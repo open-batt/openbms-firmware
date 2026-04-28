@@ -3,7 +3,7 @@
 ![Firmware](https://img.shields.io/badge/firmware-STM32-03234B)
 ![License](https://img.shields.io/badge/license-MIT-7c5cbf)
 
-OpenBMS firmware runs on STM32L4 microcontroller and is written in bare C. It consists of two layers:
+[OpenBMS](https://github.com/open-batt) firmware runs on STM32L4 microcontroller and is written in bare C. It consists of two layers:
 - Peripheral control and communication protocol handler - initializes and runs all peripherals on STM32L4, reads ADC, controls GPIO, handles communication on I2C, UART and CAN.
 - Algorithms - battery fuel gauge algorithm, charge, discharge and cell balancing control, protections.
 
@@ -26,7 +26,7 @@ Learn more at the [NLnet project page](https://nlnet.nl/project/OpenBMS).
 | Implementation on STM32 | ❌ Not started |
 | Test & Bug Fix | ❌ Not started |
 
-## Communication Protocol
+## 📡 Communication Protocol
 
 OpenBMS firmware implements the following communication protocols:
 
