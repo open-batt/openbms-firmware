@@ -9,10 +9,17 @@ extern "C" {
 #include <stdbool.h>
 #include "main.h"
 
+#define EEPROM_I2C_ADDRESS      0xA0
+#define EEPROM_I2C_TIMEOUT      100
+#define ADS131M0_SPI_TIMEOUT    100
+
 typedef enum 
 {
     OPENBMS_OK = 0,
-    OPENBMS_ERROR = -1,
+    OPENBMS_EEPROM_INIT_FAIL,
+    OPENBMS_ADS131M08_SPI_FAIL,
+    OPENNBMS_ADS131M08_INIT_FAIL,
+    
 } OpenBMS_Status_t;
 
 typedef struct 

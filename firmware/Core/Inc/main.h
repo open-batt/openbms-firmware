@@ -41,7 +41,16 @@ extern "C" {
 
 /* Exported constants --------------------------------------------------------*/
 /* USER CODE BEGIN EC */
+extern ADC_HandleTypeDef hadc1;
 
+extern CAN_HandleTypeDef hcan1;
+
+extern I2C_HandleTypeDef hi2c1;
+extern SMBUS_HandleTypeDef hsmbus2;
+
+extern SPI_HandleTypeDef hspi1;
+
+extern UART_HandleTypeDef huart1;
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/
@@ -63,6 +72,7 @@ void Error_Handler(void);
 #define ADC_CS_GPIO_Port GPIOC
 #define ADC_DRDY_Pin GPIO_PIN_15
 #define ADC_DRDY_GPIO_Port GPIOC
+#define ADC_DRDY_EXTI_IRQn EXTI15_10_IRQn
 #define CELL_2_BAL_Pin GPIO_PIN_0
 #define CELL_2_BAL_GPIO_Port GPIOA
 #define DRV_FLT_Pin GPIO_PIN_1
