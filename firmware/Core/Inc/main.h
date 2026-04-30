@@ -45,6 +45,8 @@ extern ADC_HandleTypeDef hadc1;
 
 extern CAN_HandleTypeDef hcan1;
 
+extern CRC_HandleTypeDef hcrc;
+
 extern I2C_HandleTypeDef hi2c1;
 extern SMBUS_HandleTypeDef hsmbus2;
 
