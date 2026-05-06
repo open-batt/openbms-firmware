@@ -87,6 +87,8 @@ void Error_Handler(void);
 #define MEAS_CELL_GPIO_Port GPIOA
 #define CELL_1_BAL_Pin GPIO_PIN_0
 #define CELL_1_BAL_GPIO_Port GPIOB
+#define NTC_Pin GPIO_PIN_1
+#define NTC_GPIO_Port GPIOB
 #define PWR_PG_Pin GPIO_PIN_2
 #define PWR_PG_GPIO_Port GPIOB
 #define DRV_MAIN_EN_Pin GPIO_PIN_12

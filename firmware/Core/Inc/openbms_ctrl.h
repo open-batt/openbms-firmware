@@ -7,25 +7,51 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <string.h> 
+#include <string.h>
+#include <math.h>
 #include "main.h"
 
 #define EEPROM_I2C_ADDRESS          0xA0
 #define EEPROM_SIZE                 4096
 #define EEPROM_I2C_ID_TIMEOUT       50
-#define EEPROM_I2C_READ_TIMEOUT     500
+#define EEPROM_I2C_READ_TIMEOUT     10
+#define EEPROM_I2C_WRITE_TIMEOUT    20
+
 #define ADS131M0_SPI_TIMEOUT        100
 
 typedef struct
 {
-    float cell_voltages[7];
-    bool  cell_voltages_updated;
+    bool main_fet_enable;
+    bool pre_fet_enable;
+    bool meas_cell_voltage_enable;
+    bool meas_pack_voltage_enable;
+    bool cell_balancer_enable[7];
+    bool pwr_on;
 
-    float batt_current;
-    bool  batt_current_updated;
+    bool fet_driver_fault;
+    bool fet_driver_gate_fault;
+
+} OpenBMS_Ctrl_t;
+
+typedef struct
+{
+    float cell_voltage[7];
+    bool  cell_voltage_updated;
+
+    float pack_voltage;
+    bool  pack_voltage_updated;
+
+    float pack_current;
+    bool  pack_current_updated;
     
-    float ntc_temp;
-    bool  ntc_temp_updated;
+    float temperature_ntc;
+    bool  temperature_ntc_updated;
+
+    float vdd_mv;
+    bool  vdd_mv_updated;
+
+    float temperature_stm32;
+    bool  temperature_stm32_updated;
 
 } OpenBMS_Data_t;
 
@@ -35,6 +61,7 @@ typedef struct __attribute__((packed))
     // Hardware configuration & calibration
     // -------------------------------------------------------------------------
     float    cell_voltage_resistance_factor;        // Factor to convert raw ADC value to voltage, cell 1-7
+    float    batt_voltage_resistance_factor;        // Factor to convert raw ADC value to battery (pack) voltage
     float    shunt_resistance_mohms;                // Shunt resistance in milliohms for current measurement
     float    current_sense_offset_mv;               // Offset in mV to be subtracted from current sense voltage
     float    current_sense_gain;                    // Gain factor to convert current sense voltage to current
@@ -122,6 +149,14 @@ typedef struct __attribute__((packed))
     uint16_t utp_counter[7];                        // Per-cell UTP trigger count
 
     // -------------------------------------------------------------------------
+    // NTC temperature sensor constants
+    // -------------------------------------------------------------------------
+    float    ntc_beta;                              // NTC Beta value — from datasheet (e.g. 3950.0)
+    float    ntc_r_nominal;                         // NTC nominal resistance at 25°C in Ohms (e.g. 10000.0)
+    float    ntc_r_fixed;                           // Fixed resistor value in Ohms (e.g. 10000.0)
+    float    ntc_t_nominal;                         // NTC nominal temperature in Kelvin (e.g. 298.15 = 25°C)
+
+    // -------------------------------------------------------------------------
     // Fault log
     // -------------------------------------------------------------------------
     uint8_t  fault_code[8];                         // Last 8 fault codes
@@ -138,6 +173,7 @@ typedef enum
     OPENBMS_EEPROM_ID_READ_FAIL,
     OPENBMS_EEPROM_ID_VAL_FAIL,
     OPENBMS_EEPROM_READ_FAIL,
+    OPENBMS_EEPROM_WRITE_FAIL,
     OPENBMS_EEPROM_CRC_FAIL,
 
     OPENBMS_ADS131M08_READ_FAIL,
