@@ -56,6 +56,8 @@
 
 /* External variables --------------------------------------------------------*/
 extern ADC_HandleTypeDef hadc1;
+extern CAN_HandleTypeDef hcan1;
+extern SMBUS_HandleTypeDef hsmbus2;
 extern UART_HandleTypeDef huart1;
 /* USER CODE BEGIN EV */
 
@@ -211,6 +213,76 @@ void ADC1_IRQHandler(void)
   /* USER CODE BEGIN ADC1_IRQn 1 */
 
   /* USER CODE END ADC1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles CAN1 TX interrupt.
+  */
+void CAN1_TX_IRQHandler(void)
+{
+  /* USER CODE BEGIN CAN1_TX_IRQn 0 */
+
+  /* USER CODE END CAN1_TX_IRQn 0 */
+  HAL_CAN_IRQHandler(&hcan1);
+  /* USER CODE BEGIN CAN1_TX_IRQn 1 */
+
+  /* USER CODE END CAN1_TX_IRQn 1 */
+}
+
+/**
+  * @brief This function handles CAN1 RX0 interrupt.
+  */
+void CAN1_RX0_IRQHandler(void)
+{
+  /* USER CODE BEGIN CAN1_RX0_IRQn 0 */
+
+  /* USER CODE END CAN1_RX0_IRQn 0 */
+  HAL_CAN_IRQHandler(&hcan1);
+  /* USER CODE BEGIN CAN1_RX0_IRQn 1 */
+
+  /* USER CODE END CAN1_RX0_IRQn 1 */
+}
+
+/**
+  * @brief This function handles CAN1 SCE interrupt.
+  */
+void CAN1_SCE_IRQHandler(void)
+{
+  /* USER CODE BEGIN CAN1_SCE_IRQn 0 */
+
+  /* USER CODE END CAN1_SCE_IRQn 0 */
+  HAL_CAN_IRQHandler(&hcan1);
+  /* USER CODE BEGIN CAN1_SCE_IRQn 1 */
+
+  /* USER CODE END CAN1_SCE_IRQn 1 */
+}
+
+/**
+  * @brief This function handles I2C2 event interrupt.
+  */
+void I2C2_EV_IRQHandler(void)
+{
+  /* USER CODE BEGIN I2C2_EV_IRQn 0 */
+
+  /* USER CODE END I2C2_EV_IRQn 0 */
+  HAL_SMBUS_EV_IRQHandler(&hsmbus2);
+  /* USER CODE BEGIN I2C2_EV_IRQn 1 */
+
+  /* USER CODE END I2C2_EV_IRQn 1 */
+}
+
+/**
+  * @brief This function handles I2C2 error interrupt.
+  */
+void I2C2_ER_IRQHandler(void)
+{
+  /* USER CODE BEGIN I2C2_ER_IRQn 0 */
+
+  /* USER CODE END I2C2_ER_IRQn 0 */
+  HAL_SMBUS_ER_IRQHandler(&hsmbus2);
+  /* USER CODE BEGIN I2C2_ER_IRQn 1 */
+
+  /* USER CODE END I2C2_ER_IRQn 1 */
 }
 
 /**

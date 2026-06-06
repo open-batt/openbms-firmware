@@ -117,12 +117,12 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* hadc)
     PB1     ------> ADC1_IN16
     */
     GPIO_InitStruct.Pin = NTC_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(NTC_GPIO_Port, &GPIO_InitStruct);
 
     /* ADC1 interrupt Init */
-    HAL_NVIC_SetPriority(ADC1_IRQn, 2, 0);
+    HAL_NVIC_SetPriority(ADC1_IRQn, 6, 0);
     HAL_NVIC_EnableIRQ(ADC1_IRQn);
     /* USER CODE BEGIN ADC1_MspInit 1 */
 
@@ -191,6 +191,13 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* hcan)
     GPIO_InitStruct.Alternate = GPIO_AF9_CAN1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+    /* CAN1 interrupt Init */
+    HAL_NVIC_SetPriority(CAN1_TX_IRQn, 3, 0);
+    HAL_NVIC_EnableIRQ(CAN1_TX_IRQn);
+    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 3, 0);
+    HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
+    HAL_NVIC_SetPriority(CAN1_SCE_IRQn, 4, 0);
+    HAL_NVIC_EnableIRQ(CAN1_SCE_IRQn);
     /* USER CODE BEGIN CAN1_MspInit 1 */
 
     /* USER CODE END CAN1_MspInit 1 */
@@ -221,6 +228,10 @@ void HAL_CAN_MspDeInit(CAN_HandleTypeDef* hcan)
     */
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_11|GPIO_PIN_12);
 
+    /* CAN1 interrupt DeInit */
+    HAL_NVIC_DisableIRQ(CAN1_TX_IRQn);
+    HAL_NVIC_DisableIRQ(CAN1_RX0_IRQn);
+    HAL_NVIC_DisableIRQ(CAN1_SCE_IRQn);
     /* USER CODE BEGIN CAN1_MspDeInit 1 */
 
     /* USER CODE END CAN1_MspDeInit 1 */
@@ -359,6 +370,11 @@ void HAL_SMBUS_MspInit(SMBUS_HandleTypeDef* hsmbus)
 
     /* Peripheral clock enable */
     __HAL_RCC_I2C2_CLK_ENABLE();
+    /* I2C2 interrupt Init */
+    HAL_NVIC_SetPriority(I2C2_EV_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(I2C2_EV_IRQn);
+    HAL_NVIC_SetPriority(I2C2_ER_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(I2C2_ER_IRQn);
     /* USER CODE BEGIN I2C2_MspInit 1 */
 
     /* USER CODE END I2C2_MspInit 1 */
@@ -422,6 +438,9 @@ void HAL_SMBUS_MspDeInit(SMBUS_HandleTypeDef* hsmbus)
 
     HAL_GPIO_DeInit(GPIOB, GPIO_PIN_11);
 
+    /* I2C2 interrupt DeInit */
+    HAL_NVIC_DisableIRQ(I2C2_EV_IRQn);
+    HAL_NVIC_DisableIRQ(I2C2_ER_IRQn);
     /* USER CODE BEGIN I2C2_MspDeInit 1 */
 
     /* USER CODE END I2C2_MspDeInit 1 */
@@ -538,7 +557,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     /* USART1 interrupt Init */
-    HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+    HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
     /* USER CODE BEGIN USART1_MspInit 1 */
 

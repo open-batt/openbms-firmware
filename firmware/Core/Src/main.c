@@ -272,15 +272,15 @@ static void MX_CAN1_Init(void)
 
   /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 16;
+  hcan1.Init.Prescaler = 8;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan1.Init.TimeSeg1 = CAN_BS1_8TQ;
-  hcan1.Init.TimeSeg2 = CAN_BS2_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_7TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
-  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoBusOff = ENABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
-  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan1) != HAL_OK)
@@ -390,16 +390,16 @@ static void MX_I2C2_SMBUS_Init(void)
   hsmbus2.Instance = I2C2;
   hsmbus2.Init.Timing = 0x10D19CE4;
   hsmbus2.Init.AnalogFilter = SMBUS_ANALOGFILTER_ENABLE;
-  hsmbus2.Init.OwnAddress1 = 2;
+  hsmbus2.Init.OwnAddress1 = 22;
   hsmbus2.Init.AddressingMode = SMBUS_ADDRESSINGMODE_7BIT;
   hsmbus2.Init.DualAddressMode = SMBUS_DUALADDRESS_DISABLE;
   hsmbus2.Init.OwnAddress2 = 0;
   hsmbus2.Init.OwnAddress2Masks = SMBUS_OA2_NOMASK;
   hsmbus2.Init.GeneralCallMode = SMBUS_GENERALCALL_DISABLE;
   hsmbus2.Init.NoStretchMode = SMBUS_NOSTRETCH_DISABLE;
-  hsmbus2.Init.PacketErrorCheckMode = SMBUS_PEC_DISABLE;
+  hsmbus2.Init.PacketErrorCheckMode = SMBUS_PEC_ENABLE;
   hsmbus2.Init.PeripheralMode = SMBUS_PERIPHERAL_MODE_SMBUS_SLAVE;
-  hsmbus2.Init.SMBusTimeout = 0x000083D0;
+  hsmbus2.Init.SMBusTimeout = 0x83D093E7;
   if (HAL_SMBUS_Init(&hsmbus2) != HAL_OK)
   {
     Error_Handler();
@@ -466,7 +466,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 230400;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -511,9 +511,11 @@ static void MX_GPIO_Init(void)
                           |CELL_7_BAL_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, CELL_1_BAL_Pin|DRV_MAIN_EN_Pin|I2C2_INT_Pin|PWR_ON_Pin
-                          |CELL_6_BAL_Pin|MEAS_BATT_Pin|CELL_5_BAL_Pin|CELL_4_BAL_Pin
-                          |CELL_3_BAL_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, CELL_1_BAL_Pin|DRV_MAIN_EN_Pin|I2C2_INT_Pin|CELL_6_BAL_Pin
+                          |MEAS_BATT_Pin|CELL_5_BAL_Pin|CELL_4_BAL_Pin|CELL_3_BAL_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pins : ADC_SYNC_Pin ADC_CS_Pin */
   GPIO_InitStruct.Pin = ADC_SYNC_Pin|ADC_CS_Pin;

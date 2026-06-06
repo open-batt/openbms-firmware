@@ -19,6 +19,8 @@ extern "C" {
 
 #define ADS131M0_SPI_TIMEOUT        100
 
+#define MODBUS_BUFFER_SIZE          256
+
 typedef struct
 {
     bool main_fet_enable;
@@ -30,6 +32,8 @@ typedef struct
 
     bool fet_driver_fault;
     bool fet_driver_gate_fault;
+    bool wake_up;
+    bool vcc_power_good;
 
 } OpenBMS_Ctrl_t;
 
@@ -181,6 +185,28 @@ typedef enum
     OPENBMS_ADS131M08_ID_FAIL,
     
 } OpenBMS_Status_t;
+
+typedef enum
+{
+    IDLE = 0,
+    SOF,
+    RX,
+    TX,
+    REG_H,
+    REG_L,
+    DATA,
+    CRC_L,
+    CRC_H,
+
+} MODBUS_state_t;
+
+typedef struct 
+{
+    uint8_t         uart_rx_byte;
+    uint8_t         buffer[MODBUS_BUFFER_SIZE];
+    MODBUS_state_t  state;
+
+} MODBUS_Command_t;
 
 void OpenBMS_Ctrl_Init(void);
 void OpenBMS_Ctrl_Run(void);
