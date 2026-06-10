@@ -213,7 +213,7 @@ static bool ADS131M08_ReadReg(uint8_t reg, uint16_t *status, uint8_t* value)
 
   // Assign status word and value from response
   *status = (rx_buff[0] << 8) | rx_buff[1];
-  memcpy(value, &rx_buff[3], 24);
+  memcpy(value, &rx_buff[2], 24);
 
   return res;
 }
@@ -251,6 +251,14 @@ static void ADS131M08_Init(void)
   uint16_t status;
 
   // Read ADC ID register (0x00) to verify communication
+  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
+  {
+    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
+    return;
+  }
+
+  // To read out register, actually one more transaction is needed after writing the command, 
+  // so read ID register again to get the value
   if(!ADS131M08_ReadReg(0x00, &status, rx_data))
   {
     HandleError(OPENBMS_ADS131M08_INIT_FAIL);
@@ -509,7 +517,7 @@ void OpenBMS_Ctrl_Init(void)
   //EEPROM_Init();
   //EEPROM_Read();
 
-  //ADS131M08_Init();
+  ADS131M08_Init();
 
   //STM32_ADC_Init();
 }
