@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug STM32L431",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "stlink",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/openbms-firmware.elf",
+            "interface": "swd",
+            "device": "STM32L431CCUx",
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none",
+            "serverpath": "${env:CUBE_BUNDLE_PATH}/stlink-gdbserver/7.13.0+st.3/bin/ST-LINK_gdbserver.exe",
+            "gdbPath": "${env:CUBE_BUNDLE_PATH}/gnu-gdb-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gdb.exe",
+            "objdumpPath": "${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-objdump.exe",
+            "nmPath": "${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-nm.exe",
+            "overrideResetCommands": [
+                "monitor reset halt"
+            ],
+            "overrideRestartCommands": [
+                "monitor reset halt",
+                "continue"
+            ]
+        }
+    ]
+}
