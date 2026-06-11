@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -38,6 +39,9 @@
 #define APP_FLASH_START_PAGE    20U
 #define APP_FLASH_END_PAGE      127U
 #define APP_FLASH_NUM_PAGES     (APP_FLASH_END_PAGE - APP_FLASH_START_PAGE + 1U)
+#define APP_FLASH_START_ADDRESS 0x0800A000U
+#define APP_FLAG_ADDRESS        0x08009800U
+#define APP_FLAG_MAGIC          0x12345678U
 
 #define IHEX_RECORD_DATA        0x00U
 #define IHEX_RECORD_EOF         0x01U
@@ -46,11 +50,13 @@
 #define IHEX_RECORD_EXT_ADDR    0x04U
 #define IHEX_RECORD_START_ADDR  0x05U
 
-#define IHEX_OK                 0U
-#define IHEX_EOF                1U
-#define IHEX_ERR_CHECKSUM       2U
-#define IHEX_ERR_FORMAT         3U
-#define IHEX_ERR_FLASH          4U
+#define OK                            0U  
+#define ERROR_ERRASE_FAIL             1U
+#define ERROR_IHEX_EOF                2U
+#define ERROR_IHEX_ERR_CHECKSUM       3U
+#define ERROR_IHEX_ERR_FORMAT         4U
+#define ERROR_IHEX_ERR_FLASH          5U
+#define ERROR_SET_FLAG_FAIL           6U  
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -62,6 +68,8 @@
 ADC_HandleTypeDef hadc1;
 
 CAN_HandleTypeDef hcan1;
+
+CRC_HandleTypeDef hcrc;
 
 I2C_HandleTypeDef hi2c1;
 SMBUS_HandleTypeDef hsmbus2;
@@ -84,19 +92,22 @@ static void MX_CAN1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_SMBUS_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_CRC_Init(void);
 /* USER CODE BEGIN PFP */
 static void Bootloader_Start(void);
 
-static void UART_Print(const char *message);
+static void UART_PrintU8(uint8_t value);
 static void UART_ProcessLine(char *line);
 
-static HAL_StatusTypeDef CMD_Erase(void);
 static HAL_StatusTypeDef Flash_Write(uint32_t address, uint8_t *data, uint32_t length);
 static uint8_t IHEX_HexToByte(const char *hex);
 
-static void CMD_Program(const char *hex_line);
-static void CMD_CalculateCRC(uint32_t num_bytes);
-static void CMD_Jump(void);
+static uint8_t CMD_Erase(void);
+static uint8_t CMD_Program(const char *line);
+static uint8_t CMD_CalculateCRC(uint32_t num_bytes, uint32_t *crc_out);
+static uint8_t CMD_SetAppFlag(void);
+static void    CheckAndJumpToApp(void);
+static void    CMD_Reset(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -105,44 +116,49 @@ static void Bootloader_Start(void)
 {
     HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 }
-static void UART_Print(const char *message)
+static void UART_PrintU8(uint8_t value)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t *)message, strlen(message), 100);
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%u\n", value);
+    HAL_UART_Transmit(&huart1, (uint8_t *)buf, strlen(buf), 100);
 }
 static void UART_ProcessLine(char *line)
 {
+    uint8_t  status;
+    uint32_t crc_value;
+
     if(strcmp(line, "E") == 0)
     {
         // Erase command
-        if(CMD_Erase() == HAL_OK)
-        {
-            UART_Print("0\n");
-        }
-        else
-        {
-            UART_Print("1\n");
-        }
+        status = CMD_Erase();
     }
     else if(line[0] == 'P' && line[1] == ',')
     {
         // Program command — P,<hex_line>
-        //CMD_Program(&line[2]);
+        status = CMD_Program(&line[2]);
     }
     else if(line[0] == 'C' && line[1] == ',')
     {
         // CRC command — C,<num_bytes>
         uint32_t num_bytes = (uint32_t)atoi(&line[2]);
-        //CMD_CalculateCRC(num_bytes);
+        status = CMD_CalculateCRC(num_bytes, &crc_value);
     }
-    else if(strcmp(line, "J") == 0)
+    else if(strcmp(line, "A") == 0)
     {
-        // Jump command
-        //CMD_Jump();
+        // Set Application Flag command
+        status = CMD_SetAppFlag();
+    }
+    else if(strcmp(line, "R") == 0)
+    {
+        // Reset command
+        CMD_Reset();
     }
     else
     {
-        UART_Print("255\n");
+        status = 255;
     }
+
+    UART_PrintU8(status);
 }
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -172,7 +188,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             {
                 // Buffer overflow — reset
                 uart_rx_idx = 0;
-                UART_Print("ERR: buffer overflow\r\n");
             }
         }
 
@@ -180,7 +195,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
     }
 }
-static HAL_StatusTypeDef CMD_Erase(void)
+static uint8_t CMD_Erase(void)
 {
     HAL_StatusTypeDef      status;
     FLASH_EraseInitTypeDef erase_init;
@@ -189,7 +204,7 @@ static HAL_StatusTypeDef CMD_Erase(void)
     status = HAL_FLASH_Unlock();
     if(status != HAL_OK)
     {
-        return status;
+        return ERROR_ERRASE_FAIL;
     }
 
     erase_init.TypeErase   = FLASH_TYPEERASE_PAGES;
@@ -201,7 +216,12 @@ static HAL_StatusTypeDef CMD_Erase(void)
 
     HAL_FLASH_Lock();
 
-    return status;
+    if(status != HAL_OK)
+    {
+        return ERROR_ERRASE_FAIL;
+    }
+
+    return OK;
 }
 static HAL_StatusTypeDef Flash_Write(uint32_t address, uint8_t *data, uint32_t length)
 {
@@ -270,7 +290,7 @@ static uint8_t CMD_Program(const char *line)
     // Check start code
     if(line[0] != ':')
     {
-        return IHEX_ERR_FORMAT;
+        return ERROR_IHEX_ERR_FORMAT;
     }
 
     // Parse fields
@@ -300,7 +320,7 @@ static uint8_t CMD_Program(const char *line)
 
     if(calc_checksum != 0x00)
     {
-        return IHEX_ERR_CHECKSUM;
+        return ERROR_IHEX_ERR_CHECKSUM;
     }
 
     // Process record type
@@ -322,7 +342,7 @@ static uint8_t CMD_Program(const char *line)
 
                 if(Flash_Write(flash_address + i, write_buf, 8) != HAL_OK)
                 {
-                    return IHEX_ERR_FLASH;
+                    return ERROR_IHEX_ERR_FLASH;
                 }
 
                 i += chunk;
@@ -338,54 +358,108 @@ static uint8_t CMD_Program(const char *line)
 
         case IHEX_RECORD_EOF:
         {
-            return IHEX_EOF;
+            return ERROR_IHEX_EOF;
         }
 
         default:
             break;
     }
 
-    return IHEX_OK;
+    return OK;
 }
-static void CMD_CalculateCRC(uint32_t num_bytes)
+static uint8_t CMD_CalculateCRC(uint32_t num_bytes, uint32_t *crc_out)
 {
     uint32_t app_start = 0x0800A000;
-    uint32_t crc       = HAL_CRC_Calculate(&hcrc, (uint32_t *)app_start, num_bytes / sizeof(uint32_t));
+    *crc_out = HAL_CRC_Calculate(&hcrc, (uint32_t *)app_start, num_bytes / sizeof(uint32_t));
 
-    char buf[32];
-    snprintf(buf, sizeof(buf), "CRC:0x%08lX\r\n", crc);
-    UART_Print(buf);
+    return OK;
 }
-
-static void CMD_Jump(void)
+static uint8_t CMD_SetAppFlag(void)
 {
-    uint32_t app_address    = 0x0800A000;
-    uint32_t reset_handler  = *(uint32_t *)(app_address + 4);
+    HAL_StatusTypeDef      status;
+    FLASH_EraseInitTypeDef erase_init;
+    uint32_t               page_error  = 0;
+    uint64_t               double_word = (uint64_t)APP_FLAG_MAGIC | ((uint64_t)APP_FLAG_MAGIC << 32);
 
-    // Check if valid application exists — first word should be valid stack pointer
-    uint32_t stack_pointer = *(uint32_t *)app_address;
-    if(stack_pointer < 0x20000000 || stack_pointer > 0x20010000)
+    // Unlock flash
+    status = HAL_FLASH_Unlock();
+    if(status != HAL_OK)
     {
-        UART_Print("ERR: no valid application\r\n");
+        return ERROR_SET_FLAG_FAIL;
+    }
+
+    // Erase page 19 first
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.Banks     = FLASH_BANK_1;
+    erase_init.Page      = 19U;
+    erase_init.NbPages   = 1U;
+
+    status = HAL_FLASHEx_Erase(&erase_init, &page_error);
+    if(status != HAL_OK)
+    {
+        HAL_FLASH_Lock();
+        return ERROR_SET_FLAG_FAIL;
+    }
+
+    // Write magic number
+    status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                               APP_FLAG_ADDRESS,
+                               double_word);
+
+    HAL_FLASH_Lock();
+
+    if(status != HAL_OK)
+    {
+        return ERROR_SET_FLAG_FAIL;
+    }
+
+    return OK;
+}
+static void    CheckAndJumpToApp(void)
+{
+    uint32_t app_flag      = *(uint32_t *)APP_FLAG_ADDRESS;
+    uint32_t stack_pointer = *(uint32_t *)APP_FLASH_START_ADDRESS;
+    uint32_t reset_handler = *(uint32_t *)(APP_FLASH_START_ADDRESS + 4);
+
+    // Check magic flag
+    if(app_flag != APP_FLAG_MAGIC)
+    {
         return;
     }
 
-    UART_Print("Jumping to application...\r\n");
-    HAL_Delay(100);  // Give UART time to transmit
+    // Check valid stack pointer — must be in RAM range
+    if(stack_pointer < 0x20000000U || stack_pointer > 0x20010000U)
+    {
+        return;
+    }
+
+    // Check valid reset handler — must be in app flash range
+    if(reset_handler < APP_FLASH_START_ADDRESS || reset_handler > 0x0803FFFFU)
+    {
+        return;
+    }
 
     // Disable all interrupts
     __disable_irq();
 
-    // Set vector table
-    SCB->VTOR = app_address;
+    // Deinit HAL peripherals before jump
+    HAL_UART_DeInit(&huart1);
+    HAL_RCC_DeInit();
+    HAL_DeInit();
 
-    // Set stack pointer and jump
+    // Set vector table
+    SCB->VTOR = APP_FLASH_START_ADDRESS;
+
+    // Jump to application
     __set_MSP(stack_pointer);
 
     void (*app_reset_handler)(void) = (void (*)(void))reset_handler;
     app_reset_handler();
 }
-
+static void CMD_Reset(void)
+{
+    NVIC_SystemReset();
+}
 /* USER CODE END 0 */
 
 /**
@@ -422,7 +496,9 @@ int main(void)
   MX_I2C1_Init();
   MX_I2C2_SMBUS_Init();
   MX_USART1_UART_Init();
+  MX_CRC_Init();
   /* USER CODE BEGIN 2 */
+  CheckAndJumpToApp();
   Bootloader_Start();
   /* USER CODE END 2 */
 
@@ -430,13 +506,12 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    
-    /* USER CODE END WHILE */
     if(process_cmd)
     {
         UART_ProcessLine(uart_rx_buf);
         process_cmd = 0;
     }
+    /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -602,6 +677,37 @@ static void MX_CAN1_Init(void)
   /* USER CODE BEGIN CAN1_Init 2 */
 
   /* USER CODE END CAN1_Init 2 */
+
+}
+
+/**
+  * @brief CRC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CRC_Init(void)
+{
+
+  /* USER CODE BEGIN CRC_Init 0 */
+
+  /* USER CODE END CRC_Init 0 */
+
+  /* USER CODE BEGIN CRC_Init 1 */
+
+  /* USER CODE END CRC_Init 1 */
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+  if (HAL_CRC_Init(&hcrc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CRC_Init 2 */
+
+  /* USER CODE END CRC_Init 2 */
 
 }
 
