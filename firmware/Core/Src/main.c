@@ -85,7 +85,9 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
   // Be sure to update launch.json and STM32L431XX_FLASH.ld file too
+  // Enable interrupts, since they were disabled by the bootloader, and set vector table to the right address
   SCB->VTOR = 0x0800A000;
+  __enable_irq();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/

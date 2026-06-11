@@ -41,7 +41,9 @@
 #define APP_FLASH_NUM_PAGES     (APP_FLASH_END_PAGE - APP_FLASH_START_PAGE + 1U)
 #define APP_FLASH_START_ADDRESS 0x0800A000U
 #define APP_FLAG_ADDRESS        0x08009800U
+
 #define APP_FLAG_MAGIC          0x12345678U
+#define APP_FLAG_MAGIC_PAGE     19U
 
 #define IHEX_RECORD_DATA        0x00U
 #define IHEX_RECORD_EOF         0x01U
@@ -52,11 +54,11 @@
 
 #define OK                            0U  
 #define ERROR_ERRASE_FAIL             1U
-#define ERROR_IHEX_EOF                2U
 #define ERROR_IHEX_ERR_CHECKSUM       3U
 #define ERROR_IHEX_ERR_FORMAT         4U
 #define ERROR_IHEX_ERR_FLASH          5U
 #define ERROR_SET_FLAG_FAIL           6U  
+#define ERROR_CRC_CHECKSUM            7U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -104,7 +106,7 @@ static uint8_t IHEX_HexToByte(const char *hex);
 
 static uint8_t CMD_Erase(void);
 static uint8_t CMD_Program(const char *line);
-static uint8_t CMD_CalculateCRC(uint32_t num_bytes, uint32_t *crc_out);
+static uint8_t CMD_CalculateCRC(uint32_t num_bytes, uint32_t expected_crc);
 static uint8_t CMD_SetAppFlag(void);
 static void    CheckAndJumpToApp(void);
 static void    CMD_Reset(void);
@@ -118,16 +120,20 @@ static void Bootloader_Start(void)
 }
 static void UART_PrintU8(uint8_t value)
 {
-    char buf[4];
+    char buf[5];
     snprintf(buf, sizeof(buf), "%u\n", value);
     HAL_UART_Transmit(&huart1, (uint8_t *)buf, strlen(buf), 100);
 }
 static void UART_ProcessLine(char *line)
 {
     uint8_t  status;
-    uint32_t crc_value;
 
-    if(strcmp(line, "E") == 0)
+    if(strcmp(line, "B") == 0)
+    {
+        // Ping command
+        status = 0;
+    }
+    else if(strcmp(line, "E") == 0)
     {
         // Erase command
         status = CMD_Erase();
@@ -137,11 +143,19 @@ static void UART_ProcessLine(char *line)
         // Program command — P,<hex_line>
         status = CMD_Program(&line[2]);
     }
-    else if(line[0] == 'C' && line[1] == ',')
-    {
-        // CRC command — C,<num_bytes>
-        uint32_t num_bytes = (uint32_t)atoi(&line[2]);
-        status = CMD_CalculateCRC(num_bytes, &crc_value);
+   else if(line[0] == 'C' && line[1] == ',')
+   {
+      char     *token;
+      uint32_t  num_bytes    = 0;
+      uint32_t  expected_crc = 0;
+
+      token        = strtok(&line[2], ",");
+      num_bytes    = (uint32_t)atoi(token);
+
+      token        = strtok(NULL, ",");
+      expected_crc = (uint32_t)strtoul(token, NULL, 10);
+
+      status = CMD_CalculateCRC(num_bytes, expected_crc);
     }
     else if(strcmp(line, "A") == 0)
     {
@@ -273,9 +287,9 @@ static HAL_StatusTypeDef Flash_Write(uint32_t address, uint8_t *data, uint32_t l
 }
 static uint8_t IHEX_HexToByte(const char *hex)
 {
-    uint8_t result = 0;
-    sscanf(hex, "%2hhx", &result);
-    return result;
+    unsigned int result = 0;
+    sscanf(hex, "%2x", &result);
+    return (uint8_t)result;
 }
 static uint8_t CMD_Program(const char *line)
 {
@@ -358,7 +372,7 @@ static uint8_t CMD_Program(const char *line)
 
         case IHEX_RECORD_EOF:
         {
-            return ERROR_IHEX_EOF;
+            break;
         }
 
         default:
@@ -367,10 +381,17 @@ static uint8_t CMD_Program(const char *line)
 
     return OK;
 }
-static uint8_t CMD_CalculateCRC(uint32_t num_bytes, uint32_t *crc_out)
+static uint8_t CMD_CalculateCRC(uint32_t num_bytes, uint32_t expected_crc)
 {
-    uint32_t app_start = 0x0800A000;
-    *crc_out = HAL_CRC_Calculate(&hcrc, (uint32_t *)app_start, num_bytes / sizeof(uint32_t));
+    uint32_t app_start = APP_FLASH_START_ADDRESS;
+    uint32_t calculated_crc;
+    
+    calculated_crc = HAL_CRC_Calculate(&hcrc, (uint32_t *)app_start, num_bytes);
+
+    if(calculated_crc != expected_crc)
+    {
+        return ERROR_CRC_CHECKSUM;
+    }
 
     return OK;
 }
@@ -391,7 +412,7 @@ static uint8_t CMD_SetAppFlag(void)
     // Erase page 19 first
     erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
     erase_init.Banks     = FLASH_BANK_1;
-    erase_init.Page      = 19U;
+    erase_init.Page      = APP_FLAG_MAGIC_PAGE;
     erase_init.NbPages   = 1U;
 
     status = HAL_FLASHEx_Erase(&erase_init, &page_error);
@@ -405,7 +426,7 @@ static uint8_t CMD_SetAppFlag(void)
     status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
                                APP_FLAG_ADDRESS,
                                double_word);
-
+                               
     HAL_FLASH_Lock();
 
     if(status != HAL_OK)
