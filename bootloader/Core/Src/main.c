@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,6 +38,19 @@
 #define APP_FLASH_START_PAGE    20U
 #define APP_FLASH_END_PAGE      127U
 #define APP_FLASH_NUM_PAGES     (APP_FLASH_END_PAGE - APP_FLASH_START_PAGE + 1U)
+
+#define IHEX_RECORD_DATA        0x00U
+#define IHEX_RECORD_EOF         0x01U
+#define IHEX_RECORD_EXT_SEG     0x02U
+#define IHEX_RECORD_START_SEG   0x03U
+#define IHEX_RECORD_EXT_ADDR    0x04U
+#define IHEX_RECORD_START_ADDR  0x05U
+
+#define IHEX_OK                 0U
+#define IHEX_EOF                1U
+#define IHEX_ERR_CHECKSUM       2U
+#define IHEX_ERR_FORMAT         3U
+#define IHEX_ERR_FLASH          4U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,6 +73,7 @@ static uint8_t uart_rx_byte                 = 0;
 static char    uart_rx_buf[UART_BUF_SIZE]   = {0};
 static uint8_t uart_rx_idx                  = 0;
 static uint8_t process_cmd                  = 0;
+static uint32_t flash_ext_address           = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,8 +91,11 @@ static void UART_Print(const char *message);
 static void UART_ProcessLine(char *line);
 
 static HAL_StatusTypeDef CMD_Erase(void);
-static void CMD_CalculateCRC(uint32_t num_bytes);
+static HAL_StatusTypeDef Flash_Write(uint32_t address, uint8_t *data, uint32_t length);
+static uint8_t IHEX_HexToByte(const char *hex);
+
 static void CMD_Program(const char *hex_line);
+static void CMD_CalculateCRC(uint32_t num_bytes);
 static void CMD_Jump(void);
 /* USER CODE END PFP */
 
@@ -185,22 +203,150 @@ static HAL_StatusTypeDef CMD_Erase(void)
 
     return status;
 }
-static void CMD_Program(const char *hex_line)
+static HAL_StatusTypeDef Flash_Write(uint32_t address, uint8_t *data, uint32_t length)
 {
-    uint32_t      ext_addr = 0;
-    IHEX_Status_t status   = IHEX_ParseLine(hex_line, &ext_addr);
+    HAL_StatusTypeDef status;
+    uint64_t          double_word;
 
-    switch(status)
+    // Address must be 8-byte aligned
+    if(address % 8 != 0)
     {
-        case IHEX_OK:       UART_Print("OK\r\n");                       break;
-        case IHEX_EOF:      UART_Print("OK: EOF\r\n");                  break;
-        case IHEX_ERR_CHECKSUM: UART_Print("ERR: checksum\r\n");        break;
-        case IHEX_ERR_FORMAT:   UART_Print("ERR: format\r\n");          break;
-        case IHEX_ERR_FLASH:    UART_Print("ERR: flash write\r\n");     break;
-        default:                UART_Print("ERR: unknown\r\n");         break;
+        return HAL_ERROR;
     }
-}
 
+    // Length must be multiple of 8
+    if(length % 8 != 0)
+    {
+        return HAL_ERROR;
+    }
+
+    status = HAL_FLASH_Unlock();
+    if(status != HAL_OK)
+    {
+        return status;
+    }
+
+    for(uint32_t i = 0; i < length; i += 8)
+    {
+        double_word = (uint64_t)data[i]
+                    | ((uint64_t)data[i+1] << 8)
+                    | ((uint64_t)data[i+2] << 16)
+                    | ((uint64_t)data[i+3] << 24)
+                    | ((uint64_t)data[i+4] << 32)
+                    | ((uint64_t)data[i+5] << 40)
+                    | ((uint64_t)data[i+6] << 48)
+                    | ((uint64_t)data[i+7] << 56);
+
+        status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                   address + i,
+                                   double_word);
+
+        if(status != HAL_OK)
+        {
+            HAL_FLASH_Lock();
+            return status;
+        }
+    }
+
+    HAL_FLASH_Lock();
+    return HAL_OK;
+}
+static uint8_t IHEX_HexToByte(const char *hex)
+{
+    uint8_t result = 0;
+    sscanf(hex, "%2hhx", &result);
+    return result;
+}
+static uint8_t CMD_Program(const char *line)
+{
+    uint8_t  byte_count;
+    uint16_t address;
+    uint8_t  record_type;
+    uint8_t  data[32];
+    uint8_t  checksum;
+    uint8_t  calc_checksum = 0;
+    uint32_t flash_address;
+
+    // Check start code
+    if(line[0] != ':')
+    {
+        return IHEX_ERR_FORMAT;
+    }
+
+    // Parse fields
+    byte_count  = IHEX_HexToByte(&line[1]);
+    address     = ((uint16_t)IHEX_HexToByte(&line[3]) << 8) | IHEX_HexToByte(&line[5]);
+    record_type = IHEX_HexToByte(&line[7]);
+
+    // Parse data bytes
+    for(uint8_t i = 0; i < byte_count; i++)
+    {
+        data[i] = IHEX_HexToByte(&line[9 + i * 2]);
+    }
+
+    // Parse checksum
+    checksum = IHEX_HexToByte(&line[9 + byte_count * 2]);
+
+    // Verify checksum
+    calc_checksum += byte_count;
+    calc_checksum += (address >> 8) & 0xFF;
+    calc_checksum += address & 0xFF;
+    calc_checksum += record_type;
+    for(uint8_t i = 0; i < byte_count; i++)
+    {
+        calc_checksum += data[i];
+    }
+    calc_checksum += checksum;
+
+    if(calc_checksum != 0x00)
+    {
+        return IHEX_ERR_CHECKSUM;
+    }
+
+    // Process record type
+    switch(record_type)
+    {
+        case IHEX_RECORD_DATA:
+        {
+            flash_address = (flash_ext_address << 16) | address;
+
+            uint8_t  write_buf[8];
+            uint32_t i = 0;
+
+            while(i < byte_count)
+            {
+                uint8_t chunk = ((byte_count - i) >= 8) ? 8 : (byte_count - i);
+
+                memset(write_buf, 0xFF, 8);
+                memcpy(write_buf, &data[i], chunk);
+
+                if(Flash_Write(flash_address + i, write_buf, 8) != HAL_OK)
+                {
+                    return IHEX_ERR_FLASH;
+                }
+
+                i += chunk;
+            }
+            break;
+        }
+
+        case IHEX_RECORD_EXT_ADDR:
+        {
+            flash_ext_address = ((uint32_t)data[0] << 8) | data[1];
+            break;
+        }
+
+        case IHEX_RECORD_EOF:
+        {
+            return IHEX_EOF;
+        }
+
+        default:
+            break;
+    }
+
+    return IHEX_OK;
+}
 static void CMD_CalculateCRC(uint32_t num_bytes)
 {
     uint32_t app_start = 0x0800A000;
