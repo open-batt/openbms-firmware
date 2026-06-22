@@ -20,42 +20,42 @@ Registers in range `0x00` - `0x3F` are standard SBS protocol registers and their
 
 | Address | Function | Access | Type | Notes |
 |---------|----------|--------|------|-------|
-| 0x00 | ManufacturerAccess() | r/w | word | Vendor side-channel |
-| 0x01 | RemainingCapacityAlarm() | r/w | word | mAh or 10mWh; 0 disables alarm |
-| 0x02 | RemainingTimeAlarm() | r/w | word | Minutes; 0 disables alarm |
-| 0x03 | BatteryMode() | r/w | word | Bit 15: CAPACITY_MODE — 0=mA/mAh, 1=10mW/10mWh<br/>Bit 14: CHARGER_MODE — 0=broadcast ChargingCurrent/Voltage, 1=disable<br/>Bit 13: ALARM_MODE — 0=broadcast AlarmWarning, 1=disable<br/>Bit 9: PRIMARY_BATTERY — 0=secondary, 1=primary<br/>Bit 8: CHARGE_CONTROLLER_ENABLED — 0=off, 1=on<br/>Bit 7: CONDITION_FLAG — 1=conditioning cycle requested<br/>Bit 1: PRIMARY_BATTERY_SUPPORT — 1=supported<br/>Bit 0: INTERNAL_CHARGE_CONTROLLER — 1=supported<br/>Bits 12-10, 6-2: reserved |
-| 0x04 | AtRate() | r/w | word | Signed mA or 10mW; hypothetical rate; positive=charge, negative=discharge, zero=default |
-| 0x05 | AtRateTimeToFull() | r | word | Minutes to full at AtRate charge rate — purely hypothetical; 65535 = not charging |
-| 0x06 | AtRateTimeToEmpty() | r | word | Minutes to empty at AtRate discharge rate — purely hypothetical; 65535 = not discharging |
-| 0x07 | AtRateOK() | r | word | Boolean — can battery sustain AtRate on top of present current for 10s?; always TRUE if AtRate() >= 0 |
-| 0x08 | Temperature() | r | word | 0.1K units |
-| 0x09 | Voltage() | r | word | mV |
-| 0x0A | Current() | r | word | Signed mA; positive = charge, negative = discharge |
-| 0x0B | AverageCurrent() | r | word | Signed mA; 1-minute rolling average |
-| 0x0C | MaxError() | r | word | % gauge uncertainty |
-| 0x0D | RelativeStateOfCharge() | r | word | % of FullChargeCapacity() |
-| 0x0E | AbsoluteStateOfCharge() | r | word | % of DesignCapacity(); can exceed 100% |
-| 0x0F | RemainingCapacity() | r | word | mAh or 10mWh |
-| 0x10 | FullChargeCapacity() | r | word | mAh or 10mWh; learned full capacity |
-| 0x11 | RunTimeToEmpty() | r | word | Minutes at present rate; 65535 = not discharging |
-| 0x12 | AverageTimeToEmpty() | r | word | Minutes; 1-minute rolling average; 65535 = not discharging |
-| 0x13 | AverageTimeToFull() | r | word | Minutes; 1-minute rolling average; 65535 = not charging |
-| 0x14 | ChargingCurrent() | r/w | word | mA; broadcast to charger; 65535 = charger acts as voltage source |
-| 0x15 | ChargingVoltage() | r/w | word | mV; broadcast to charger; 65535 = charger acts as current source |
-| 0x16 | BatteryStatus() / AlarmWarning() | r | word | Bit 15: OVER_CHARGED_ALARM<br/>Bit 14: TERMINATE_CHARGE_ALARM<br/>Bit 13: reserved<br/>Bit 12: OVER_TEMP_ALARM<br/>Bit 11: TERMINATE_DISCHARGE_ALARM<br/>Bit 10: reserved<br/>Bit 9: REMAINING_CAPACITY_ALARM<br/>Bit 8: REMAINING_TIME_ALARM<br/>Bit 7: INITIALIZED<br/>Bit 6: DISCHARGING<br/>Bit 5: FULLY_CHARGED<br/>Bit 4: FULLY_DISCHARGED<br/>Bits 3-0: ERROR_CODE — 0x0=OK, 0x1=Busy, 0x2=Reserved, 0x3=Unsupported, 0x4=Access Denied, 0x5=Overflow, 0x6=Bad Size, 0x7=Unknown |
-| 0x17 | CycleCount() | r | word | Charge/discharge cycle counter; 65535 = ≥65535 cycles |
-| 0x18 | DesignCapacity() | r | word | mAh or 10mWh; nominal factory capacity |
-| 0x19 | DesignVoltage() | r | word | mV; nominal pack voltage |
-| 0x1A | SpecificationInfo() | r | word | Bits 15-12: IPScale — current/capacity multiplier (10^n)<br/>Bits 11-8: VScale — voltage multiplier (10^n)<br/>Bits 7-4: Version — 0x1=SBS1.0, 0x2=SBS1.1, 0x3=SBS1.1+PEC<br/>Bits 3-0: Revision — always 0x1<br/>Note: scaling does not apply to ChargingCurrent() and ChargingVoltage() |
-| 0x1B | ManufactureDate() | r | word | Packed: (year−1980)×512 + month×32 + day |
-| 0x1C | SerialNumber() | r | word | Combined with name + date = unique battery ID |
-| 0x1D | — | — | — | Undefined |
-| 0x1E | — | — | — | Undefined |
-| 0x1F | — | — | — | Undefined |
-| 0x20 | ManufacturerName() | r | block | String |
-| 0x21 | DeviceName() | r | block | String |
-| 0x22 | DeviceChemistry() | r | block | String; e.g. LION, NiMH, LiP |
-| 0x23 | ManufacturerData() | r | block | Vendor-defined payload |
+| 0x00 | ManufacturerAccess() | r/w | word | Default: 0x21; can be changed via write; vendor side-channel for custom commands |
+| 0x01 | RemainingCapacityAlarm() | r/w | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh; 0 disables alarm; default: 0 |
+| 0x02 | RemainingTimeAlarm() | r/w | word | Value in minutes; 0 disables alarm; default: 0 |
+| 0x03 | BatteryMode() | r/w | word | Bit 15: CAPACITY_MODE — default 0 (mA/mAh); 1=10mW/10mWh<br/>Bit 14: CHARGER_MODE — default 0 (broadcast enabled); 1=disable broadcast<br/>Bit 13: ALARM_MODE — default 0 (broadcast enabled); 1=disable broadcast; auto-clears every 60s<br/>Bit 9: PRIMARY_BATTERY — default 0 (secondary role); 1=primary role<br/>Bit 8: CHARGE_CONTROLLER_ENABLED — default 0 (off); 1=on; only effective if bit 0 is set<br/>Bit 7: CONDITION_FLAG — default 0; read-only; 1=conditioning cycle requested<br/>Bit 1: PRIMARY_BATTERY_SUPPORT — default 0; read-only; 1=pack supports primary/secondary switching<br/>Bit 0: INTERNAL_CHARGE_CONTROLLER — default 0; read-only; 1=pack has internal charge controller<br/>Bits 12-10, 6-2: reserved; all bits reset to default on power cycle |
+| 0x04 | AtRate() | r/w | word | CAPACITY_MODE=0: signed mA; CAPACITY_MODE=1: signed 10mW; positive=charge, negative=discharge, zero=default (0); re-write after CAPACITY_MODE change |
+| 0x05 | AtRateTimeToFull() | r | word | Minutes to full at AtRate charge rate — purely hypothetical; valid only when AtRate() > 0; 65535 = not charging or AtRate() ≤ 0 |
+| 0x06 | AtRateTimeToEmpty() | r | word | Minutes to empty at AtRate discharge rate — purely hypothetical; valid only when AtRate() < 0; 65535 = not discharging or AtRate() ≥ 0 |
+| 0x07 | AtRateOK() | r | word | Boolean; 1=battery can sustain AtRate on top of present Current() for 10s; always 1 (TRUE) if AtRate() ≥ 0 |
+| 0x08 | Temperature() | r | word | 0.1K units; e.g. 2981 = 298.1K = 25.0°C; range: 0–6553.5K |
+| 0x09 | Voltage() | r | word | Pack terminal voltage in mV; e.g. 29400 = 29.4V |
+| 0x0A | Current() | r | word | Signed mA; positive = charging current; negative = discharge current; e.g. 2000 = 2A charge, -5000 = 5A discharge |
+| 0x0B | AverageCurrent() | r | word | Signed mA; 1-minute rolling average; same sign convention as Current() |
+| 0x0C | MaxError() | r | word | Gauge accuracy uncertainty in %; 100 = completely uncertain (first boot); converges toward 0 after full cycles |
+| 0x0D | RelativeStateOfCharge() | r | word | SoC as % of FullChargeCapacity(); 0–100%; can briefly exceed 100% during overcharge |
+| 0x0E | AbsoluteStateOfCharge() | r | word | SoC as % of DesignCapacity(); 0–100%; can exceed 100% if learned capacity > design capacity |
+| 0x0F | RemainingCapacity() | r | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh |
+| 0x10 | FullChargeCapacity() | r | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh; learned full capacity updated each cycle |
+| 0x11 | RunTimeToEmpty() | r | word | Minutes at present instantaneous discharge rate; 65535 = not discharging |
+| 0x12 | AverageTimeToEmpty() | r | word | Minutes at 1-minute average discharge rate; 65535 = not discharging |
+| 0x13 | AverageTimeToFull() | r | word | Minutes at 1-minute average charge rate; 65535 = not charging |
+| 0x14 | ChargingCurrent() | r/w | word | Requested charge current in mA broadcast to charger; 65535 = charger should act as voltage source only |
+| 0x15 | ChargingVoltage() | r/w | word | Requested charge voltage in mV broadcast to charger; 65535 = charger should act as current source only |
+| 0x16 | BatteryStatus() / AlarmWarning() | r | word | Bit 15: OVER_CHARGED_ALARM<br/>Bit 14: TERMINATE_CHARGE_ALARM<br/>Bit 13: reserved<br/>Bit 12: OVER_TEMP_ALARM<br/>Bit 11: TERMINATE_DISCHARGE_ALARM<br/>Bit 10: reserved<br/>Bit 9: REMAINING_CAPACITY_ALARM<br/>Bit 8: REMAINING_TIME_ALARM<br/>Bit 7: INITIALIZED — 1=calibrated, 0=calibration lost<br/>Bit 6: DISCHARGING — 1=not charging (includes self-discharge)<br/>Bit 5: FULLY_CHARGED<br/>Bit 4: FULLY_DISCHARGED<br/>Bits 3-0: ERROR_CODE — 0x0=OK, 0x1=Busy, 0x2=Reserved, 0x3=Unsupported, 0x4=Access Denied, 0x5=Overflow, 0x6=Bad Size, 0x7=Unknown |
+| 0x17 | CycleCount() | r | word | Full charge/discharge cycle counter; increments when cumulative discharge ≥ DesignCapacity(); 65535 = ≥65535 cycles |
+| 0x18 | DesignCapacity() | r | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh; nominal factory capacity |
+| 0x19 | DesignVoltage() | r | word | Nominal pack voltage in mV; e.g. 25900 = 25.9V (7S × 3.7V nominal) |
+| 0x1A | SpecificationInfo() | r | word | Bits 15-12: IPScale=0 (×1, no scaling)<br/>Bits 11-8: VScale=0 (×1, no scaling)<br/>Bits 7-4: Version=0x1 (SBS 1.0)<br/>Bits 3-0: Revision=0x1<br/>Packed value: 0x0011<br/>Note: scaling does not apply to ChargingCurrent() and ChargingVoltage() |
+| 0x1B | ManufactureDate() | r | word | Packed: (year−1980)×512 + month×32 + day; e.g. 2026-01-15 = (46×512)+(1×32)+15 = 23599 = 0x5C2F |
+| 0x1C | SerialNumber() | r | word | 16-bit unique serial number; combined with ManufacturerName() and ManufactureDate() forms unique battery ID |
+| 0x1D | — | r | word | Undefined; returns 0x0000 |
+| 0x1E | — | r | word | Undefined; returns 0x0000 |
+| 0x1F | — | r | word | Undefined; returns 0x0000 |
+| 0x20 | ManufacturerName() | r | block | "OpenBatt Team" |
+| 0x21 | DeviceName() | r | block | "OpenBMS" |
+| 0x22 | DeviceChemistry() | r | block | "Li-Ion" |
+| 0x23 | ManufacturerData() | r | block | "Year 2026" |
 | 0x24–0x2F | — | — | — | Optional manufacturer-defined block registers |
 | 0x30–0x3F | — | — | — | Reserved |
 
@@ -86,8 +86,6 @@ Registers in range `0x40` - `0xFF` are OpenBMS-specific extensions and are not p
 | 0x43 | VoltageProtectionControl() | r/w | block | Bytes 0-1: slow UVP threshold - UINT16 mV, range 0-65535<br/>Bytes 2-3: slow UVP detection time - UINT16 ms, range 0-65535<br/>Bytes 4-5: fast UVP threshold - UINT16 mV, range 0-65535<br/>Bytes 6-7: fast UVP detection time - UINT16 ms, range 0-65535<br/>Bytes 8-9: slow OVP threshold - UINT16 mV, range 0-65535<br/>Bytes 10-11: slow OVP detection time - UINT16 ms, range 0-65535<br/>Bytes 12-13: fast OVP threshold - UINT16 mV, range 0-65535<br/>Bytes 14-15: fast OVP detection time - UINT16 ms, range 0-65535 |
 | 0x44 | CurrentProtectionControl() | r/w | block | Bytes 0-1: charge OCP threshold - UINT16 mA, range 0-65535<br/>Bytes 2-3: charge OCP detection time - UINT16 ms, range 0-65535<br/>Bytes 4-5: slow discharge OCP threshold - UINT16 mA, range 0-65535<br/>Bytes 6-7: slow discharge OCP detection time - UINT16 ms, range 0-65535<br/>Bytes 8-9: fast discharge OCP threshold - UINT16 mA, range 0-65535<br/>Bytes 10-11: fast discharge OCP detection time - UINT16 ms, range 0-65535 |
 | 0x45 | TemperatureProtectionControl() | r/w | block | Bytes 0-1: OTP threshold - UINT16 °C, range 0-65535<br/>Bytes 2-3: OTP detection time - UINT16 ms, range 0-65535 |
-| 0x46 | OCV() | r/w | block | Pack OCV table — 51 SoC points (0% to 100% in 2% steps) × 4 temperatures × UINT16 mV = 408 bytes<br/>Bytes 0-101: OCV at -10°C (51 × UINT16)<br/>Bytes 102-203: OCV at 0°C (51 × UINT16)<br/>Bytes 204-305: OCV at 25°C (51 × UINT16)<br/>Bytes 306-407: OCV at 45°C (51 × UINT16) |
-| 0x47 | Impedance() | r/w | block | Per-cell impedance table — 7 cells × 51 SoC points (0% to 100% in 2% steps) × 4 temperatures × UINT16 mΩ = 2856 bytes<br/>Cell 1: Bytes 0-101 at -10°C, Bytes 102-203 at 0°C, Bytes 204-305 at 25°C, Bytes 306-407 at 45°C<br/>Cell 2: Bytes 408-509 at -10°C, Bytes 510-611 at 0°C, Bytes 612-713 at 25°C, Bytes 714-815 at 45°C<br/>Cell 3: Bytes 816-917 at -10°C, Bytes 918-1019 at 0°C, Bytes 1020-1121 at 25°C, Bytes 1122-1223 at 45°C<br/>Cell 4: Bytes 1224-1325 at -10°C, Bytes 1326-1427 at 0°C, Bytes 1428-1529 at 25°C, Bytes 1530-1631 at 45°C<br/>Cell 5: Bytes 1632-1733 at -10°C, Bytes 1734-1835 at 0°C, Bytes 1836-1937 at 25°C, Bytes 1938-2039 at 45°C<br/>Cell 6: Bytes 2040-2141 at -10°C, Bytes 2142-2243 at 0°C, Bytes 2244-2345 at 25°C, Bytes 2346-2447 at 45°C<br/>Cell 7: Bytes 2448-2549 at -10°C, Bytes 2550-2651 at 0°C, Bytes 2652-2753 at 25°C, Bytes 2754-2855 at 45°C |
 | 0x48 | CellVoltage() | r | block | Per-cell voltages — 7 × UINT16 mV = 14 bytes<br/>Bytes 0-1: Cell 1 voltage<br/>Bytes 2-3: Cell 2 voltage<br/>Bytes 4-5: Cell 3 voltage<br/>Bytes 6-7: Cell 4 voltage<br/>Bytes 8-9: Cell 5 voltage<br/>Bytes 10-11: Cell 6 voltage<br/>Bytes 12-13: Cell 7 voltage |
 | 0x49 | CellTemperature() | r | block | Per-cell temperatures — 7 × INT16 0.1°C = 14 bytes<br/>Bytes 0-1: Cell 1 temperature<br/>Bytes 2-3: Cell 2 temperature<br/>Bytes 4-5: Cell 3 temperature<br/>Bytes 6-7: Cell 4 temperature<br/>Bytes 8-9: Cell 5 temperature<br/>Bytes 10-11: Cell 6 temperature<br/>Bytes 12-13: Cell 7 temperature |
 | 0x4A | FETStatus() | r | word | Actual FET state readback<br/>Bits 15-2: reserved<br/>Bit 1: aux FET state - 0=off, 1=on<br/>Bit 0: main FETs state - 0=off, 1=on |

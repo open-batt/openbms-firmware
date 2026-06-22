@@ -19,7 +19,6 @@ extern "C" {
 
 #define ADS131M0_SPI_TIMEOUT        100
 
-#define MODBUS_BUFFER_SIZE          256
 
 typedef struct
 {
@@ -186,27 +185,6 @@ typedef enum
     
 } OpenBMS_Status_t;
 
-typedef enum
-{
-    IDLE = 0,
-    SOF,
-    RX,
-    TX,
-    REG_H,
-    REG_L,
-    DATA,
-    CRC_L,
-    CRC_H,
-
-} MODBUS_state_t;
-
-typedef struct 
-{
-    uint8_t         uart_rx_byte;
-    uint8_t         buffer[MODBUS_BUFFER_SIZE];
-    MODBUS_state_t  state;
-
-} MODBUS_Command_t;
 
 void OpenBMS_Ctrl_Init(void);
 void OpenBMS_Ctrl_Run(void);
