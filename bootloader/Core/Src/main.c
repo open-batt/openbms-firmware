@@ -79,10 +79,10 @@ SMBUS_HandleTypeDef hsmbus2;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-static uint8_t uart_rx_byte                 = 0;
-static char    uart_rx_buf[UART_BUF_SIZE]   = {0};
-static uint8_t uart_rx_idx                  = 0;
-static uint8_t process_cmd                  = 0;
+static uint8_t  uart_rx_byte                = 0;
+static char     uart_rx_buf[UART_BUF_SIZE]  = {0};
+static uint8_t  uart_rx_idx                 = 0;
+static uint8_t  process_cmd                 = 0;
 static uint32_t flash_ext_address           = 0;
 /* USER CODE END PV */
 
@@ -96,20 +96,22 @@ static void MX_I2C2_SMBUS_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_CRC_Init(void);
 /* USER CODE BEGIN PFP */
-static void Bootloader_Start(void);
 
-static void UART_PrintU8(uint8_t value);
-static void UART_ProcessLine(char *line);
+static void               Bootloader_Start(void);
 
-static HAL_StatusTypeDef Flash_Write(uint32_t address, uint8_t *data, uint32_t length);
-static uint8_t IHEX_HexToByte(const char *hex);
+static void               UART_PrintU8(uint8_t value);
+static void               UART_ProcessLine(char *line);
 
-static uint8_t CMD_Erase(void);
-static uint8_t CMD_Program(const char *line);
-static uint8_t CMD_CalculateCRC(uint32_t num_bytes, uint32_t expected_crc);
-static uint8_t CMD_SetAppFlag(void);
-static void    CheckAndJumpToApp(void);
-static void    CMD_Reset(void);
+static HAL_StatusTypeDef  Flash_Write(uint32_t address, uint8_t *data, uint32_t length);
+static uint8_t            IHEX_HexToByte(const char *hex);
+
+static uint8_t            CMD_Erase(void);
+static uint8_t            CMD_Program(const char *line);
+static uint8_t            CMD_CalculateCRC(uint32_t num_bytes, uint32_t expected_crc);
+static uint8_t            CMD_SetAppFlag(void);
+static void               CMD_Reset(void);
+static void               CheckFlagAndJumpToApp(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -436,7 +438,7 @@ static uint8_t CMD_SetAppFlag(void)
 
     return OK;
 }
-static void    CheckAndJumpToApp(void)
+static void    CheckFlagAndJumpToApp(void)
 {
     uint32_t app_flag      = *(uint32_t *)APP_FLAG_ADDRESS;
     uint32_t stack_pointer = *(uint32_t *)APP_FLASH_START_ADDRESS;
@@ -519,7 +521,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_CRC_Init();
   /* USER CODE BEGIN 2 */
-  CheckAndJumpToApp();
+  CheckFlagAndJumpToApp();
   Bootloader_Start();
   /* USER CODE END 2 */
 
