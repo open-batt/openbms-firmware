@@ -28,6 +28,7 @@ static CommErrorType_t  SBS_ReadWriteRegister(OpenBMS_SBS_Data_t *sbs, uint8_t a
 static void             SBS_SetDefaults(OpenBMS_SBS_Data_t *sbs);
 static void             SBS_SetTestValues(OpenBMS_SBS_Data_t *sbs);
 
+static void             RemoveAppFlag(void);
 static void             ProcessCommand(void);
 static uint8_t          Checksum(uint8_t *data, uint16_t length);
 static void             SendResponse(uint8_t *data, uint8_t length);
@@ -1546,9 +1547,37 @@ static void SBS_SetTestValues(OpenBMS_SBS_Data_t *sbs)
     // -------------------------------------------------------------------------
     sbs->learning_status                            =  0x0001;  // learning active
 }
+static void RemoveAppFlag(void)
+{
+    HAL_StatusTypeDef      status;
+    FLASH_EraseInitTypeDef erase_init;
+    uint32_t               page_error = 0;
+
+    status = HAL_FLASH_Unlock();
+    if(status != HAL_OK)
+    {
+        //return ERROR_ERRASE_FAIL;
+    }
+
+    erase_init.TypeErase   = FLASH_TYPEERASE_PAGES;
+    erase_init.Banks       = FLASH_BANK_1;
+    erase_init.Page        = APP_FLAG_FLASH_LAGE;
+    erase_init.NbPages     = 1;
+
+    status = HAL_FLASHEx_Erase(&erase_init, &page_error);
+
+    HAL_FLASH_Lock();
+
+    if(status != HAL_OK)
+    {
+        //return ERROR_ERRASE_FAIL;
+    }
+
+    //return OK;
+}
 static void ProcessCommand(void)
 {
-    uint8_t         *   rx_buf   = uart_cmd.rx_buffer;
+    uint8_t             *rx_buf   = uart_cmd.rx_buffer;
     uint8_t             *tx_buf   = uart_cmd.tx_buffer;
     uint8_t             cmd;
     uint8_t             length;
@@ -1575,6 +1604,9 @@ static void ProcessCommand(void)
     // -------------------------------------------------------
     if(cmd == CMD_BOOTLOADER)
     {
+        RemoveAppFlag();
+        SendResponse((uint8_t*)"1\n",2);
+        HAL_Delay(100);
         NVIC_SystemReset();
     }
 
