@@ -1563,10 +1563,19 @@ static void ProcessCommand(void)
     cmd = rx_buf[0];
     if( cmd != CMD_WRITE && 
         cmd != CMD_READ && 
-        cmd != CMD_ERROR)
+        cmd != CMD_ERROR &&
+        cmd != CMD_BOOTLOADER)
     {
         SendError(CE_WRONG_CMD);
         return;
+    }
+
+    // -------------------------------------------------------
+    // Perform Reset command
+    // -------------------------------------------------------
+    if(cmd == CMD_BOOTLOADER)
+    {
+        NVIC_SystemReset();
     }
 
     // -------------------------------------------------------

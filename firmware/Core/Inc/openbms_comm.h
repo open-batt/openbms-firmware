@@ -18,10 +18,11 @@ extern "C" {
 
 typedef enum
 {
-    CMD_WRITE = 0x01,
-    CMD_READ = 0x02,
-    CMD_ACK = 0x03,
-    CMD_ERROR = 0x04,
+    CMD_WRITE       = 0x01,
+    CMD_READ        = 0x02,
+    CMD_ACK         = 0x03,
+    CMD_ERROR       = 0x04,
+    CMD_BOOTLOADER  = 0x42,
 
 } CommCmdType_t;
 
