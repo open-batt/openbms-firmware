@@ -24,18 +24,16 @@ UART_HandleTypeDef        *debug_uart           = &huart1;
 static UART_Command_t     uart_cmd              = {0};
 static OpenBMS_SBS_Data_t OpenBMS_sbs_data      = {0};
 
+static CommErrorType_t  SBS_ReadWriteRegister(OpenBMS_SBS_Data_t *sbs, uint8_t address, uint8_t *raw_data, uint8_t *length, bool write); 
+static void             SBS_SetDefaults(OpenBMS_SBS_Data_t *sbs);
+static void             SBS_SetTestValues(OpenBMS_SBS_Data_t *sbs);
 
-static void           SBS_ReadWriteRegister(OpenBMS_SBS_Data_t *sbs, uint8_t address, uint8_t *raw_data, uint8_t *length, bool write); 
-static void           SBS_SetDefaults(OpenBMS_SBS_Data_t *sbs);
-static void           SBS_SetTestValues(OpenBMS_SBS_Data_t *sbs);
-static void           ProcessCommand(void);
-static void           ClearAppFlag(void);
+static void             ProcessCommand(void);
+static uint8_t          Checksum(uint8_t *data, uint16_t length);
+static void             SendResponse(uint8_t *data, uint8_t length);
+static void             SendError(CommErrorType_t err);
 
-static void           UART_SendResponse(uint8_t *data, uint8_t length);
-static uint8_t        Checksum(uint8_t *data, uint16_t length);
-
-
-static void SBS_ReadWriteRegister(OpenBMS_SBS_Data_t *sbs, uint8_t address, uint8_t *raw_data, uint8_t *length, bool write)
+static CommErrorType_t SBS_ReadWriteRegister(OpenBMS_SBS_Data_t *sbs, uint8_t address, uint8_t *raw_data, uint8_t *length, bool write)
 {
     void    *data_point = NULL;
     bool     ro         = false;
@@ -414,9 +412,16 @@ static void SBS_ReadWriteRegister(OpenBMS_SBS_Data_t *sbs, uint8_t address, uint
         default: break;
     }
 
-    if(data_point == NULL) return;
+    if(data_point == NULL)
+    {
+        return CE_NO_REG;
+    }
 
-    if(write && !ro)
+    if(write && ro)
+    {
+        return CE_RO;
+    }
+    else if(write && !ro)
     {
         memcpy(data_point, raw_data, *length);
     }
@@ -424,105 +429,8 @@ static void SBS_ReadWriteRegister(OpenBMS_SBS_Data_t *sbs, uint8_t address, uint
     {
         memcpy(raw_data, data_point, *length);
     }
-}
-static void ProcessCommand(void)
-{
-    uint8_t *rx_buf   = uart_cmd.rx_buffer;
-    uint8_t *tx_buf   = uart_cmd.tx_buffer;
-    uint8_t  cmd;
-    uint8_t  length;
-    uint8_t  address;
-    uint8_t  crc_calc, crc_rec;
-    bool     write;
 
-    // -------------------------------------------------------
-    // Parse command type
-    // -------------------------------------------------------
-    cmd = rx_buf[0];
-    if     (cmd == 0x01) write = true;
-    else if(cmd == 0x02) write = false;
-    else return;
-
-    // -------------------------------------------------------
-    // Parse address and length
-    // -------------------------------------------------------
-    address = rx_buf[1];
-    length  = rx_buf[2];
-
-    // -------------------------------------------------------
-    // Validate CRC
-    // -------------------------------------------------------
-    crc_calc = Checksum(rx_buf, length + 3);
-    crc_rec  = rx_buf[length + 3];
-
-    if(crc_calc != crc_rec) return;
-
-    // -------------------------------------------------------
-    // Execute read or write
-    // -------------------------------------------------------
-    if(write)
-    {
-        SBS_ReadWriteRegister(&OpenBMS_sbs_data, address, &rx_buf[3], &length, true);
-    }
-    else
-    {
-        SBS_ReadWriteRegister(&OpenBMS_sbs_data, address, &tx_buf[3], &length, false);
-    }
-    
-
-    // -------------------------------------------------------
-    // Respond
-    // -------------------------------------------------------
-    if(write)
-    {
-        // ACK: [0x03][code][crc]
-        tx_buf[0] = 0x03;
-        tx_buf[1] = 0;
-        tx_buf[2] = 0;
-        tx_buf[2] = Checksum(tx_buf, 3);
-        length = 0;
-    }
-    else
-    {
-        // Read response: [0x02][address][length][data...][crc]
-        tx_buf[0] = 0x02;
-        tx_buf[1] = address;
-        tx_buf[2] = length;
-        // Data is already store at this moment
-        tx_buf[length + 3] = Checksum(tx_buf, length + 3);
-    }
-
-    UART_SendResponse(tx_buf, length + 4);
-}
-static void ClearAppFlag(void)
-{
-    HAL_StatusTypeDef      status;
-    FLASH_EraseInitTypeDef erase_init;
-    uint32_t               page_error = 0;
-
-    status = HAL_FLASH_Unlock();
-    if(status != HAL_OK)
-    {
-        //UART_SendResponse("2\n");
-        return;
-    }
-
-    erase_init.TypeErase   = FLASH_TYPEERASE_PAGES;
-    erase_init.Banks       = FLASH_BANK_1;
-    erase_init.Page        = APP_FLAG_FLASH_LAGE;
-    erase_init.NbPages     = 1;
-
-    status = HAL_FLASHEx_Erase(&erase_init, &page_error);
-
-    HAL_FLASH_Lock();
-
-    if(status != HAL_OK)
-    {
-        //UART_SendResponse("2\n");
-        return;
-    }
-
-    //UART_SendResponse("1\n");;
+    return CE_OK;
 }
 static void SBS_SetDefaults(OpenBMS_SBS_Data_t *sbs)
 {
@@ -1638,11 +1546,92 @@ static void SBS_SetTestValues(OpenBMS_SBS_Data_t *sbs)
     // -------------------------------------------------------------------------
     sbs->learning_status                            =  0x0001;  // learning active
 }
-void OpenBMS_Comm_Init(void)
+static void ProcessCommand(void)
 {
-  //SBS_SetTestValues(&OpenBMS_sbs_data);
-  SBS_SetDefaults(&OpenBMS_sbs_data);
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
+    uint8_t         *   rx_buf   = uart_cmd.rx_buffer;
+    uint8_t             *tx_buf   = uart_cmd.tx_buffer;
+    uint8_t             cmd;
+    uint8_t             length;
+    uint8_t             address;
+    uint8_t             crc_calc, crc_rec;
+    bool                write = false;
+    CommErrorType_t     res;
+
+    // -------------------------------------------------------
+    // Parse command type
+    // -------------------------------------------------------
+    cmd = rx_buf[0];
+    if( cmd != CMD_WRITE && 
+        cmd != CMD_READ && 
+        cmd != CMD_ERROR)
+    {
+        SendError(CE_WRONG_CMD);
+        return;
+    }
+
+    // -------------------------------------------------------
+    // Parse address and length
+    // -------------------------------------------------------
+    address = rx_buf[1];
+    length  = rx_buf[2];
+
+    // -------------------------------------------------------
+    // Validate CRC
+    // -------------------------------------------------------
+    crc_calc = Checksum(rx_buf, length + 3);
+    crc_rec  = rx_buf[length + 3];
+
+    if(crc_calc != crc_rec)
+    {
+        SendError(CE_BAD_CRC);
+        return;
+    }
+
+    // -------------------------------------------------------
+    // Execute read or write
+    // -------------------------------------------------------
+    if     (cmd == 0x01) write = true;
+    else if(cmd == 0x02) write = false;
+
+    if(write)
+    {
+        res = SBS_ReadWriteRegister(&OpenBMS_sbs_data, address, &rx_buf[3], &length, true);
+    }
+    else
+    {
+        res = SBS_ReadWriteRegister(&OpenBMS_sbs_data, address, &tx_buf[3], &length, false);
+    }
+
+    if(res != CE_OK)
+    {
+        SendError( res);
+        return;
+    }
+    
+
+    // -------------------------------------------------------
+    // Respond
+    // -------------------------------------------------------
+    if(write)
+    {
+        // ACK: [0x03][code][crc]
+        tx_buf[0] = 0x03;
+        tx_buf[1] = 0;
+        tx_buf[2] = 0;
+        tx_buf[2] = Checksum(tx_buf, 3);
+        length = 0;
+    }
+    else
+    {
+        // Read response: [0x02][address][length][data...][crc]
+        tx_buf[0] = 0x02;
+        tx_buf[1] = address;
+        tx_buf[2] = length;
+        // Data is already store at this moment
+        tx_buf[length + 3] = Checksum(tx_buf, length + 3);
+    }
+
+    SendResponse(tx_buf, length + 4);
 }
 static uint8_t Checksum(uint8_t *data, uint16_t length)
 {
@@ -1653,49 +1642,27 @@ static uint8_t Checksum(uint8_t *data, uint16_t length)
     }
     return sum;
 }
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
+static void SendResponse(uint8_t *data, uint8_t length)
 {
-    if(huart->Instance == USART1)
-    {
-        uart_cmd.rx_length       = size;
-        uart_cmd.frame_ready     = true;
-        HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
-        /*
-        bool frame_complete = false;
+    HAL_UART_Transmit_IT(&huart1, (uint8_t *)data, length);
+}
+static void SendError(CommErrorType_t err)
+{
+    uint8_t buff[5];
 
-        // Check if frame ends with \n
-        for(uint16_t i = 0; i < size + uart_cmd.rx_length; i++)
-        {
-            if(uart_cmd.rx_buffer[i] == '\n' || uart_cmd.rx_buffer[i] == '\r')
-            {
-                frame_complete = true;
-                size = i;  // trim to position of \n
-                break;
-            }
-        }
+    buff[0] = CMD_ERROR;
+    buff[1] = 0;    // Address
+    buff[2] = 1;    // Lenght
+    buff[3] = err; // Error type
+    buff[4] = Checksum(buff, 4);
 
-        if(frame_complete)
-        {
-            // Complete frame received
-            uart_cmd.rx_buffer[size] = '\0';
-            uart_cmd.rx_length       = size;
-            uart_cmd.frame_ready     = true;
-
-            // Re-arm from beginning for next frame
-            HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
-        }
-        else
-        {
-            // Incomplete frame — accumulate bytes
-            uart_cmd.rx_length += size;
-
-            // Incomplete frame — re-arm from where we left off
-            HAL_UARTEx_ReceiveToIdle_DMA(&huart1,
-                                          uart_cmd.rx_buffer + uart_cmd.rx_length,
-                                          UART_RX_BUFFER_SIZE - uart_cmd.rx_length);
-        }
-        */
-    }
+    SendResponse(buff, sizeof(buff));
+}
+void OpenBMS_Comm_Init(void)
+{
+  //SBS_SetTestValues(&OpenBMS_sbs_data);
+  SBS_SetDefaults(&OpenBMS_sbs_data);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
 }
 void OpenBMS_Comm_Run(void)
 {
@@ -1706,7 +1673,12 @@ void OpenBMS_Comm_Run(void)
     uart_cmd.rx_length   = 0;
   }
 }
-static void UART_SendResponse(uint8_t *data, uint8_t length)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
-    HAL_UART_Transmit_IT(&huart1, (uint8_t *)data, length);
+    if(huart->Instance == USART1)
+    {
+        uart_cmd.rx_length       = size;
+        uart_cmd.frame_ready     = true;
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
+    }
 }

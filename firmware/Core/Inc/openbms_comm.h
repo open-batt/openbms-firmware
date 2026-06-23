@@ -18,18 +18,22 @@ extern "C" {
 
 typedef enum
 {
-    TYPE_UINT8,
-    TYPE_UINT16,
-    TYPE_UINT32,
-    TYPE_INT8,
-    TYPE_INT16,
-    TYPE_INT32,
-    TYPE_FLOAT,
-    TYPE_DOUBLE,
-    TYPE_CHAR,
-    TYPE_STRING,
+    CMD_WRITE = 0x01,
+    CMD_READ = 0x02,
+    CMD_ACK = 0x03,
+    CMD_ERROR = 0x04,
 
-} SBS_RegType_t;
+} CommCmdType_t;
+
+typedef enum
+{
+    CE_OK,
+    CE_WRONG_CMD,
+    CE_BAD_CRC,
+    CE_NO_REG,
+    CE_RO,
+
+} CommErrorType_t;
 
 typedef struct
 {
