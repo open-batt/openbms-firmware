@@ -16,6 +16,7 @@
   */
 
 #include "openbms_ctrl.h"
+#include "openbms_comm.h"
 #include "stm32l4xx_hal_gpio.h"
 
 ADC_HandleTypeDef   *internal_adc    = &hadc1;
@@ -24,13 +25,11 @@ CRC_HandleTypeDef   *hw_crc          = &hcrc;
 I2C_HandleTypeDef   *eeprom_i2c      = &hi2c1;
 SMBUS_HandleTypeDef *host_smbus      = &hsmbus2;
 SPI_HandleTypeDef   *adc_spi         = &hspi1;
-UART_HandleTypeDef  *debug_uart      = &huart1;
 
 uint64_t                OpenBMS_status   = 0;
 OpenBMS_Data_t          OpenBMS_data     = {0};
 OpenBMS_Config_t        OpenBMS_config   = {0};
 OpenBMS_Ctrl_t          OpenBMS_ctrl     = {0};
-static MODBUS_Command_t modbus_cmd       = {0};
 
 static void HandleError(OpenBMS_Status_t error)
 {
@@ -462,68 +461,20 @@ static void GPIO_Ctrl(void)
   OpenBMS_ctrl.vcc_power_good = (bool)HAL_GPIO_ReadPin(PWR_PG_GPIO_Port, PWR_PG_Pin);
 
 }
-static void UART_StartReciving(void)
-{
-    // Start UART receive interrupt for 1 byte
-    HAL_UART_Receive_IT(debug_uart, &modbus_cmd.uart_rx_byte, 1);
-}
-static void UART_ProcessByte(void)
-{
-  switch(modbus_cmd.state)
-  {
-    case IDLE:
-    // Wait for start of frame
-    if(modbus_cmd.uart_rx_byte == 0x01)
-    {
-      modbus_cmd.state = SOF;
-    }
-    break;
-
-    case SOF:
-    {
-      if(modbus_cmd.uart_rx_byte == 0x03) modbus_cmd.state = RX;
-      
-      else if(modbus_cmd.uart_rx_byte == 0x06) modbus_cmd.state = TX;
-      
-      else  modbus_cmd.state = IDLE;
-      
-    }
-    break;
-
-    case RX:
-    // Store received byte in buffer, check if we have a complete command
-    // For example, if command length is fixed at 8 bytes:
-    static uint8_t rx_index = 1;
-    modbus_cmd.buffer[rx_index++] = modbus_cmd.uart_rx_byte;
-
-    if(rx_index >= 8)
-    {
-        // We have a complete command in modbus_cmd.buffer
-        // Process command here...
-
-        // Reset for next command
-        rx_index = 0;
-        modbus_cmd.state = IDLE;
-    }
-    break;
-
-    default:
-      // Handle other states if needed
-      break;
-  }
-}
 void OpenBMS_Ctrl_Init(void)
 {
+  OpenBMS_Comm_Init();
   //EEPROM_Init();
   //EEPROM_Read();
 
-  ADS131M08_Init();
+  //ADS131M08_Init();
 
   //STM32_ADC_Init();
 }
 void OpenBMS_Ctrl_Run(void)
 {
   //GPIO_Ctrl();
+  OpenBMS_Comm_Run();
 }
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -539,16 +490,4 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   {
     STM32_ADC_Read();
   }
-}
-// Callback fires after each received byte
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if(huart->Instance == USART1)
-    {
-        // Process received byte
-        UART_ProcessByte();
-
-        // Re-arm interrupt for next byte
-        UART_StartReciving();
-    }
 }
