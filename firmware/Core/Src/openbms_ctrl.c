@@ -17,6 +17,7 @@
 
 #include "openbms_ctrl.h"
 #include "openbms_comm.h"
+#include "stm32l4xx_hal.h"
 #include "stm32l4xx_hal_gpio.h"
 
 ADC_HandleTypeDef   *internal_adc    = &hadc1;
@@ -27,9 +28,33 @@ SMBUS_HandleTypeDef *host_smbus      = &hsmbus2;
 SPI_HandleTypeDef   *adc_spi         = &hspi1;
 
 uint64_t                OpenBMS_status   = 0;
-OpenBMS_Data_t          OpenBMS_data     = {0};
-OpenBMS_Config_t        OpenBMS_config   = {0};
 OpenBMS_Ctrl_t          OpenBMS_ctrl     = {0};
+
+#define ADS_FULL_SCALE_GAIN_16                150.0
+#define ADS_FULL_SCALE_GAIN_4                 300.0f
+#define ADS_FULL_SCALE_GAIN_2                 600.0f
+
+static bool     pack_current_updated          = false;
+static bool     pack_voltage_updated          = false;
+static bool     cell_voltage_updated          = false;
+static bool     main_vdd_mv_updated           = false;
+static bool     temperature_ntc_updated       = false;
+static bool     temperature_stm32_updated     = true;
+static uint8_t  stm32_adc_conv_index          = 0;
+
+static bool     ads_calibration_start         = false;
+static bool     ads_calibration_finish        = false;
+static int32_t  ads_cal_val_sum[8]            = {0};
+static uint32_t ads_cal_val_count             = 0;
+
+static bool     gpio_meas_cell_voltage_enable      = false;
+static bool     gpio_meas_pack_voltage_enable      = false;
+static bool     gpio_pwr_on                        = true;
+static bool     gpio_cell_balancer_enable[7]       = {false};
+
+static bool     gpio_main_drv_enable               = true;
+static bool     gpio_main_fet_enable               = true;
+ 
 
 static void HandleError(OpenBMS_Status_t error)
 {
@@ -58,9 +83,9 @@ static void EEPROM_Read(void)
   uint32_t crc_stored   = 0;
   uint32_t crc_calc     = 0;
   uint8_t  data[32];
-  uint16_t total_bytes  = sizeof(OpenBMS_Config_t);
+  uint16_t total_bytes  = sizeof(OpenBMS_Data_t);
   uint16_t bytes_read   = 0;
-  uint8_t  *dest        = (uint8_t *)&OpenBMS_config;
+  uint8_t  *dest        = (uint8_t *)&OpenBMS_data;
   uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);  // Last 4 bytes of EEPROM
 
   // Read struct starting at address 0x0000
@@ -102,7 +127,7 @@ static void EEPROM_Read(void)
   }
 
   // Calculate CRC32 over read struct and compare with stored CRC
-  crc_calc = HAL_CRC_Calculate(hw_crc, (uint32_t *)&OpenBMS_config, total_bytes / sizeof(uint32_t));
+  crc_calc = HAL_CRC_Calculate(hw_crc, (uint32_t *)&OpenBMS_data, total_bytes / sizeof(uint32_t));
 
   if(crc_calc != crc_stored)
   {
@@ -114,9 +139,9 @@ static void EEPROM_Update(void)
 {
   uint8_t  eeprom_buf[32];
   uint8_t  struct_buf[32];
-  uint16_t total_bytes  = sizeof(OpenBMS_Config_t);
+  uint16_t total_bytes  = sizeof(OpenBMS_Data_t);
   uint16_t bytes_done   = 0;
-  uint8_t  *src         = (uint8_t *)&OpenBMS_config;
+  uint8_t  *src         = (uint8_t *)&OpenBMS_data;
   uint32_t crc_calc     = 0;
   uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);
 
@@ -168,7 +193,7 @@ static void EEPROM_Update(void)
   }
 
   // Calculate new CRC32 over entire struct
-  crc_calc = HAL_CRC_Calculate(&hcrc, (uint32_t *)&OpenBMS_config, sizeof(OpenBMS_Config_t));
+  crc_calc = HAL_CRC_Calculate(&hcrc, (uint32_t *)&OpenBMS_data, sizeof(OpenBMS_Data_t));
 
   // Write CRC to last 4 bytes of EEPROM
   if(HAL_I2C_Mem_Write(eeprom_i2c,
@@ -186,12 +211,11 @@ static void EEPROM_Update(void)
   // Wait for final CRC write cycle to complete
   HAL_Delay(5);
 }
-static bool ADS131M08_ReadReg(uint8_t reg, uint16_t *status, uint8_t* value)
+static bool ADS131M08_ReadReg(uint8_t reg, uint8_t* data)
 {
   // According to datasheet, if word is set to 24 bits, then total SPI transacation has 30 bytes
   // First 3 bytes are command, followed by 24 bytes of response, followed by 3 bytes of CRC
   uint8_t tx_buff[30] = {0};
-  uint8_t rx_buff[30] = {0};
   uint16_t cmd;
   bool res = true;
 
@@ -202,7 +226,7 @@ static bool ADS131M08_ReadReg(uint8_t reg, uint16_t *status, uint8_t* value)
   // CS low
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
 
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, data, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
   {
     res = false;
   }
@@ -210,9 +234,25 @@ static bool ADS131M08_ReadReg(uint8_t reg, uint16_t *status, uint8_t* value)
   // CS high
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
 
-  // Assign status word and value from response
-  *status = (rx_buff[0] << 8) | rx_buff[1];
-  memcpy(value, &rx_buff[2], 24);
+  return res;
+}
+static bool ADS131M08_ReadADCValues(uint8_t* data)
+{
+  // TX: 3 bytes NULL command + 27 bytes zeros
+  // RX: 3 bytes STATUS + 24 bytes channel data (CH0-CH7) + 3 bytes CRC
+  uint8_t tx_buff[30] = {0};
+  bool res = true;
+
+  // CS low
+  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
+
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, data, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  {
+    res = false;
+  }
+
+  // CS high
+  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
 
   return res;
 }
@@ -228,9 +268,9 @@ static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
   tx_buff[1] =  cmd       & 0xFF;
   tx_buff[2] = 0x00;
 
-  tx_buff[3] = 0x00;
-  tx_buff[4] = (value >> 8) & 0xFF;
-  tx_buff[5] =  value       & 0xFF;
+  tx_buff[3] = (value >> 8) & 0xFF;
+  tx_buff[4] =  value       & 0xFF;
+  tx_buff[5] = 0x00;
 
     // CS low
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
@@ -247,10 +287,9 @@ static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
 static void ADS131M08_Init(void)
 {
   uint8_t rx_data[30] = {0};
-  uint16_t status;
 
   // Read ADC ID register (0x00) to verify communication
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
+  if(!ADS131M08_ReadReg(0x00, rx_data))
   {
     HandleError(OPENBMS_ADS131M08_INIT_FAIL);
     return;
@@ -258,7 +297,7 @@ static void ADS131M08_Init(void)
 
   // To read out register, actually one more transaction is needed after writing the command, 
   // so read ID register again to get the value
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
+  if(!ADS131M08_ReadReg(0x00, rx_data))
   {
     HandleError(OPENBMS_ADS131M08_INIT_FAIL);
     return;
@@ -272,7 +311,7 @@ static void ADS131M08_Init(void)
   }
 
   // Initilize CLOCK register, all channels enabled, SPS set to 125
-  if(!ADS131M08_WriteReg(0x03, 0xFF13))
+  if(!ADS131M08_WriteReg(0x03, 0xFF1F))
   {
     HandleError(OPENBMS_ADS131M08_INIT_FAIL);
     return;
@@ -291,75 +330,136 @@ static void ADS131M08_Init(void)
     HandleError(OPENBMS_ADS131M08_INIT_FAIL);
     return;
   }
+
+  // Start internal offset calibration
+  ADS131M08_WriteReg(0x09, 0x0001);  // CH0_CFG MUX=01
+  ADS131M08_WriteReg(0x0E, 0x0001);  // CH1_CFG MUX=01
+  ADS131M08_WriteReg(0x13, 0x0001);  // CH2_CFG MUX=01
+  ADS131M08_WriteReg(0x18, 0x0001);  // CH3_CFG MUX=01
+  ADS131M08_WriteReg(0x1D, 0x0001);  // CH4_CFG MUX=01
+  ADS131M08_WriteReg(0x22, 0x0001);  // CH5_CFG MUX=01
+  ADS131M08_WriteReg(0x27, 0x0001);  // CH6_CFG MUX=01
+  ADS131M08_WriteReg(0x2C, 0x0001);  // CH7_CFG MUX=01
+
+  // Wait a bit to settle down
+  HAL_Delay(10);
+  ads_calibration_start = true;
+  
+  HAL_Delay(100);
+  ads_calibration_finish = true;
+
+  // Stop internal offset calibration
+  ADS131M08_WriteReg(0x09, 0x0000);  // CH0_CFG MUX=01
+  ADS131M08_WriteReg(0x0E, 0x0000);  // CH1_CFG MUX=01
+  ADS131M08_WriteReg(0x13, 0x0000);  // CH2_CFG MUX=01
+  ADS131M08_WriteReg(0x18, 0x0000);  // CH3_CFG MUX=01
+  ADS131M08_WriteReg(0x1D, 0x0000);  // CH4_CFG MUX=01
+  ADS131M08_WriteReg(0x22, 0x0000);  // CH5_CFG MUX=01
+  ADS131M08_WriteReg(0x27, 0x0000);  // CH6_CFG MUX=01
+  ADS131M08_WriteReg(0x2C, 0x0000);  // CH7_CFG MUX=01
+
+  HAL_Delay(10);
+  gpio_meas_cell_voltage_enable = true;
+  
+
 }
 static void ADS131M08_Read(void)
 {
   uint8_t rx_data[30] = {0};
-  uint16_t status;
   int32_t raw_value;
   float voltage_mv;
 
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
+  if(!ADS131M08_ReadADCValues(rx_data))
   {
     HandleError(OPENBMS_ADS131M08_READ_FAIL);
   }
 
   // Extract CH0 value, get battery current by dividing voltage by shunt resistance
-  raw_value = ((int32_t)rx_data[0] << 24) | (rx_data[1] << 16) | (rx_data[2] << 8);
+  raw_value = ((int32_t)rx_data[3] << 24) | (rx_data[4] << 16) | (rx_data[5] << 8);
   raw_value >>= 8;
   voltage_mv = (float)raw_value * (150.0f / 16777216.0f);
-  voltage_mv /= OpenBMS_config.shunt_resistance_mohms;
-  OpenBMS_data.pack_current = voltage_mv;
+  OpenBMS_data.current = voltage_mv * OpenBMS_data.shunt_resistance_mohms;
 
   // Set update flags
-  OpenBMS_data.pack_current_updated   = true;
+  pack_current_updated = true;
 
   // Extract CH1 - CH7 values and get cell voltages
-  if(OpenBMS_ctrl.meas_pack_voltage_enable & OpenBMS_ctrl.meas_cell_voltage_enable)
-  {
-    // Only measure pack voltage from channel 7
-    raw_value = ((int32_t)rx_data[7*3+0] << 24) | (rx_data[7*3+1] << 16) | (rx_data[7*3+2] << 8);
-    raw_value >>= 8;
-    voltage_mv = (float)raw_value * (600.0f / 16777216.0f);
-    OpenBMS_data.pack_voltage = voltage_mv / OpenBMS_config.batt_voltage_resistance_factor;
-
-    // Set update flags
-    OpenBMS_data.pack_voltage_updated = true;
-  }
-  else if(OpenBMS_ctrl.meas_cell_voltage_enable)
+  if(gpio_meas_cell_voltage_enable)
   {
     // Measure all cell voltages
     for(uint8_t i = 1; i <= 7; i++)
     {
-      raw_value = ((int32_t)rx_data[i*3+0] << 24) | (rx_data[i*3+1] << 16) | (rx_data[i*3+2] << 8);
+      raw_value = ((int32_t)rx_data[i*3+3] << 24) | (rx_data[i*3+4] << 16) | (rx_data[i*3+5] << 8);
       raw_value >>= 8;
       voltage_mv = (float)raw_value * (600.0f / 16777216.0f);
-      voltage_mv /= OpenBMS_config.cell_voltage_resistance_factor;
-      OpenBMS_data.cell_voltage[i-1] = voltage_mv;
+      OpenBMS_data.cell_voltage[i-1] = voltage_mv * OpenBMS_data.cell_voltage_resistance_factor;
+      OpenBMS_data.cell_voltage[i-1] -= OpenBMS_data.voltage_offset[i-1];
+      OpenBMS_data.cell_voltage[i-1] *= OpenBMS_data.voltage_gain[i-1];
     }
 
     // Set update flags
-    OpenBMS_data.cell_voltage_updated = true;
+    cell_voltage_updated = true;
   }
-}
-static float NTC_GetTemperature(float ntc_mv, float vdd_mv)
-{
-    if(ntc_mv >= vdd_mv || ntc_mv <= 0.0f)
+  /*
+  else if(gpio_meas_pack_voltage_enable)
+  {
+    // Only measure pack voltage from channel 7
+    raw_value = ((int32_t)rx_data[24] << 24) | (rx_data[25] << 16) | (rx_data[26] << 8);
+    raw_value >>= 8;
+    voltage_mv = (float)raw_value * (1200.0f / 16777216.0f);
+    OpenBMS_data.voltage = voltage_mv * OpenBMS_data.batt_voltage_resistance_factor;
+
+    // Set update flags
+    pack_voltage_updated = true;
+  }
+  */
+  else if(ads_calibration_start)
+  {
+    // Record offset values
+    for(uint8_t i = 0; i <= 7; i++)
     {
-        return -273.15f;
+      raw_value = ((int32_t)rx_data[i*3+3] << 24) | (rx_data[i*3+4] << 16) | (rx_data[i*3+5] << 8);
+      raw_value >>= 8;
+      
+      ads_cal_val_sum[i] += raw_value;
     }
 
-    float r_ntc = OpenBMS_config.ntc_r_fixed * (ntc_mv / (vdd_mv - ntc_mv));
+    ads_cal_val_count++;
 
+    if(ads_calibration_finish)
+    {
+      // Get offset values now
+      for(uint8_t i = 0; i <= 7; i++) 
+      {
+        ads_cal_val_sum[i] /= ads_cal_val_count;
+
+        if(i == 0) 
+        {
+          OpenBMS_data.current_sensor_offset = (float) ads_cal_val_sum[i] * (150.0f / 16777216.0f);
+          OpenBMS_data.current_sensor_offset *= OpenBMS_data.shunt_resistance_mohms;
+        }
+        else 
+        {
+          OpenBMS_data.voltage_offset[i-1] = (float) ads_cal_val_sum[i] * (600.0f / 16777216.0f);
+          OpenBMS_data.voltage_offset[i-1] *= OpenBMS_data.cell_voltage_resistance_factor;
+        }
+      }
+
+      ads_calibration_start   = false;
+      ads_calibration_finish  = false;
+    }
+  }
+}
+static float NTC_GetTemperature(float r_ntc)
+{
     if(r_ntc <= 0.0f)
     {
         return -273.15f;
     }
 
-    float temp_k = 1.0f / ((1.0f / OpenBMS_config.ntc_t_nominal) + (1.0f / OpenBMS_config.ntc_beta) * logf(r_ntc / OpenBMS_config.ntc_r_nominal)
-    );
+    float temp_k = 1.0f / ((1.0f / OpenBMS_data.ntc_t_nominal) + (1.0f / OpenBMS_data.ntc_beta) * logf(r_ntc / OpenBMS_data.ntc_r_nominal));
 
-    return temp_k - 273.15f;
+    return (temp_k * 10.0f);
 }
 static void STM32_ADC_Init(void)
 {
@@ -368,85 +468,86 @@ static void STM32_ADC_Init(void)
 }
 static void STM32_ADC_Read(void)
 {
-  switch(ADC_CHANNEL_ID_MASK & internal_adc->Instance->SQR1)
+  uint32_t adc_raw = HAL_ADC_GetValue(internal_adc);
+
+  switch(stm32_adc_conv_index)
   {
-    case ADC_CHANNEL_16:         
+    case 0:         
     {
-      uint32_t adc_ntc_raw     = HAL_ADC_GetValue(internal_adc); 
+      // Calculate NTC voltage using actual VDD
+      float r_ntc = 10000 / ((4095.0f / (float)adc_raw) - 1);
 
-      if(OpenBMS_data.vdd_mv_updated)
-      {
-        // Calculate NTC voltage using actual VDD
-        float ntc_mv = ((float)adc_ntc_raw / 4095.0f) * OpenBMS_data.vdd_mv;
+      // Get temperature now
+      OpenBMS_data.temperature_package = NTC_GetTemperature(r_ntc);
 
-        // Get temperature now
-        OpenBMS_data.temperature_ntc = NTC_GetTemperature(ntc_mv, OpenBMS_data.vdd_mv);
-
-        // Set flag
-        OpenBMS_data.temperature_ntc_updated = true;
-      }
-
+      // Set flag
+      temperature_ntc_updated = true;
     }
     break;
 
-    case ADC_CHANNEL_VREFINT:    
+    case 1:    
     {
-      uint32_t adc_vrefint_raw = HAL_ADC_GetValue(internal_adc);
-
       // ST factory calibrated VREFINT value measured at 3.0V, 30°C
       // Stored in flash at fixed address
       uint16_t vrefint_cal = *((uint16_t*)0x1FFF75AA);
 
       // Calculate actual VDD
       // vrefint_cal was measured at 3.0V so multiply by 3.0
-      OpenBMS_data.vdd_mv = (3000.0f * (float)vrefint_cal) / (float)adc_vrefint_raw;
+      OpenBMS_data.main_vdd_voltage_mv = (3000.0f * (float)vrefint_cal) / (float)adc_raw;
 
       // Set flag true
-      OpenBMS_data.vdd_mv_updated = true;
+      main_vdd_mv_updated = true;
     }
     break;
 
-    case ADC_CHANNEL_TEMPSENSOR: 
+    case 2:
     {
-      uint32_t adc_temp_raw = HAL_ADC_GetValue(internal_adc); 
+      if(main_vdd_mv_updated)
+      {
+        uint16_t ts_cal1 = *((uint16_t*)0x1FFF75A8);
+        uint16_t ts_cal2 = *((uint16_t*)0x1FFF75CA);
 
-      // Calculate STM32 die temperature using actual VDD
-      // ST factory cal values
-      uint16_t ts_cal1 = *((uint16_t*)0x1FFF75A8);  // TS_CAL1 at 30°C, 3.0V
-      uint16_t ts_cal2 = *((uint16_t*)0x1FFF75CA);  // TS_CAL2 at 130°C, 3.0V
-      OpenBMS_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1) * ((float)adc_temp_raw - (float)ts_cal1) + 30.0f;
+        // Scale UP to 3.0V reference — VDD > 3.0V means raw is artificially low
+        float adc_corrected = (float)adc_raw * (OpenBMS_data.main_vdd_voltage_mv / 3000.0f);
 
-      // Set flag true
-      OpenBMS_data.temperature_stm32_updated = true;
+        OpenBMS_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1)
+                                            * (adc_corrected - (float)ts_cal1) + 30.0f;
+
+        temperature_stm32_updated = true;
+      }
     }
     break;
   }
+
+  stm32_adc_conv_index++;
+  if(stm32_adc_conv_index == 3) stm32_adc_conv_index = 0;
 }
 static void GPIO_Ctrl(void)
 {
-  // Set main FET state
-  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.main_fet_enable);
+  // Set main FET and driver state
+  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) gpio_main_drv_enable);
+  HAL_GPIO_WritePin(DRV_FET_EN_GPIO_Port, DRV_FET_EN_Pin, (GPIO_PinState) gpio_main_fet_enable);
 
   // Set precharge/predischarge FET state
   HAL_GPIO_WritePin(DRV_PRE_FET_EN_GPIO_Port, DRV_PRE_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.pre_fet_enable);
 
   // Enable cell voltage measuring
-  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) OpenBMS_ctrl.meas_cell_voltage_enable);
+  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) (gpio_meas_cell_voltage_enable | gpio_meas_pack_voltage_enable));
 
   // Enable pack voltage measuring
-  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) OpenBMS_ctrl.meas_pack_voltage_enable);
+  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) gpio_meas_pack_voltage_enable);
 
   // Set balancer
-  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[0]);
-  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[1]);
-  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[2]);
-  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[3]);
-  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[4]);
-  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[5]);
-  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[6]);
+  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[0]);
+  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[1]);
+  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[2]);
+  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[3]);
+  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[4]);
+  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[5]);
+  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[6]);
   
   // Set main power signal on to keep OpenBMS on
-  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) OpenBMS_ctrl.pwr_on);
+  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) gpio_pwr_on);
 
   // Read driver fault pin, inverse state
   OpenBMS_ctrl.fet_driver_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GPIO_Port, DRV_FLT_Pin));
@@ -467,14 +568,32 @@ void OpenBMS_Ctrl_Init(void)
   //EEPROM_Init();
   //EEPROM_Read();
 
-  //ADS131M08_Init();
-
-  //STM32_ADC_Init();
+  ADS131M08_Init();
+  STM32_ADC_Init();
 }
 void OpenBMS_Ctrl_Run(void)
 {
-  //GPIO_Ctrl();
+  GPIO_Ctrl();
   OpenBMS_Comm_Run();
+
+  char buffer[100];
+  if(cell_voltage_updated)
+  {
+    cell_voltage_updated = false;
+    int length = sprintf(buffer, "%d,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%d\n\r",
+      OpenBMS_data.voltage,
+      OpenBMS_data.cell_voltage[0],
+      OpenBMS_data.cell_voltage[1],
+      OpenBMS_data.cell_voltage[2],
+      OpenBMS_data.cell_voltage[3],
+      OpenBMS_data.cell_voltage[4],
+      OpenBMS_data.cell_voltage[5],
+      OpenBMS_data.cell_voltage[6],
+      OpenBMS_data.current);
+
+    HAL_UART_Transmit_IT(&huart1, (uint8_t *)buffer, length);
+    HAL_Delay(10);
+  }
 }
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {

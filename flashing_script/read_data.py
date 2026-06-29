@@ -90,107 +90,160 @@ SBS_REGISTERS = [
 ]
 
 # ---------------------------------------------------------------
-# Control registers  0x40 — 0x74
+# Control and configuration registers  0x40 — 0x6F
 # ---------------------------------------------------------------
 CTRL_REGISTERS = [
-    Reg(0x40, "Configuration",                  "flags",       'H', 1),
-    Reg(0x41, "MainControl",                    "flags",       'H', 1),
-    Reg(0x42, "FETState",                       "flags",       'H', 1),
-    Reg(0x43, "FETStatus",                      "flags",       'H', 1),
-    Reg(0x44, "UVP_SlowThreshold",              "mV",          'H', 1),
-    Reg(0x45, "UVP_SlowTime",                   "ms",          'H', 1),
-    Reg(0x46, "UVP_FastThreshold",              "mV",          'H', 1),
-    Reg(0x47, "UVP_FastTime",                   "ms",          'H', 1),
-    Reg(0x48, "OVP_SlowThreshold",              "mV",          'H', 1),
-    Reg(0x49, "OVP_SlowTime",                   "ms",          'H', 1),
-    Reg(0x4A, "OVP_FastThreshold",              "mV",          'H', 1),
-    Reg(0x4B, "OVP_FastTime",                   "ms",          'H', 1),
-    Reg(0x4C, "OCP_ChargeThreshold",            "mA",          'H', 1),
-    Reg(0x4D, "OCP_ChargeTime",                 "ms",          'H', 1),
-    Reg(0x4E, "OCP_DischargeSlowThreshold",     "mA",          'H', 1),
-    Reg(0x4F, "OCP_DischargeSlowTime",          "ms",          'H', 1),
-    Reg(0x50, "OCP_DischargeFastThreshold",     "mA",          'H', 1),
-    Reg(0x51, "OCP_DischargeFastTime",          "ms",          'H', 1),
-    Reg(0x52, "OTP_Threshold",                  "C",           'H', 1),
-    Reg(0x53, "OTP_Time",                       "ms",          'H', 1),
-    Reg(0x54, "CellVoltage",                    "mV",          'H', 7),
-    Reg(0x55, "CellTemperature",                "0.1C",        'h', 7),
-    Reg(0x56, "CellSoC",                        "%",           'B', 7),
-    Reg(0x57, "CellSoH",                        "%",           'B', 7),
-    Reg(0x58, "CellRemainingCapacity",          "mAh",         'H', 7),
-    Reg(0x59, "CellSelfDischarge",              "mAh/month",   'H', 7),
-    Reg(0x5A, "CellQmax",                       "mAh",         'H', 7),
-    Reg(0x5B, "FaultSnapshotVoltage",           "mV",          'H', 7),
-    Reg(0x5C, "FaultSnapshotCurrent",           "mA",          'h', 1),
-    Reg(0x5D, "FaultSnapshotTemperature",       "C",           'B', 1),
-    Reg(0x5E, "FaultSnapshotSoC",               "%",           'B', 1),
-    Reg(0x5F, "FaultCode",                      "",            'B', 8),
-    Reg(0x60, "FaultTimestamp",                 "Unix",        'I', 8),
-    Reg(0x61, "OVP_Counter",                    "count",       'H', 7),
-    Reg(0x62, "UVP_Counter",                    "count",       'H', 7),
-    Reg(0x63, "OCP_Counter",                    "count",       'H', 7),
-    Reg(0x64, "OTP_Counter",                    "count",       'H', 7),
-    Reg(0x65, "UTP_Counter",                    "count",       'H', 7),
-    Reg(0x66, "CurrentSensorOffset",            "mA",          'h', 1),
-    Reg(0x67, "CurrentSensorGain",              "",            'h', 1),
-    Reg(0x68, "VoltageOffset",                  "mV",          'h', 7),
-    Reg(0x69, "VoltageGain",                    "",            'h', 7),
-    Reg(0x6A, "TemperatureOffset",              "C",           'B', 1),
-    Reg(0x6B, "CellBalancingEnergy",            "mWh",         'H', 7),
-    Reg(0x6C, "CellBalancingTime",              "min",         'H', 7),
-    Reg(0x6D, "CellDeepestDischarge",           "%",           'B', 7),
-    Reg(0x6E, "CellMaxTemperature",             "C",           'B', 7),
-    Reg(0x6F, "BalancingStatus",                "flags",       'H', 1),
-    Reg(0x70, "BalancingControl",               "flags",       'H', 1),
-    Reg(0x71, "FirmwareVersion",                "",            's', 32),
-    Reg(0x72, "HardwareVersion",                "",            's', 32),
-    Reg(0x73, "LastCommunicationTimestamp",     "Unix",        'I', 1),
-    Reg(0x74, "UptimeCounter",                  "s",           'I', 1),
+    # System control
+    Reg(0x40, "Configuration",                  "flags",    'H', 1),
+    Reg(0x41, "MainControl",                    "flags",    'H', 1),
+    Reg(0x42, "PackCapacity",                   "mAh",      'I', 1),
+    Reg(0x43, "MaxPackVoltage",                 "mV",       'H', 1),
+    Reg(0x44, "MinPackVoltage",                 "mV",       'H', 1),
+
+    # Calibration
+    Reg(0x45, "CurrentSensorOffset",            "",         'f', 1),
+    Reg(0x46, "CurrentSensorGain",              "",         'f', 1),
+    Reg(0x47, "VoltageOffset",                  "",         'f', 7),
+    Reg(0x48, "VoltageGain",                    "",         'f', 7),
+
+    # NTC constants
+    Reg(0x49, "NTC_Beta",                       "",         'f', 1),
+    Reg(0x4A, "NTC_R_Nominal",                  "Ohm",      'f', 1),
+    Reg(0x4B, "NTC_R_Fixed",                    "Ohm",      'f', 1),
+    Reg(0x4C, "NTC_T_Nominal",                  "K",        'f', 1),
+    Reg(0x4D, "TemperatureOffset",              "C",        'f', 1),
+
+    # Voltage protection
+    Reg(0x60, "UVP_SlowThreshold",              "mV",       'H', 1),
+    Reg(0x61, "UVP_SlowTime",                   "ms",       'H', 1),
+    Reg(0x62, "UVP_FastThreshold",              "mV",       'H', 1),
+    Reg(0x63, "UVP_FastTime",                   "ms",       'H', 1),
+    Reg(0x64, "OVP_SlowThreshold",              "mV",       'H', 1),
+    Reg(0x65, "OVP_SlowTime",                   "ms",       'H', 1),
+    Reg(0x66, "OVP_FastThreshold",              "mV",       'H', 1),
+    Reg(0x67, "OVP_FastTime",                   "ms",       'H', 1),
+
+    # Current protection
+    Reg(0x68, "OCP_ChargeThreshold",            "mA",       'H', 1),
+    Reg(0x69, "OCP_ChargeTime",                 "ms",       'H', 1),
+    Reg(0x6A, "OCP_DischargeSlowThreshold",     "mA",       'H', 1),
+    Reg(0x6B, "OCP_DischargeSlowTime",          "ms",       'H', 1),
+    Reg(0x6C, "OCP_DischargeFastThreshold",     "mA",       'H', 1),
+    Reg(0x6D, "OCP_DischargeFastTime",          "ms",       'H', 1),
+
+    # Temperature protection
+    Reg(0x6E, "OTP_Threshold",                  "C",        'H', 1),
+    Reg(0x6F, "OTP_Time",                       "ms",       'H', 1),
 ]
 
 # ---------------------------------------------------------------
-# ECM / Kalman registers  0xA0 — 0xC6
+# Analog measurement registers  0x80 — 0x82
+# ---------------------------------------------------------------
+ANALOG_REGISTERS = [
+    Reg(0x80, "FETStatus",                      "flags",    'H', 1),
+    Reg(0x81, "MainVddVoltage",                 "mV",       'f', 1),
+    Reg(0x82, "TemperatureSTM32",               "C",        'f', 1),
+]
+
+# ---------------------------------------------------------------
+# Fault registers  0x90 — 0x99
+# ---------------------------------------------------------------
+FAULT_REGISTERS = [
+    Reg(0x90, "FaultSnapshotVoltage",           "mV",       'H', 7),
+    Reg(0x91, "FaultSnapshotCurrent",           "mA",       'h', 1),
+    Reg(0x92, "FaultSnapshotTemperature",       "C",        'B', 1),
+    Reg(0x93, "FaultSnapshotSoC",               "%",        'B', 1),
+    Reg(0x94, "FaultCode",                      "",         'B', 8),
+    Reg(0x95, "FaultTimestamp",                 "Unix",     'I', 8),
+    Reg(0x96, "CellBalancingEnergy",            "mWh",      'H', 7),
+    Reg(0x97, "CellBalancingTime",              "min",      'H', 7),
+    Reg(0x98, "CellDeepestDischarge",           "%",        'B', 7),
+    Reg(0x99, "CellMaxTemperature",             "C",        'B', 7),
+]
+
+# ---------------------------------------------------------------
+# Hardware configuration registers  0xA0 — 0xA9
+# ---------------------------------------------------------------
+HW_REGISTERS = [
+    Reg(0xA0, "CellVoltageResistanceFactor",    "",         'f', 1),
+    Reg(0xA1, "BattVoltageResistanceFactor",    "",         'f', 1),
+    Reg(0xA2, "ShuntResistance",                "mOhm",     'f', 1),
+    Reg(0xA3, "CurrentSenseOffsetMv",           "mV",       'f', 1),
+    Reg(0xA4, "CurrentSenseGain",               "",         'f', 1),
+    Reg(0xA5, "BalancerResistor",               "mOhm",     'I', 1),
+    Reg(0xA6, "FirmwareVersion",                "",         's', 32),
+    Reg(0xA7, "HardwareVersion",                "",         's', 32),
+    Reg(0xA8, "LastCommunicationTimestamp",     "Unix",     'I', 1),
+    Reg(0xA9, "UptimeCounter",                  "s",        'I', 1),
+]
+
+# ---------------------------------------------------------------
+# Fuel gauge registers  0xB0 — 0xB5
+# ---------------------------------------------------------------
+FUEL_REGISTERS = [
+    Reg(0xB0, "CellVoltage",                    "mV",       'f', 7),
+    Reg(0xB1, "CellSoC",                        "%",        'B', 7),
+    Reg(0xB2, "CellSoH",                        "%",        'B', 7),
+    Reg(0xB3, "CellRemainingCapacity",          "mAh",      'H', 7),
+    Reg(0xB4, "CellSelfDischarge",              "mAh/month",'H', 7),
+    Reg(0xB5, "CellQmax",                       "mAh",      'H', 7),
+]
+
+# ---------------------------------------------------------------
+# ECM / Kalman registers  0xB6 — 0xDC
 # ---------------------------------------------------------------
 ECM_REGISTERS = [
-    Reg(0xA0, "SOC_Grid",               "%",        'f', 20),
-    Reg(0xA1, "OCV_Discharge",          "V",        'f', 20),
-    Reg(0xA2, "OCV_Charge",             "V",        'f', 20),
-    Reg(0xA3, "R0_Discharge",           "Ohm",      'f', 20),
-    Reg(0xA4, "R1_Discharge",           "Ohm",      'f', 20),
-    Reg(0xA5, "Tau1_Discharge",         "s",        'f', 20),
-    Reg(0xA6, "R2_Discharge",           "Ohm",      'f', 20),
-    Reg(0xA7, "Tau2_Discharge",         "s",        'f', 20),
-    Reg(0xA8, "R0_Charge",              "Ohm",      'f', 20),
-    Reg(0xA9, "R1_Charge",              "Ohm",      'f', 20),
-    Reg(0xAA, "Tau1_Charge",            "s",        'f', 20),
-    Reg(0xAB, "R2_Charge",              "Ohm",      'f', 20),
-    Reg(0xAC, "Tau2_Charge",            "s",        'f', 20),
-    Reg(0xAD, "Q_Nom_TempSetpoints",    "C",        'f', 5 ),
-    Reg(0xAE, "Q_Nom_TempCapacity",     "Ah",       'f', 5 ),
-    Reg(0xAF, "Q_Nom",                  "Ah",       'f', 1 ),
-    Reg(0xB0, "CoulombicEfficiency",    "",         'f', 1 ),
-    Reg(0xB1, "R0_Ref",                 "Ohm",      'f', 1 ),
-    Reg(0xB2, "R1_Ref",                 "Ohm",      'f', 1 ),
-    Reg(0xB3, "Tau1_Ref",               "s",        'f', 1 ),
-    Reg(0xB4, "R2_Ref",                 "Ohm",      'f', 1 ),
-    Reg(0xB5, "Tau2_Ref",               "s",        'f', 1 ),
-    Reg(0xB6, "Ea_R0",                  "J/mol",    'f', 1 ),
-    Reg(0xB7, "Ea_R1",                  "J/mol",    'f', 1 ),
-    Reg(0xB8, "Ea_Tau1",                "J/mol",    'f', 1 ),
-    Reg(0xB9, "Ea_R2",                  "J/mol",    'f', 1 ),
-    Reg(0xBA, "Ea_Tau2",                "J/mol",    'f', 1 ),
-    Reg(0xBB, "KF_Q_SOC",               "",         'f', 1 ),
-    Reg(0xBC, "KF_Q_RC1",               "",         'f', 1 ),
-    Reg(0xBD, "KF_Q_RC2",               "",         'f', 1 ),
-    Reg(0xBE, "KF_R_V",                 "V2",       'f', 1 ),
-    Reg(0xBF, "Cell_SOC_f",             "",         'f', 7 ),
-    Reg(0xC0, "Cell_VRC1",              "V",        'f', 7 ),
-    Reg(0xC1, "Cell_VRC2",              "V",        'f', 7 ),
-    Reg(0xC2, "Cell_Covariance",        "",         'f', 42),  # cell_p[7][6]
-    Reg(0xC3, "Cell_Q_Nom",             "Ah",       'f', 7 ),
-    Reg(0xC4, "Cell_R0_Scale",          "",         'f', 7 ),
-    Reg(0xC5, "Cell_CycleCount",        "cycles",   'H', 7 ),
-    Reg(0xC6, "LearningStatus",         "flags",    'H', 1 ),
+    # OCV / ECM tables
+    Reg(0xB6, "SOC_Grid",               "%",        'f', 20),
+    Reg(0xB7, "OCV_Discharge",          "V",        'f', 20),
+    Reg(0xB8, "OCV_Charge",             "V",        'f', 20),
+    Reg(0xB9, "R0_Discharge",           "Ohm",      'f', 20),
+    Reg(0xBA, "R1_Discharge",           "Ohm",      'f', 20),
+    Reg(0xBB, "Tau1_Discharge",         "s",        'f', 20),
+    Reg(0xBC, "R2_Discharge",           "Ohm",      'f', 20),
+    Reg(0xBD, "Tau2_Discharge",         "s",        'f', 20),
+    Reg(0xBE, "R0_Charge",              "Ohm",      'f', 20),
+    Reg(0xBF, "R1_Charge",              "Ohm",      'f', 20),
+    Reg(0xC0, "Tau1_Charge",            "s",        'f', 20),
+    Reg(0xC1, "R2_Charge",              "Ohm",      'f', 20),
+    Reg(0xC2, "Tau2_Charge",            "s",        'f', 20),
+
+    # Capacity model
+    Reg(0xC3, "Q_Nom_TempSetpoints",    "C",        'f', 5 ),
+    Reg(0xC4, "Q_Nom_TempCapacity",     "Ah",       'f', 5 ),
+    Reg(0xC5, "Q_Nom",                  "Ah",       'f', 1 ),
+    Reg(0xC6, "CoulombicEfficiency",    "",         'f', 1 ),
+
+    # Reference parameters
+    Reg(0xC7, "R0_Ref",                 "Ohm",      'f', 1 ),
+    Reg(0xC8, "R1_Ref",                 "Ohm",      'f', 1 ),
+    Reg(0xC9, "Tau1_Ref",               "s",        'f', 1 ),
+    Reg(0xCA, "R2_Ref",                 "Ohm",      'f', 1 ),
+    Reg(0xCB, "Tau2_Ref",               "s",        'f', 1 ),
+
+    # Activation energies
+    Reg(0xCC, "Ea_R0",                  "J/mol",    'f', 1 ),
+    Reg(0xCD, "Ea_R1",                  "J/mol",    'f', 1 ),
+    Reg(0xCE, "Ea_Tau1",                "J/mol",    'f', 1 ),
+    Reg(0xCF, "Ea_R2",                  "J/mol",    'f', 1 ),
+    Reg(0xD0, "Ea_Tau2",                "J/mol",    'f', 1 ),
+
+    # Kalman noise parameters
+    Reg(0xD1, "KF_Q_SOC",               "",         'f', 1 ),
+    Reg(0xD2, "KF_Q_RC1",               "",         'f', 1 ),
+    Reg(0xD3, "KF_Q_RC2",               "",         'f', 1 ),
+    Reg(0xD4, "KF_R_V",                 "V2",       'f', 1 ),
+
+    # Per-cell Kalman state (read-only)
+    Reg(0xD5, "Cell_SOC_f",             "",         'f', 7 ),
+    Reg(0xD6, "Cell_VRC1",              "V",        'f', 7 ),
+    Reg(0xD7, "Cell_VRC2",              "V",        'f', 7 ),
+    Reg(0xD8, "Cell_Covariance",        "",         'f', 42),  # cell_p[7][6]
+
+    # Per-cell aging state (read-only)
+    Reg(0xD9, "Cell_Q_Nom",             "Ah",       'f', 7 ),
+    Reg(0xDA, "Cell_R0_Scale",          "",         'f', 7 ),
+    Reg(0xDC, "LearningStatus",         "flags",    'H', 1 ),
 ]
 
 
@@ -220,15 +273,12 @@ def build_read_command(address):
 # Returns raw bytes, or None on timeout / short read.
 # ---------------------------------------------------------------
 def receive_packet(ser):
-    # Every packet starts with a fixed 3-byte header
     header = ser.read(3)
     if len(header) < 3:
         return None
 
-    # byte[2] is always the payload length (0 for ACK and read commands)
     payload_length = header[2]
 
-    # Read payload + 1 CRC byte
     rest = ser.read(payload_length + 1)
     if len(rest) < payload_length + 1:
         return None
@@ -311,7 +361,7 @@ def read_registers(ser, registers, errors):
     for reg in registers:
         ser.reset_input_buffer()
         ser.write(build_read_command(reg.address))
-        #time.sleep(0.01)    
+
         raw          = receive_packet(ser)
         value, error = parse_read_response(raw, reg)
 
@@ -336,8 +386,8 @@ def read_registers(ser, registers, errors):
 # ---------------------------------------------------------------
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python read_sbs.py <COM_PORT>")
-        print("Example: python read_sbs.py COM3")
+        print("Usage: python read_data.py <COM_PORT>")
+        print("Example: python read_data.py COM3")
         sys.exit(1)
 
     port = sys.argv[1]
@@ -352,18 +402,23 @@ def main():
 
     print(f"Connected to {port} at {BAUD_RATE} baud")
 
+    all_groups = [
+        ("SBS v1.1 Registers  (0x00 - 0x23)",                SBS_REGISTERS  ),
+        ("Control & Configuration  (0x40 - 0x6F)",           CTRL_REGISTERS ),
+        ("Analog Measurements  (0x80 - 0x82)",               ANALOG_REGISTERS),
+        ("Fault & Lifetime History  (0x90 - 0x99)",          FAULT_REGISTERS ),
+        ("Hardware Configuration  (0xA0 - 0xA9)",            HW_REGISTERS   ),
+        ("Fuel Gauge  (0xB0 - 0xB5)",                        FUEL_REGISTERS ),
+        ("ECM / Kalman  (0xB6 - 0xDC)",                      ECM_REGISTERS  ),
+    ]
+
     errors = 0
-    total  = len(SBS_REGISTERS) + len(CTRL_REGISTERS) + len(ECM_REGISTERS)
+    total  = sum(len(regs) for _, regs in all_groups)
 
     try:
-        print_header("SBS v1.1 Registers  (0x00 - 0x23)")
-        errors = read_registers(ser, SBS_REGISTERS, errors)
-
-        print_header("OpenBMS Control Registers  (0x40 - 0x74)")
-        errors = read_registers(ser, CTRL_REGISTERS, errors)
-
-        print_header("ECM / Kalman Registers  (0xA0 - 0xC6)")
-        errors = read_registers(ser, ECM_REGISTERS, errors)
+        for title, regs in all_groups:
+            print_header(title)
+            errors = read_registers(ser, regs, errors)
 
     except KeyboardInterrupt:
         print("\nAborted by user.")

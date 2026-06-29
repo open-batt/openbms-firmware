@@ -18,11 +18,12 @@ extern "C" {
 
 typedef enum
 {
-    CMD_WRITE       = 0x01,
-    CMD_READ        = 0x02,
-    CMD_ACK         = 0x03,
-    CMD_ERROR       = 0x04,
-    CMD_BOOTLOADER  = 0x42,
+    CC_WRITE       = 0x01,
+    CC_READ        = 0x02,
+    CC_ACK         = 0x03,
+    CC_ERROR       = 0x04,
+    CC_CMD         = 0x05,
+    CC_BOOTLOADER  = 0x42,
 
 } CommCmdType_t;
 
@@ -45,6 +46,11 @@ typedef struct
     bool     frame_ready;
 
 } UART_Command_t;
+
+typedef struct
+{
+
+} OpenBMS_Command_t;
 
 typedef struct __attribute__((packed))
 {
@@ -82,8 +88,8 @@ typedef struct __attribute__((packed))
     // 0x0A — Current - read-only
     // 0x0B — AverageCurrent - read-only
     // -------------------------------------------------------------------------
-    uint16_t temperature;                              // 0.1K units; NTC battery temperature
-    uint16_t voltage;                                  // pack terminal voltage in mV
+    uint16_t temperature_package;                      // 0.1K units; NTC battery temperature
+    uint16_t voltage;                                  // pack voltage in mV
     int16_t  current;                                  // signed mA; positive=charge, negative=discharge
     int16_t  average_current;                          // signed mA; 1-minute rolling average
 
@@ -130,8 +136,8 @@ typedef struct __attribute__((packed))
     uint16_t cycle_count;                              // charge/discharge cycle counter
 
     // -------------------------------------------------------------------------
-    // 0x18 — DesignCapacity
-    // 0x19 — DesignVoltage
+    // 0x18 — DesignCapacity - read-only
+    // 0x19 — DesignVoltage - read-only
     // -------------------------------------------------------------------------
     uint16_t design_capacity;                          // mAh or 10mWh; nominal factory capacity
     uint16_t design_voltage;                           // mV; nominal pack voltage
@@ -157,332 +163,351 @@ typedef struct __attribute__((packed))
     const char manufacturer_data[32];                  // "Year 2026"
 
     // -------------------------------------------------------------------------
-    // Control registers
+    // Control and configuration registers
     // -------------------------------------------------------------------------
 
     // 0x40 — Configuration
-    uint16_t configuration;                            // Bit 6: UART, Bit 5: CAN, Bit 4: I2C, Bits 3-0: cell count
+    uint16_t configuration;                            // Bit7: Use NTC sesnor, Bit 6: UART, Bit 5: CAN, Bit 4: I2C, Bits 3-0: cell count
 
     // 0x41 — MainControl
     uint16_t main_control;                             // Bit 5: temp prot, Bit 4: curr prot, Bit 3: volt prot, Bit 1: test mode, Bit 0: OpenBMS state
 
-    // 0x42 — FETState
-    uint16_t fet_state;                                // Bit 1: aux FET, Bit 0: main FETs
+    // 0x42 - PackCapacity
+    uint32_t pack_capacity;                            // factory capacity in mAh
 
-    // 0x43 — FETStatus - read-only
-    uint16_t fet_status;                               // Bit 1: aux FET state, Bit 0: main FETs state
+    // 0x43 - MaxPackVoltage
+    uint16_t voltage_pack_max;                         // max designed pack voltage in mV
+
+    // 0x44 - MinPackVoltage                           
+    uint16_t voltage_pack_min;                         // min designed pack voltage in mV
+
+    // -------------------------------------------------------------------------
+    // Calibration registers
+    // -------------------------------------------------------------------------
+
+    // 0x45 — Current sensor offset
+    float    current_sensor_offset;                    // current sensor offset calibration
+
+    // 0x46 — Current sensor gain
+    float    current_sensor_gain;                      // current sensor gain calibration
+
+    // 0x47 — Voltage offset calibration — block
+    float    voltage_offset[7];                        // per-cell ADC offset calibration
+
+    // 0x48 — Voltage gain calibration — block
+    float    voltage_gain[7];                          // per-cell ADC gain calibration
+
+    // -------------------------------------------------------------------------
+    // NTC temperature sensor constants
+    // -------------------------------------------------------------------------
+
+    // 0x49 — NTC_Beta
+    float    ntc_beta;                              // NTC Beta value from datasheet (e.g. 3950.0)
+
+    // 0x4A — NTC_R_Nominal
+    float    ntc_r_nominal;                         // NTC nominal resistance at 25°C in Ohms (e.g. 10000.0)
+
+    // 0x4B — NTC_R_Fixed
+    float    ntc_r_fixed;                           // Fixed resistor value in Ohms (e.g. 10000.0)
+
+    // 0x4C — NTC_T_Nominal
+    float    ntc_t_nominal;                         // NTC nominal temperature in Kelvin (e.g. 298.15 = 25°C)
+
+    // 0x4D — Temperature offset
+    float    temperature_offset;                    // temperature sensor offset in °C
 
     // -------------------------------------------------------------------------
     // Voltage protection configuration
     // -------------------------------------------------------------------------
 
-    // 0x44 — UVP slow threshold
+    // 0x60 — UVP slow threshold
     uint16_t uvp_slow_threshold_mv;                    // slow UVP threshold in mV
 
-    // 0x45 — UVP slow time
+    // 0x61 — UVP slow time
     uint16_t uvp_slow_time_ms;                         // slow UVP detection time in ms
 
-    // 0x46 — UVP fast threshold
+    // 0x62 — UVP fast threshold
     uint16_t uvp_fast_threshold_mv;                    // fast UVP threshold in mV
 
-    // 0x47 — UVP fast time
+    // 0x63 — UVP fast time
     uint16_t uvp_fast_time_ms;                         // fast UVP detection time in ms
 
-    // 0x48 — OVP slow threshold
+    // 0x64 — OVP slow threshold
     uint16_t ovp_slow_threshold_mv;                    // slow OVP threshold in mV
 
-    // 0x49 — OVP slow time
+    // 0x65 — OVP slow time
     uint16_t ovp_slow_time_ms;                         // slow OVP detection time in ms
 
-    // 0x4A — OVP fast threshold
+    // 0x66 — OVP fast threshold
     uint16_t ovp_fast_threshold_mv;                    // fast OVP threshold in mV
 
-    // 0x4B — OVP fast time
+    // 0x67 — OVP fast time
     uint16_t ovp_fast_time_ms;                         // fast OVP detection time in ms
 
     // -------------------------------------------------------------------------
     // Current protection configuration
     // -------------------------------------------------------------------------
 
-    // 0x4C — Charge OCP threshold
+    // 0x68 — Charge OCP threshold
     uint16_t ocp_charge_threshold_ma;                  // charge OCP threshold in mA
 
-    // 0x4D — Charge OCP time
+    // 0x69 — Charge OCP time
     uint16_t ocp_charge_time_ms;                       // charge OCP detection time in ms
 
-    // 0x4E — Slow discharge OCP threshold
+    // 0x6A — Slow discharge OCP threshold
     uint16_t ocp_discharge_slow_threshold_ma;          // slow discharge OCP threshold in mA
 
-    // 0x4F — Slow discharge OCP time
+    // 0x6B — Slow discharge OCP time
     uint16_t ocp_discharge_slow_time_ms;               // slow discharge OCP detection time in ms
 
-    // 0x50 — Fast discharge OCP threshold
+    // 0x6C — Fast discharge OCP threshold
     uint16_t ocp_discharge_fast_threshold_ma;          // fast discharge OCP threshold in mA
 
-    // 0x51 — Fast discharge OCP time
+    // 0x6D — Fast discharge OCP time
     uint16_t ocp_discharge_fast_time_ms;               // fast discharge OCP detection time in ms
 
     // -------------------------------------------------------------------------
     // Temperature protection configuration
     // -------------------------------------------------------------------------
 
-    // 0x52 — OTP threshold
+    // 0x6E — OTP threshold
     uint16_t otp_threshold_c;                          // OTP threshold in °C
 
-    // 0x53 — OTP time
+    // 0x6F — OTP time
     uint16_t otp_time_ms;                              // OTP detection time in ms
 
     // -------------------------------------------------------------------------
-    // Analog measurement registers — block
+    // Analog measurement registers
     // -------------------------------------------------------------------------
 
-    // 0x54 — CellVoltage - read-only
-    uint16_t cell_voltage[7];                          // per-cell voltage in mV
+    // 0x80 — FETStatus - read-only
+    uint16_t fet_status;                               // Bit 8:2: balancer FETs, Bit 1: pre-FET state, Bit 0: main FETs state
 
-    // 0x55 — CellTemperature - read-only
-    int16_t  cell_temperature[7];                      // per-cell temperature in 0.1°C
+    // 0x81 — MainVddVoltage - read-only
+    float main_vdd_voltage_mv;                         // VDD voltage in the system (usually 3300mV)
 
-    // -------------------------------------------------------------------------
-    // Fuel gauge registers — block
-    // -------------------------------------------------------------------------
-
-    // 0x56 — CellSoC - read-only
-    uint8_t  cell_soc[7];                              // per-cell SoC in %
-
-    // 0x57 — CellSoH - read-only
-    uint8_t  cell_soh[7];                              // per-cell SoH in %
-
-    // 0x58 — CellRemainingCapacity - read-only
-    uint16_t cell_remaining_capacity[7];               // per-cell remaining capacity in mAh
-
-    // 0x59 — CellSelfDischarge - read-only
-    uint16_t cell_self_discharge[7];                   // per-cell self-discharge rate in mAh/month
-
-    // 0x5A — CellQmax - read-only
-    uint16_t cell_qmax[7];                             // per-cell learned maximum capacity in mAh
+    // 0x82 - TemperatureSTM32 - read-only
+    float temperature_stm32;                           // Temperature read out from STM32 in °C
 
     // -------------------------------------------------------------------------
-    // Fault registers — block
+    // Fault registers
     // -------------------------------------------------------------------------
 
-    // 0x5B — FaultSnapshotVoltage - read-only
+    // 0x90 — FaultSnapshotVoltage - read-only
     uint16_t fault_snapshot_voltage[7];                // per-cell voltage at last fault in mV
 
-    // 0x5C — FaultSnapshotCurrent - read-only
+    // 0x91 — FaultSnapshotCurrent - read-only
     int16_t  fault_snapshot_current;                   // current at last fault in mA
 
-    // 0x5D — FaultSnapshotTemperature - read-only
+    // 0x92 — FaultSnapshotTemperature - read-only
     uint8_t  fault_snapshot_temperature;               // temperature at last fault in °C
 
-    // 0x5E — FaultSnapshotSoC - read-only
+    // 0x93 — FaultSnapshotSoC - read-only
     uint8_t  fault_snapshot_soc;                       // SoC at last fault in %
 
-    // 0x5F — FaultCode - read-only
+    // 0x94 — FaultCode - read-only
     uint8_t  fault_code[8];                            // last 8 fault codes
 
-    // 0x60 — FaultTimestamp - read-only
+    // 0x95 — FaultTimestamp - read-only
     uint32_t fault_timestamp[8];                       // last 8 fault Unix timestamps
-
-    // -------------------------------------------------------------------------
-    // Protection event counters — block per protection type
-    // -------------------------------------------------------------------------
-
-    // 0x61 — OVP counters - read-only
-    uint16_t ovp_counter[7];                           // per-cell OVP trigger count
-
-    // 0x62 — UVP counters - read-only
-    uint16_t uvp_counter[7];                           // per-cell UVP trigger count
-
-    // 0x63 — OCP counters - read-only
-    uint16_t ocp_counter[7];                           // per-cell OCP trigger count
-
-    // 0x64 — OTP counters - read-only
-    uint16_t otp_counter[7];                           // per-cell OTP trigger count
-
-    // 0x65 — UTP counters - read-only
-    uint16_t utp_counter[7];                           // per-cell UTP trigger count
-
-    // -------------------------------------------------------------------------
-    // Calibration registers
-    // -------------------------------------------------------------------------
-
-    // 0x66 — Current sensor offset
-    int16_t  current_sensor_offset;                    // current sensor offset calibration
-
-    // 0x67 — Current sensor gain
-    int16_t  current_sensor_gain;                      // current sensor gain calibration
-
-    // 0x68 — Voltage offset calibration — block
-    int16_t  voltage_offset[7];                        // per-cell ADC offset calibration
-
-    // 0x69 — Voltage gain calibration — block
-    int16_t  voltage_gain[7];                          // per-cell ADC gain calibration
-
-    // 0x6A — Temperature offset
-    uint8_t  temperature_offset;                       // temperature sensor offset in °C
-
+ 
     // -------------------------------------------------------------------------
     // Lifetime history registers — block
     // -------------------------------------------------------------------------
 
-    // 0x6B — CellBalancingEnergy - read-only
+    // 0x96 — CellBalancingEnergy - read-only
     uint16_t cell_balancing_energy[7];                 // per-cell accumulated balancing energy in mWh
 
-    // 0x6C — CellBalancingTime - read-only
+    // 0x97 — CellBalancingTime - read-only
     uint16_t cell_balancing_time[7];                   // per-cell accumulated balancing time in minutes
 
-    // 0x6D — CellDeepestDischarge - read-only
+    // 0x98 — CellDeepestDischarge - read-only
     uint8_t  cell_deepest_discharge[7];                // per-cell lowest SoC ever recorded in %
 
-    // 0x6E — CellMaxTemperature - read-only
+    // 0x99 — CellMaxTemperature - read-only
     uint8_t  cell_max_temperature[7];                  // per-cell highest temperature ever recorded in °C
 
+
     // -------------------------------------------------------------------------
-    // Balancing registers
+    // Hardware configuration
     // -------------------------------------------------------------------------
 
-    // 0x6F — BalancingStatus - read-only
-    uint16_t balancing_status;                         // bitmask — bit N = cell N+1 balancing
+    // 0xA0 — CellVoltageResistanceFactor
+    float    cell_voltage_resistance_factor;        // Factor to convert raw ADC value to cell voltage (cells 1-7)
 
-    // 0x70 — BalancingControl
-    uint16_t balancing_control;                        // bitmask — bit N = cell N+1 force balancing
+    // 0xA1 — BattVoltageResistanceFactor
+    float    batt_voltage_resistance_factor;        // Factor to convert raw ADC value to battery pack voltage
+
+    // 0xA2 — ShuntResistance
+    float    shunt_resistance_mohms;                // Shunt resistance in milliohms for current measurement
+
+    // 0xA3 — CurrentSenseOffsetMv
+    float    current_sense_offset_mv;               // Offset in mV to subtract from current sense voltage
+
+    // 0xA4 — CurrentSenseGain
+    float    current_sense_gain;                    // Gain factor to convert current sense voltage to current
+
+    // 0xA5 - BalancerResistor
+    uint32_t  balancer_resistor;                    // Balancer resistance in mOhms
 
     // -------------------------------------------------------------------------
     // System information registers
     // -------------------------------------------------------------------------
 
-    // 0x71 — FirmwareVersion - read-only
+    // 0xA6 — FirmwareVersion - read-only
     char     firmware_version[32];                     // firmware version string — ASCII null-terminated
 
-    // 0x72 — HardwareVersion - read-only
+    // 0xA7 — HardwareVersion - read-only
     char     hardware_version[32];                     // hardware version string — ASCII null-terminated
 
-    // 0x73 — LastCommunicationTimestamp - read-only
+    // 0xA8 — LastCommunicationTimestamp - read-only
     uint32_t last_communication_timestamp;             // Unix timestamp of last host communication
 
-    // 0x74 — UptimeCounter - read-only
+    // 0xA9 — UptimeCounter - read-only
     uint32_t uptime_counter;                           // total uptime since first boot in seconds
 
     // -------------------------------------------------------------------------
-    // 0xA0 — SOC grid
+    // Fuel gauge registers
     // -------------------------------------------------------------------------
-    float soc_grid[20];                                // SOC setpoints in %
+
+    // 0xB0 — CellVoltage - read-only
+    float cell_voltage[7];                          // per-cell voltage in mV
+
+    // 0xB1 — CellSoC - read-only
+    uint8_t  cell_soc[7];                           // per-cell SoC in %
+
+    // 0xB2 — CellSoH - read-only
+    uint8_t  cell_soh[7];                           // per-cell SoH in %
+
+    // 0xB3 — CellRemainingCapacity - read-only
+    uint16_t cell_remaining_capacity[7];            // per-cell remaining capacity in mAh
+
+    // 0xB4 — CellSelfDischarge - read-only
+    uint16_t cell_self_discharge[7];                // per-cell self-discharge rate in mAh/month
+
+    // 0xB5 — CellQmax - read-only
+    uint16_t cell_qmax[7];                          // per-cell learned maximum capacity in mAh
 
     // -------------------------------------------------------------------------
-    // 0xA1 — OCV discharge curve
-    // 0xA2 — OCV charge curve
+    // 0xB6 — SOC grid
     // -------------------------------------------------------------------------
-    float ocv_dis[20];                                 // OCV discharge curve in V
-    float ocv_chg[20];                                 // OCV charge curve in V
+    float soc_grid[20];                             // SOC setpoints in %
 
     // -------------------------------------------------------------------------
-    // 0xA3 — R0 discharge
-    // 0xA4 — R1 discharge
-    // 0xA5 — tau1 discharge
-    // 0xA6 — R2 discharge
-    // 0xA7 — tau2 discharge
+    // 0xB7 — OCV discharge curve
+    // 0xB8 — OCV charge curve
     // -------------------------------------------------------------------------
-    float r0_dis[20];                                  // R0 discharge in Ω
-    float r1_dis[20];                                  // R1 discharge in Ω
-    float tau1_dis[20];                                // tau1 discharge in s
-    float r2_dis[20];                                  // R2 discharge in Ω
-    float tau2_dis[20];                                // tau2 discharge in s
+    float ocv_dis[20];                              // OCV discharge curve in V
+    float ocv_chg[20];                              // OCV charge curve in V
 
     // -------------------------------------------------------------------------
-    // 0xA8 — R0 charge
-    // 0xA9 — R1 charge
-    // 0xAA — tau1 charge
-    // 0xAB — R2 charge
-    // 0xAC — tau2 charge
+    // 0xB9 — R0 discharge
+    // 0xBA — R1 discharge
+    // 0xBB — tau1 discharge
+    // 0xBC — R2 discharge
+    // 0xBD — tau2 discharge
     // -------------------------------------------------------------------------
-    float r0_chg[20];                                  // R0 charge in Ω
-    float r1_chg[20];                                  // R1 charge in Ω
-    float tau1_chg[20];                                // tau1 charge in s
-    float r2_chg[20];                                  // R2 charge in Ω
-    float tau2_chg[20];                                // tau2 charge in s
+    float r0_dis[20];                               // R0 discharge in Ω
+    float r1_dis[20];                               // R1 discharge in Ω
+    float tau1_dis[20];                             // tau1 discharge in s
+    float r2_dis[20];                               // R2 discharge in Ω
+    float tau2_dis[20];                             // tau2 discharge in s
 
     // -------------------------------------------------------------------------
-    // 0xAD — Q_nom temperature setpoints
-    // 0xAE — Q_nom at each temperature
+    // 0xBE — R0 charge
+    // 0xBF — R1 charge
+    // 0xC0 — tau1 charge
+    // 0xC1 — R2 charge
+    // 0xC2 — tau2 charge
     // -------------------------------------------------------------------------
-    float q_nom_temp_c[5];                             // temperature setpoints in °C
-    float q_nom_temp_ah[5];                            // capacity at each temperature in Ah
+    float r0_chg[20];                               // R0 charge in Ω
+    float r1_chg[20];                               // R1 charge in Ω
+    float tau1_chg[20];                             // tau1 charge in s
+    float r2_chg[20];                               // R2 charge in Ω
+    float tau2_chg[20];                             // tau2 charge in s
 
     // -------------------------------------------------------------------------
-    // 0xAF — Nominal capacity at 25°C
-    // 0xB0 — Coulombic efficiency
+    // 0xC3 — Q_nom temperature setpoints
+    // 0xC4 — Q_nom at each temperature
     // -------------------------------------------------------------------------
-    float q_nom_ah;                                    // nominal capacity at 25°C in Ah
-    float coulombic_efficiency;                        // typically 0.995 to 0.999
+    float q_nom_temp_c[5];                          // temperature setpoints in °C
+    float q_nom_temp_ah[5];                         // capacity at each temperature in Ah
 
     // -------------------------------------------------------------------------
-    // 0xB1 — R0 reference at 25°C
-    // 0xB2 — R1 reference at 25°C
-    // 0xB3 — tau1 reference at 25°C
-    // 0xB4 — R2 reference at 25°C
-    // 0xB5 — tau2 reference at 25°C
+    // 0xC5 — Nominal capacity at 25°C
+    // 0xC6 — Coulombic efficiency
     // -------------------------------------------------------------------------
-    float r0_ref;                                      // R0 reference at 25°C in Ω
-    float r1_ref;                                      // R1 reference at 25°C in Ω
-    float tau1_ref;                                    // tau1 reference at 25°C in s
-    float r2_ref;                                      // R2 reference at 25°C in Ω
-    float tau2_ref;                                    // tau2 reference at 25°C in s
+    float q_nom_ah;                                 // nominal capacity at 25°C in Ah
+    float coulombic_efficiency;                     // typically 0.995 to 0.999
 
     // -------------------------------------------------------------------------
-    // 0xB6 — Ea for R0
-    // 0xB7 — Ea for R1
-    // 0xB8 — Ea for tau1
-    // 0xB9 — Ea for R2
-    // 0xBA — Ea for tau2
+    // 0xC7 — R0 reference at 25°C
+    // 0xC8 — R1 reference at 25°C
+    // 0xC9 — tau1 reference at 25°C
+    // 0xCA — R2 reference at 25°C
+    // 0xCB — tau2 reference at 25°C
     // -------------------------------------------------------------------------
-    float ea_r0;                                       // activation energy for R0 in J/mol
-    float ea_r1;                                       // activation energy for R1 in J/mol
-    float ea_tau1;                                     // activation energy for tau1 in J/mol
-    float ea_r2;                                       // activation energy for R2 in J/mol
-    float ea_tau2;                                     // activation energy for tau2 in J/mol
+    float r0_ref;                                   // R0 reference at 25°C in Ω
+    float r1_ref;                                   // R1 reference at 25°C in Ω
+    float tau1_ref;                                 // tau1 reference at 25°C in s
+    float r2_ref;                                   // R2 reference at 25°C in Ω
+    float tau2_ref;                                 // tau2 reference at 25°C in s
 
     // -------------------------------------------------------------------------
-    // 0xBB — Kalman process noise SOC
-    // 0xBC — Kalman process noise RC1
-    // 0xBD — Kalman process noise RC2
-    // 0xBE — Kalman measurement noise
+    // 0xCC — Ea for R0
+    // 0xCD — Ea for R1
+    // 0xCE — Ea for tau1
+    // 0xCF — Ea for R2
+    // 0xD0 — Ea for tau2
     // -------------------------------------------------------------------------
-    float kf_q_soc;                                    // process noise — SOC state
-    float kf_q_rc1;                                    // process noise — V_RC1 state
-    float kf_q_rc2;                                    // process noise — V_RC2 state
-    float kf_r_v;                                      // measurement noise — voltage sensor V²
+    float ea_r0;                                    // activation energy for R0 in J/mol
+    float ea_r1;                                    // activation energy for R1 in J/mol
+    float ea_tau1;                                  // activation energy for tau1 in J/mol
+    float ea_r2;                                    // activation energy for R2 in J/mol
+    float ea_tau2;                                  // activation energy for tau2 in J/mol
 
     // -------------------------------------------------------------------------
-    // 0xBF — Per-cell SOC float (7 cells) - read-only
-    // 0xC0 — Per-cell V_RC1 (7 cells) - read-only
-    // 0xC1 — Per-cell V_RC2 (7 cells) - read-only
+    // 0xD1 — Kalman process noise SOC
+    // 0xD2 — Kalman process noise RC1
+    // 0xD3 — Kalman process noise RC2
+    // 0xD4 — Kalman measurement noise
     // -------------------------------------------------------------------------
-    float cell_soc_f[7];                               // last estimated SOC per cell (0.0 to 1.0)
-    float cell_vrc1[7];                                // last estimated V_RC1 per cell in V
-    float cell_vrc2[7];                                // last estimated V_RC2 per cell in V
+    float kf_q_soc;                                 // process noise — SOC state
+    float kf_q_rc1;                                 // process noise — V_RC1 state
+    float kf_q_rc2;                                 // process noise — V_RC2 state
+    float kf_r_v;                                   // measurement noise — voltage sensor V²
 
     // -------------------------------------------------------------------------
-    // 0xC2 — Per-cell covariance matrix upper triangle (7 cells) - read-only
+    // 0xD5 — Per-cell SOC float (7 cells) - read-only
+    // 0xD6 — Per-cell V_RC1 (7 cells) - read-only
+    // 0xD7 — Per-cell V_RC2 (7 cells) - read-only
+    // -------------------------------------------------------------------------
+    float cell_soc_f[7];                            // last estimated SOC per cell (0.0 to 1.0)
+    float cell_vrc1[7];                             // last estimated V_RC1 per cell in V
+    float cell_vrc2[7];                             // last estimated V_RC2 per cell in V
+
+    // -------------------------------------------------------------------------
+    // 0xD8 — Per-cell covariance matrix upper triangle (7 cells) - read-only
     //        P layout per cell: [P00, P01, P02, P11, P12, P22]
     // -------------------------------------------------------------------------
-    float cell_p[7][6];                                // full covariance upper triangle per cell
+    float cell_p[7][6];                             // full covariance upper triangle per cell
 
     // -------------------------------------------------------------------------
-    // 0xC3 — Per-cell capacity after aging (7 cells) - read-only
-    // 0xC4 — Per-cell R0 growth factor (7 cells) - read-only
-    // 0xC5 — Per-cell cycle count (7 cells) - read-only
+    // 0xD9 — Per-cell capacity after aging (7 cells) - read-only
+    // 0xDA — Per-cell R0 growth factor (7 cells) - read-only
     // -------------------------------------------------------------------------
-    float    cell_q_nom_ah[7];                         // current capacity after aging in Ah
-    float    cell_r0_scale[7];                         // R0 growth factor per cell (1.0 = nominal)
-    uint16_t cell_cycle_count[7];                      // cycle count per cell
+    float    cell_q_nom_ah[7];                      // current capacity after aging in Ah
+    float    cell_r0_scale[7];                      // R0 growth factor per cell (1.0 = nominal)
 
     // -------------------------------------------------------------------------
-    // 0xC6 — LearningStatus - read-only
+    // 0xDC — LearningStatus - read-only
     // -------------------------------------------------------------------------
-    uint16_t learning_status;                          // Kalman filter convergence and learning state flags
+    uint16_t learning_status;                       // Kalman filter convergence and learning state flags
 
-} OpenBMS_SBS_Data_t;
+} OpenBMS_Data_t;
 
+extern OpenBMS_Data_t OpenBMS_data;
+extern OpenBMS_Data_t OpenBMS_Command_t;
 
 void OpenBMS_Comm_Init(void);
 void OpenBMS_Comm_Run(void);

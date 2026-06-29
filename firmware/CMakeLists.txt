@@ -76,3 +76,6 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
         $<TARGET_FILE:${CMAKE_PROJECT_NAME}>
         ${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.hex
 )
+
+# Use float numbers for printf/scanf
+target_link_options(${PROJECT_NAME} PRIVATE -u _printf_float)
