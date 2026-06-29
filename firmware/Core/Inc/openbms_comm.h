@@ -49,8 +49,21 @@ typedef struct
 
 typedef struct
 {
+    bool    gpio_meas_cell_voltage_enable;
+    bool    gpio_meas_pack_voltage_enable;
+    bool    gpio_pwr_on;
+    bool    gpio_cell_balancer_enable[7];
 
-} OpenBMS_Command_t;
+    bool    gpio_main_drv_enable;
+    bool    gpio_main_fet_enable;
+    bool    gpio_pre_fet_enable;
+
+    bool    gpio_r_fet_driver_fault;
+    bool    gpio_r_fet_driver_gate_fault;
+    bool    gpio_r_wake_up;
+    bool    gpio_r_vcc_power_good;
+ 
+} OpenBMS_Control_t;
 
 typedef struct __attribute__((packed))
 {
@@ -507,7 +520,7 @@ typedef struct __attribute__((packed))
 } OpenBMS_Data_t;
 
 extern OpenBMS_Data_t OpenBMS_data;
-extern OpenBMS_Data_t OpenBMS_Command_t;
+extern OpenBMS_Control_t OpenBMS_ctrl;
 
 void OpenBMS_Comm_Init(void);
 void OpenBMS_Comm_Run(void);

@@ -20,6 +20,10 @@
 #include "stm32l4xx_hal.h"
 #include "stm32l4xx_hal_gpio.h"
 
+#define ADS_FULL_SCALE_GAIN_16                150.0
+#define ADS_FULL_SCALE_GAIN_4                 300.0f
+#define ADS_FULL_SCALE_GAIN_2                 600.0f
+
 ADC_HandleTypeDef   *internal_adc    = &hadc1;
 CAN_HandleTypeDef   *host_can        = &hcan1;
 CRC_HandleTypeDef   *hw_crc          = &hcrc;
@@ -28,11 +32,7 @@ SMBUS_HandleTypeDef *host_smbus      = &hsmbus2;
 SPI_HandleTypeDef   *adc_spi         = &hspi1;
 
 uint64_t                OpenBMS_status   = 0;
-OpenBMS_Ctrl_t          OpenBMS_ctrl     = {0};
 
-#define ADS_FULL_SCALE_GAIN_16                150.0
-#define ADS_FULL_SCALE_GAIN_4                 300.0f
-#define ADS_FULL_SCALE_GAIN_2                 600.0f
 
 static bool     pack_current_updated          = false;
 static bool     pack_voltage_updated          = false;
@@ -46,15 +46,6 @@ static bool     ads_calibration_start         = false;
 static bool     ads_calibration_finish        = false;
 static int32_t  ads_cal_val_sum[8]            = {0};
 static uint32_t ads_cal_val_count             = 0;
-
-static bool     gpio_meas_cell_voltage_enable      = false;
-static bool     gpio_meas_pack_voltage_enable      = false;
-static bool     gpio_pwr_on                        = true;
-static bool     gpio_cell_balancer_enable[7]       = {false};
-
-static bool     gpio_main_drv_enable               = true;
-static bool     gpio_main_fet_enable               = true;
- 
 
 static void HandleError(OpenBMS_Status_t error)
 {
@@ -359,7 +350,7 @@ static void ADS131M08_Init(void)
   ADS131M08_WriteReg(0x2C, 0x0000);  // CH7_CFG MUX=01
 
   HAL_Delay(10);
-  gpio_meas_cell_voltage_enable = true;
+  OpenBMS_ctrl.gpio_meas_cell_voltage_enable = true;
   
 
 }
@@ -384,7 +375,7 @@ static void ADS131M08_Read(void)
   pack_current_updated = true;
 
   // Extract CH1 - CH7 values and get cell voltages
-  if(gpio_meas_cell_voltage_enable)
+  if(OpenBMS_ctrl.gpio_meas_cell_voltage_enable)
   {
     // Measure all cell voltages
     for(uint8_t i = 1; i <= 7; i++)
@@ -525,41 +516,41 @@ static void STM32_ADC_Read(void)
 static void GPIO_Ctrl(void)
 {
   // Set main FET and driver state
-  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) gpio_main_drv_enable);
-  HAL_GPIO_WritePin(DRV_FET_EN_GPIO_Port, DRV_FET_EN_Pin, (GPIO_PinState) gpio_main_fet_enable);
+  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_main_drv_enable);
+  HAL_GPIO_WritePin(DRV_FET_EN_GPIO_Port, DRV_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_main_fet_enable);
 
   // Set precharge/predischarge FET state
-  HAL_GPIO_WritePin(DRV_PRE_FET_EN_GPIO_Port, DRV_PRE_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.pre_fet_enable);
+  HAL_GPIO_WritePin(DRV_PRE_FET_EN_GPIO_Port, DRV_PRE_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_pre_fet_enable);
 
   // Enable cell voltage measuring
-  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) (gpio_meas_cell_voltage_enable | gpio_meas_pack_voltage_enable));
+  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) (OpenBMS_ctrl.gpio_meas_cell_voltage_enable | OpenBMS_ctrl.gpio_meas_pack_voltage_enable));
 
   // Enable pack voltage measuring
-  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) gpio_meas_pack_voltage_enable);
+  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_meas_pack_voltage_enable);
 
   // Set balancer
-  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[0]);
-  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[1]);
-  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[2]);
-  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[3]);
-  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[4]);
-  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[5]);
-  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) gpio_cell_balancer_enable[6]);
+  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[0]);
+  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[1]);
+  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[2]);
+  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[3]);
+  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[4]);
+  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[5]);
+  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[6]);
   
   // Set main power signal on to keep OpenBMS on
-  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) gpio_pwr_on);
+  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_pwr_on);
 
   // Read driver fault pin, inverse state
-  OpenBMS_ctrl.fet_driver_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GPIO_Port, DRV_FLT_Pin));
+  OpenBMS_ctrl.gpio_r_fet_driver_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GPIO_Port, DRV_FLT_Pin));
 
   // Read driver gate fault pin, inverse state
-  OpenBMS_ctrl.fet_driver_gate_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GD_GPIO_Port, DRV_FLT_GD_Pin));
+  OpenBMS_ctrl.gpio_r_fet_driver_gate_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GD_GPIO_Port, DRV_FLT_GD_Pin));
 
   // Read wake up pin, active high
-  OpenBMS_ctrl.wake_up = (bool)HAL_GPIO_ReadPin(WAKE_UP_GPIO_Port, WAKE_UP_Pin);
+  OpenBMS_ctrl.gpio_r_wake_up = (bool)HAL_GPIO_ReadPin(WAKE_UP_GPIO_Port, WAKE_UP_Pin);
 
   // Read VCC power good pin
-  OpenBMS_ctrl.vcc_power_good = (bool)HAL_GPIO_ReadPin(PWR_PG_GPIO_Port, PWR_PG_Pin);
+  OpenBMS_ctrl.gpio_r_vcc_power_good = (bool)HAL_GPIO_ReadPin(PWR_PG_GPIO_Port, PWR_PG_Pin);
 
 }
 void OpenBMS_Ctrl_Init(void)

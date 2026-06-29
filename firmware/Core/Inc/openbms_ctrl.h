@@ -19,22 +19,6 @@ extern "C" {
 
 #define ADS131M0_SPI_TIMEOUT        100
 
-typedef struct
-{
-    //bool main_fet_enable;
-    bool pre_fet_enable;
-    //bool meas_cell_voltage_enable;
-    //bool meas_pack_voltage_enable;
-    //bool cell_balancer_enable[7];
-    //bool pwr_on;
-
-    bool fet_driver_fault;
-    bool fet_driver_gate_fault;
-    bool wake_up;
-    bool vcc_power_good;
-
-} OpenBMS_Ctrl_t;
-
 typedef enum 
 {
     OPENBMS_EEPROM_ID_READ_FAIL,
