@@ -119,14 +119,14 @@ int main(void)
   MX_USART1_UART_Init();
   MX_CRC_Init();
   /* USER CODE BEGIN 2 */
-  OpenBMS_Ctrl_Init();
+  Ctrl_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    OpenBMS_Ctrl_Run();
+    Ctrl_Run();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

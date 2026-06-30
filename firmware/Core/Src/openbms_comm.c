@@ -16,18 +16,17 @@
   */
 
 #include "openbms_comm.h"
-#include <stdint.h>
+#include "openbms_periph.h"
+#include <complex.h>
 
 #define APP_FLAG_FLASH_LAGE  19U
 
 static UART_HandleTypeDef   *debug_uart             = &huart1;
 static UART_Command_t       uart_cmd                = {0};
 OpenBMS_Data_t              OpenBMS_data            = {0};
-OpenBMS_Control_t           OpenBMS_ctrl            = {0};
 
-static void                 Controls_SetDefaults(OpenBMS_Control_t *ctrl);
 static void                 Data_SetDefaults(OpenBMS_Data_t *data);
-static CommErrorType_t      Controls_Set(OpenBMS_Control_t *ctrl, uint8_t address, uint8_t *data, uint8_t length);
+static CommErrorType_t      Controls_Set(uint8_t address, uint8_t *data, uint8_t length);
 static CommErrorType_t      Data_ReadWriteRegister(OpenBMS_Data_t *data, uint8_t address, uint8_t *raw_data, uint8_t *length, bool write); 
 
 static void                 RemoveAppFlag(void);
@@ -36,12 +35,7 @@ static uint8_t              Checksum(uint8_t *data, uint16_t length);
 static void                 SendResponse(uint8_t *data, uint8_t length);
 static void                 SendError(CommErrorType_t err);
 
-static void Controls_SetDefaults(OpenBMS_Control_t *ctrl)
-{
-    memset(ctrl, 0, sizeof(OpenBMS_Control_t));
 
-    ctrl->gpio_pwr_on = true;
-}
 static void Data_SetDefaults(OpenBMS_Data_t *data)
 {
     // -------------------------------------------------------------------------
@@ -578,9 +572,42 @@ static void Data_SetDefaults(OpenBMS_Data_t *data)
     // -------------------------------------------------------------------------
     data->learning_status                            =  0x0000;
 }
-static CommErrorType_t Controls_Set(OpenBMS_Control_t *ctrl, uint8_t address, uint8_t *data, uint8_t length)
+static CommErrorType_t Controls_Set(uint8_t address, uint8_t *data, uint8_t length)
 {
-    return CE_OK;
+    CommErrorType_t res = CE_OK;
+
+    if(length != 1)
+    {
+        res = CE_WRONG_CMD;
+    }
+    else 
+    {
+        switch(address)
+        {
+            case 0x00: 
+            {
+                if(data[0] != 0x00 && data[0] != 0x01) res = CE_WRONG_CMD;
+                else Periph_SetFET((bool) data[0]);
+            }
+            break;
+
+            case 0x01:
+            {
+                if(data[0] != 0x00 && data[0] != 0x01) res = CE_WRONG_CMD;
+                else Periph_SetLearningState((bool) data[0]);
+            }
+            break;
+
+            default: 
+            {
+                res = CE_NO_REG; 
+            }
+            break;
+        }
+    }
+
+
+    return res;
 }
 static CommErrorType_t Data_ReadWriteRegister(OpenBMS_Data_t *data, uint8_t address, uint8_t *raw_data, uint8_t *length, bool write)
 {
@@ -1073,16 +1100,16 @@ static void ProcessCommand(void)
 
     if(cmd == CC_CMD)
     {
-        res = Controls_Set(&OpenBMS_ctrl, address, &rx_buf[3], length);
+        res = Controls_Set(address, &rx_buf[3], length);
 
         if(res == CE_OK)
         {
-            tx_buf[0] = CC_CMD;
-            tx_buf[1] = address;    // Reflect address back
-            tx_buf[2] = length;     // Lenght of data should always be 1
-            tx_buf[3] = 0x00;       // Send 0x00, all is good
-            // Data is already store at this moment
-            tx_buf[length + 3] = Checksum(tx_buf, length + 3);
+            // ACK: [CC_ACK][code][crc]
+            tx_buf[0] = CC_ACK;
+            tx_buf[1] = 0;
+            tx_buf[2] = 0;
+            tx_buf[3] = Checksum(tx_buf, 3);
+            length = 0;
 
         }
         else
@@ -1119,17 +1146,17 @@ static void ProcessCommand(void)
         // -------------------------------------------------------
         if(write)
         {
-            // ACK: [0x03][code][crc]
-            tx_buf[0] = 0x03;
+            // ACK: [CC_ACK][code][crc]
+            tx_buf[0] = CC_ACK;
             tx_buf[1] = 0;
             tx_buf[2] = 0;
-            tx_buf[2] = Checksum(tx_buf, 3);
+            tx_buf[3] = Checksum(tx_buf, 3);
             length = 0;
         }
         else
         {
-            // Read response: [0x02][address][length][data...][crc]
-            tx_buf[0] = 0x02;
+            // Read response: [CC_READ][address][length][data...][crc]
+            tx_buf[0] = CC_READ;
             tx_buf[1] = address;
             tx_buf[2] = length;
             // Data is already store at this moment
@@ -1164,16 +1191,15 @@ static void SendError(CommErrorType_t err)
 
     SendResponse(buff, sizeof(buff));
 }
-void OpenBMS_Comm_Init(void)
+void Comm_Init(void)
 {
     // Initalize structs
-    Controls_SetDefaults(&OpenBMS_ctrl);
     Data_SetDefaults(&OpenBMS_data);
 
     // Start data receiving on UART
     HAL_UARTEx_ReceiveToIdle_DMA(debug_uart, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
 }
-void OpenBMS_Comm_Run(void)
+void Comm_Run(void)
 {
   if(uart_cmd.frame_ready)
   {

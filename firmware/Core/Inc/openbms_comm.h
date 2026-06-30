@@ -5,12 +5,6 @@
 extern "C" {
 #endif
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
 #include "main.h"
 
 #define UART_RX_BUFFER_SIZE     2048U
@@ -46,24 +40,6 @@ typedef struct
     bool     frame_ready;
 
 } UART_Command_t;
-
-typedef struct
-{
-    bool    gpio_meas_cell_voltage_enable;
-    bool    gpio_meas_pack_voltage_enable;
-    bool    gpio_pwr_on;
-    bool    gpio_cell_balancer_enable[7];
-
-    bool    gpio_main_drv_enable;
-    bool    gpio_main_fet_enable;
-    bool    gpio_pre_fet_enable;
-
-    bool    gpio_r_fet_driver_fault;
-    bool    gpio_r_fet_driver_gate_fault;
-    bool    gpio_r_wake_up;
-    bool    gpio_r_vcc_power_good;
- 
-} OpenBMS_Control_t;
 
 typedef struct __attribute__((packed))
 {
@@ -520,9 +496,8 @@ typedef struct __attribute__((packed))
 } OpenBMS_Data_t;
 
 extern OpenBMS_Data_t OpenBMS_data;
-extern OpenBMS_Control_t OpenBMS_ctrl;
 
-void OpenBMS_Comm_Init(void);
-void OpenBMS_Comm_Run(void);
+void Comm_Init(void);
+void Comm_Run(void);
 
 #endif

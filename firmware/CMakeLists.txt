@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/openbms_ctrl.c
     Core/Src/openbms_comm.c
+    Core/Src/openbms_periph.c
 )   
 
 # Add include paths
