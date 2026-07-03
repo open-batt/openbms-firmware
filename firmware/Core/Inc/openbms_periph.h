@@ -33,8 +33,9 @@ void Periph_Init(void);
 void Periph_Run(void);
 void Periph_SetFET(bool state);
 void Periph_SetPreFET(bool state);
-void Periph_SetLearningState(bool state);
-bool Perigh_GetLearningState(void);
+
+void Periph_GetData(Peripheral_Data_t *pd);
+void Periph_50msTimer(void);
 
 #ifdef __cplusplus
 }

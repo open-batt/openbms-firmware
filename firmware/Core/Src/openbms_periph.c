@@ -17,11 +17,17 @@
 
 #include "openbms_comm.h"
 #include "openbms_ctrl.h"
+#include "openbms_data.h"
+#include <math.h>
 #include "openbms_periph.h"
 
-#define ADS_FULL_SCALE_GAIN_16                150.0
-#define ADS_FULL_SCALE_GAIN_4                 300.0f
-#define ADS_FULL_SCALE_GAIN_2                 600.0f
+#define ADS_FULL_SCALE_GAIN_16                150.0f
+#define ADS_FULL_SCALE_GAIN_4                 600.0f
+#define ADS_READ_FILT_COEF                    0.166f
+
+#define HW_CELL_VOLTAGE_RESISTANCE_FACTOR     21.6060606f
+#define HW_BATT_VOLTAGE_RESISTANCE_FACTOR     1
+#define HW_SHUNT_RESISTANCE_MOHM              2.0f
 
 typedef struct
 {
@@ -38,10 +44,8 @@ typedef struct
     bool    gpio_r_fet_driver_gate_fault;
     bool    gpio_r_wake_up;
     bool    gpio_r_vcc_power_good;
-    
-    bool    run_learning;
  
-} OpenBMS_Control_t;
+} Periph_GPIO_t;
 
 ADC_HandleTypeDef           *internal_adc               = &hadc1;
 CAN_HandleTypeDef           *host_can                   = &hcan1;
@@ -49,20 +53,23 @@ CRC_HandleTypeDef           *hw_crc                     = &hcrc;
 I2C_HandleTypeDef           *eeprom_i2c                 = &hi2c1;
 SMBUS_HandleTypeDef         *host_smbus                 = &hsmbus2;
 SPI_HandleTypeDef           *adc_spi                    = &hspi1;
+TIM_HandleTypeDef           *periodic_timer             = &htim7;
 
-static OpenBMS_Control_t    OpenBMS_ctrl                = {0};
+static Periph_GPIO_t        periph_gpio                 = {0};
+static Peripheral_Data_t    periph_data                 = {0};
+
 static uint64_t             OpenBMS_status              = 0;
 
-static bool                 pack_current_updated        = false;
-static bool                 pack_voltage_updated        = false;
-static bool                 cell_voltage_updated        = false;
 static bool                 main_vdd_mv_updated         = false;
 static bool                 temperature_ntc_updated     = false;
 static bool                 temperature_stm32_updated   = true;
 static uint8_t              stm32_adc_conv_index        = 0;
+static float_t              cell_voltage_filt_prev[7]   = {0};
+static float                current_filt_prev           = 0;
 
 static bool                 ads_calibration_start       = false;
 static bool                 ads_calibration_finish      = false;
+static bool                 ads_start_measurements      = false;
 static int32_t              ads_cal_val_sum[8]          = {0};
 static uint32_t             ads_cal_val_count           = 0;
 
@@ -70,6 +77,7 @@ static void HandleError(OpenBMS_Status_t error)
 {
   OpenBMS_status |= (1ULL << error);
 }
+/*
 static void EEPROM_Init(void)
 {
   uint8_t data[2];
@@ -95,7 +103,7 @@ static void EEPROM_Read(void)
   uint8_t  data[32];
   uint16_t total_bytes  = sizeof(OpenBMS_Data_t);
   uint16_t bytes_read   = 0;
-  uint8_t  *dest        = (uint8_t *)&OpenBMS_data;
+  uint8_t  *dest        = (uint8_t *)&bd;
   uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);  // Last 4 bytes of EEPROM
 
   // Read struct starting at address 0x0000
@@ -137,7 +145,7 @@ static void EEPROM_Read(void)
   }
 
   // Calculate CRC32 over read struct and compare with stored CRC
-  crc_calc = HAL_CRC_Calculate(hw_crc, (uint32_t *)&OpenBMS_data, total_bytes / sizeof(uint32_t));
+  crc_calc = HAL_CRC_Calculate(hw_crc, (uint32_t *)&bd, total_bytes / sizeof(uint32_t));
 
   if(crc_calc != crc_stored)
   {
@@ -151,7 +159,7 @@ static void EEPROM_Update(void)
   uint8_t  struct_buf[32];
   uint16_t total_bytes  = sizeof(OpenBMS_Data_t);
   uint16_t bytes_done   = 0;
-  uint8_t  *src         = (uint8_t *)&OpenBMS_data;
+  uint8_t  *src         = (uint8_t *)&bd;
   uint32_t crc_calc     = 0;
   uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);
 
@@ -203,7 +211,7 @@ static void EEPROM_Update(void)
   }
 
   // Calculate new CRC32 over entire struct
-  crc_calc = HAL_CRC_Calculate(&hcrc, (uint32_t *)&OpenBMS_data, sizeof(OpenBMS_Data_t));
+  crc_calc = HAL_CRC_Calculate(&hcrc, (uint32_t *)&bd, sizeof(OpenBMS_Data_t));
 
   // Write CRC to last 4 bytes of EEPROM
   if(HAL_I2C_Mem_Write(eeprom_i2c,
@@ -220,6 +228,55 @@ static void EEPROM_Update(void)
 
   // Wait for final CRC write cycle to complete
   HAL_Delay(5);
+}
+*/
+static bool ADS131M08_Standby(void)
+{
+  uint8_t tx_buff[30] = {0};
+  uint8_t rx_buff[30] = {0};
+  bool res = true;
+
+  // STANDBY command = 0x0022, MSB aligned in 24-bit word
+  tx_buff[0] = 0x00;
+  tx_buff[1] = 0x22;
+  tx_buff[2] = 0x00;
+
+  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
+
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  {
+    res = false;
+  }
+
+  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
+  return res;
+}
+static bool ADS131M08_Wakeup(void)
+{
+  uint8_t tx_buff[30] = {0};
+  uint8_t rx_buff[30] = {0};
+  bool res = true;
+
+  // WAKEUP command = 0x0033, MSB aligned in 24-bit word
+  tx_buff[0] = 0x00;
+  tx_buff[1] = 0x33;
+  tx_buff[2] = 0x00;
+
+  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
+
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  {
+    res = false;
+  }
+
+  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
+
+  // After wakeup, wait for modulators to settle (8 × tMOD)
+  // tMOD = 1/fMOD = 2/fCLKIN = 2/8192000 = 244ns
+  // 8 × tMOD = ~2µs, but add margin
+  HAL_Delay(1);
+
+  return res;
 }
 static bool ADS131M08_ReadReg(uint8_t reg, uint8_t* data)
 {
@@ -268,8 +325,8 @@ static bool ADS131M08_ReadADCValues(uint8_t* data)
 }
 static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
 {
-  uint8_t tx_buff[6] = {0};
-  uint8_t rx_buff[6] = {0};
+  uint8_t tx_buff[30] = {0};
+  uint8_t rx_buff[30] = {0};
   uint16_t cmd;
   bool res = true;
 
@@ -285,7 +342,7 @@ static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
     // CS low
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
 
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 6, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
   {
     res = false;
   }
@@ -297,6 +354,21 @@ static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
 static void ADS131M08_Init(void)
 {
   uint8_t rx_data[30] = {0};
+
+  // Reset the ADS131M08 by toggling the SYNC pin low, then high
+  HAL_GPIO_WritePin(ADC_SYNC_GPIO_Port, ADC_SYNC_Pin, GPIO_PIN_RESET);
+  HAL_Delay(1);
+  HAL_GPIO_WritePin(ADC_SYNC_GPIO_Port, ADC_SYNC_Pin, GPIO_PIN_SET);
+
+  // Wait for DRDY to go high indicating reset complete
+  while(HAL_GPIO_ReadPin(ADC_DRDY_GPIO_Port, ADC_DRDY_Pin) == GPIO_PIN_RESET);
+
+  // Standby the ADS131M08 to allow register configuration
+  if(!ADS131M08_Standby())
+  {
+    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
+    return;
+  }
 
   // Read ADC ID register (0x00) to verify communication
   if(!ADS131M08_ReadReg(0x00, rx_data))
@@ -318,6 +390,17 @@ static void ADS131M08_Init(void)
   {
     HandleError(OPENBMS_ADS131M08_ID_FAIL);
     return;
+  }
+
+  ADS131M08_ReadReg(0x02, rx_data);
+  ADS131M08_ReadReg(0x02, rx_data);
+
+  // Clear RESET bit in MODE register
+  // Default MODE = 0x0510, clear bit 10 → 0x0110
+  if(!ADS131M08_WriteReg(0x02, 0x0110))
+  {
+      HandleError(OPENBMS_ADS131M08_INIT_FAIL);
+      return;
   }
 
   // Initilize CLOCK register, all channels enabled, SPS set to 125
@@ -351,11 +434,19 @@ static void ADS131M08_Init(void)
   ADS131M08_WriteReg(0x27, 0x0001);  // CH6_CFG MUX=01
   ADS131M08_WriteReg(0x2C, 0x0001);  // CH7_CFG MUX=01
 
-  // Wait a bit to settle down
+  // Standby the ADS131M08 to allow register configuration
+  if(!ADS131M08_Wakeup())
+  {
+    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
+    return;
+  }
+
+  // Wait a bit to settle down, 3-4 samples
   HAL_Delay(10);
   ads_calibration_start = true;
   
-  HAL_Delay(100);
+  // Wait to complete calibration
+  HAL_Delay(500);
   ads_calibration_finish = true;
 
   // Stop internal offset calibration
@@ -368,47 +459,64 @@ static void ADS131M08_Init(void)
   ADS131M08_WriteReg(0x27, 0x0000);  // CH6_CFG MUX=01
   ADS131M08_WriteReg(0x2C, 0x0000);  // CH7_CFG MUX=01
 
+  // Wait a bit to settle down, 3-4 samples
   HAL_Delay(10);
-  OpenBMS_ctrl.gpio_meas_cell_voltage_enable = true;
+  periph_gpio.gpio_meas_cell_voltage_enable = true;
+  ads_start_measurements = true;
   
-
 }
 static void ADS131M08_Read(void)
 {
   uint8_t rx_data[30] = {0};
   int32_t raw_value;
   float voltage_mv;
+  float current;
+  float current_filtered;
 
   if(!ADS131M08_ReadADCValues(rx_data))
   {
     HandleError(OPENBMS_ADS131M08_READ_FAIL);
   }
 
-  // Extract CH0 value, get battery current by dividing voltage by shunt resistance
-  raw_value = ((int32_t)rx_data[3] << 24) | (rx_data[4] << 16) | (rx_data[5] << 8);
-  raw_value >>= 8;
-  voltage_mv = (float)raw_value * (150.0f / 16777216.0f);
-  OpenBMS_data.current = voltage_mv * OpenBMS_data.shunt_resistance_mohms;
+  if(ads_start_measurements)
+  {
+    // Extract CH0 value, get battery current by dividing voltage by shunt resistance
+    raw_value = ((int32_t)rx_data[3] << 24) | (rx_data[4] << 16) | (rx_data[5] << 8);
+    raw_value >>= 8;
+    voltage_mv = (float)raw_value * (ADS_FULL_SCALE_GAIN_16 / 16777216.0f);
+    current = voltage_mv / HW_SHUNT_RESISTANCE_MOHM;
+    current -= periph_data.current_sensor_offset;
+    current *= 1000.0f;  // Convert to mA
 
-  // Set update flags
-  pack_current_updated = true;
+    // Todo: remove hardcoded value
+    current -= 28.3;
+    
+    current_filtered = current_filt_prev + ADS_READ_FILT_COEF * (current - current_filt_prev);
+    current_filt_prev = current_filtered;
+
+    // Assign calulcated values
+    periph_data.pack_current = current;
+    periph_data.pack_current_filtered = current_filtered;
+  }
+
 
   // Extract CH1 - CH7 values and get cell voltages
-  if(OpenBMS_ctrl.gpio_meas_cell_voltage_enable)
+  if(periph_gpio.gpio_meas_cell_voltage_enable & ads_start_measurements)
   {
     // Measure all cell voltages
-    for(uint8_t i = 1; i <= 7; i++)
+    for(uint8_t i = 0; i < 7; i++)
     {
-      raw_value = ((int32_t)rx_data[i*3+3] << 24) | (rx_data[i*3+4] << 16) | (rx_data[i*3+5] << 8);
+      raw_value = ((int32_t)rx_data[i*3+6] << 24) | (rx_data[i*3+7] << 16) | (rx_data[i*3+8] << 8);
       raw_value >>= 8;
-      voltage_mv = (float)raw_value * (600.0f / 16777216.0f);
-      OpenBMS_data.cell_voltage[i-1] = voltage_mv * OpenBMS_data.cell_voltage_resistance_factor;
-      OpenBMS_data.cell_voltage[i-1] -= OpenBMS_data.voltage_offset[i-1];
-      OpenBMS_data.cell_voltage[i-1] *= OpenBMS_data.voltage_gain[i-1];
-    }
+      voltage_mv = (float)raw_value * (ADS_FULL_SCALE_GAIN_4 / 16777216.0f);
+      periph_data.cell_voltage[i] = voltage_mv * HW_CELL_VOLTAGE_RESISTANCE_FACTOR;
+      periph_data.cell_voltage[i] -= periph_data.voltage_offset[i];
+      periph_data.cell_voltage[i] *= periph_data.voltage_gain[i];
 
-    // Set update flags
-    cell_voltage_updated = true;
+      // Get filtered voltage now
+      periph_data.cell_voltage_filtered[i] = cell_voltage_filt_prev[i] + ADS_READ_FILT_COEF * (periph_data.cell_voltage[i] - cell_voltage_filt_prev[i]);
+      cell_voltage_filt_prev[i] = periph_data.cell_voltage_filtered[i];
+    }
   }
   /*
   else if(gpio_meas_pack_voltage_enable)
@@ -417,7 +525,7 @@ static void ADS131M08_Read(void)
     raw_value = ((int32_t)rx_data[24] << 24) | (rx_data[25] << 16) | (rx_data[26] << 8);
     raw_value >>= 8;
     voltage_mv = (float)raw_value * (1200.0f / 16777216.0f);
-    OpenBMS_data.voltage = voltage_mv * OpenBMS_data.batt_voltage_resistance_factor;
+    periph_data.voltage = voltage_mv * periph_data.batt_voltage_resistance_factor;
 
     // Set update flags
     pack_voltage_updated = true;
@@ -445,13 +553,13 @@ static void ADS131M08_Read(void)
 
         if(i == 0) 
         {
-          OpenBMS_data.current_sensor_offset = (float) ads_cal_val_sum[i] * (150.0f / 16777216.0f);
-          OpenBMS_data.current_sensor_offset *= OpenBMS_data.shunt_resistance_mohms;
+          periph_data.current_sensor_offset = (float) ads_cal_val_sum[i] * (ADS_FULL_SCALE_GAIN_16 / 16777216.0f);
+          periph_data.current_sensor_offset /= HW_SHUNT_RESISTANCE_MOHM;
         }
         else 
         {
-          OpenBMS_data.voltage_offset[i-1] = (float) ads_cal_val_sum[i] * (600.0f / 16777216.0f);
-          OpenBMS_data.voltage_offset[i-1] *= OpenBMS_data.cell_voltage_resistance_factor;
+          periph_data.voltage_offset[i-1] = (float) ads_cal_val_sum[i] * (ADS_FULL_SCALE_GAIN_4 / 16777216.0f);
+          periph_data.voltage_offset[i-1] *= HW_CELL_VOLTAGE_RESISTANCE_FACTOR;
         }
       }
 
@@ -467,9 +575,9 @@ static float NTC_GetTemperature(float r_ntc)
         return -273.15f;
     }
 
-    float temp_k = 1.0f / ((1.0f / OpenBMS_data.ntc_t_nominal) + (1.0f / OpenBMS_data.ntc_beta) * logf(r_ntc / OpenBMS_data.ntc_r_nominal));
+    float temp_k = 1.0f / ((1.0f / periph_data.ntc_t_nominal) + (1.0f / periph_data.ntc_beta) * logf(r_ntc / periph_data.ntc_r_nominal));
 
-    return (temp_k * 10.0f);
+    return (temp_k - 273.0f);
 }
 static void STM32_ADC_Init(void)
 {
@@ -488,7 +596,7 @@ static void STM32_ADC_Read(void)
       float r_ntc = 10000 / ((4095.0f / (float)adc_raw) - 1);
 
       // Get temperature now
-      OpenBMS_data.temperature_package = NTC_GetTemperature(r_ntc);
+      periph_data.temperature_package = NTC_GetTemperature(r_ntc);
 
       // Set flag
       temperature_ntc_updated = true;
@@ -503,7 +611,7 @@ static void STM32_ADC_Read(void)
 
       // Calculate actual VDD
       // vrefint_cal was measured at 3.0V so multiply by 3.0
-      OpenBMS_data.main_vdd_voltage_mv = (3000.0f * (float)vrefint_cal) / (float)adc_raw;
+      periph_data.main_vdd_voltage_mv = (3000.0f * (float)vrefint_cal) / (float)adc_raw;
 
       // Set flag true
       main_vdd_mv_updated = true;
@@ -518,10 +626,10 @@ static void STM32_ADC_Read(void)
         uint16_t ts_cal2 = *((uint16_t*)0x1FFF75CA);
 
         // Scale UP to 3.0V reference — VDD > 3.0V means raw is artificially low
-        float adc_corrected = (float)adc_raw * (OpenBMS_data.main_vdd_voltage_mv / 3000.0f);
+        float adc_corrected = (float)adc_raw * (periph_data.main_vdd_voltage_mv / 3000.0f);
 
-        OpenBMS_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1)
-                                            * (adc_corrected - (float)ts_cal1) + 30.0f;
+        periph_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1)
+                                * (adc_corrected - (float)ts_cal1) + 30.0f;
 
         temperature_stm32_updated = true;
       }
@@ -532,45 +640,113 @@ static void STM32_ADC_Read(void)
   stm32_adc_conv_index++;
   if(stm32_adc_conv_index == 3) stm32_adc_conv_index = 0;
 }
+static void Timer_Init(void)
+{
+  HAL_TIM_Base_Start_IT(periodic_timer);
+}
 static void GPIO_Ctrl(void)
 {
   // Set main FET and driver state
-  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_main_drv_enable);
-  HAL_GPIO_WritePin(DRV_FET_EN_GPIO_Port, DRV_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_main_fet_enable);
+  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) periph_gpio.gpio_main_drv_enable);
+  HAL_GPIO_WritePin(DRV_FET_EN_GPIO_Port, DRV_FET_EN_Pin, (GPIO_PinState) periph_gpio.gpio_main_fet_enable);
 
   // Set precharge/predischarge FET state
-  HAL_GPIO_WritePin(DRV_PRE_FET_EN_GPIO_Port, DRV_PRE_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_pre_fet_enable);
+  HAL_GPIO_WritePin(DRV_PRE_FET_EN_GPIO_Port, DRV_PRE_FET_EN_Pin, (GPIO_PinState) periph_gpio.gpio_pre_fet_enable);
 
   // Enable cell voltage measuring
-  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) (OpenBMS_ctrl.gpio_meas_cell_voltage_enable | OpenBMS_ctrl.gpio_meas_pack_voltage_enable));
+  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) (periph_gpio.gpio_meas_cell_voltage_enable | periph_gpio.gpio_meas_pack_voltage_enable));
 
   // Enable pack voltage measuring
-  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_meas_pack_voltage_enable);
+  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) periph_gpio.gpio_meas_pack_voltage_enable);
 
   // Set balancer
-  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[0]);
-  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[1]);
-  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[2]);
-  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[3]);
-  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[4]);
-  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[5]);
-  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_cell_balancer_enable[6]);
+  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) periph_gpio.gpio_cell_balancer_enable[0]);
+  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) periph_gpio.gpio_cell_balancer_enable[1]);
+  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) periph_gpio.gpio_cell_balancer_enable[2]);
+  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) periph_gpio.gpio_cell_balancer_enable[3]);
+  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) periph_gpio.gpio_cell_balancer_enable[4]);
+  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) periph_gpio.gpio_cell_balancer_enable[5]);
+  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) periph_gpio.gpio_cell_balancer_enable[6]);
   
   // Set main power signal on to keep OpenBMS on
-  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) OpenBMS_ctrl.gpio_pwr_on);
+  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) periph_gpio.gpio_pwr_on);
 
   // Read driver fault pin, inverse state
-  OpenBMS_ctrl.gpio_r_fet_driver_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GPIO_Port, DRV_FLT_Pin));
+  periph_gpio.gpio_r_fet_driver_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GPIO_Port, DRV_FLT_Pin));
 
   // Read driver gate fault pin, inverse state
-  OpenBMS_ctrl.gpio_r_fet_driver_gate_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GD_GPIO_Port, DRV_FLT_GD_Pin));
+  periph_gpio.gpio_r_fet_driver_gate_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GD_GPIO_Port, DRV_FLT_GD_Pin));
 
   // Read wake up pin, active high
-  OpenBMS_ctrl.gpio_r_wake_up = (bool)HAL_GPIO_ReadPin(WAKE_UP_GPIO_Port, WAKE_UP_Pin);
+  periph_gpio.gpio_r_wake_up = (bool)HAL_GPIO_ReadPin(WAKE_UP_GPIO_Port, WAKE_UP_Pin);
 
   // Read VCC power good pin
-  OpenBMS_ctrl.gpio_r_vcc_power_good = (bool)HAL_GPIO_ReadPin(PWR_PG_GPIO_Port, PWR_PG_Pin);
+  periph_gpio.gpio_r_vcc_power_good = (bool)HAL_GPIO_ReadPin(PWR_PG_GPIO_Port, PWR_PG_Pin);
 
+}
+static void Periph_SetDefaultData(void)
+{
+  memset(&periph_data, 0, sizeof(Peripheral_Data_t));
+
+  periph_data.current_sensor_gain                        = 1.0f;
+  periph_data.voltage_gain[0]                            = 1.02622576f;
+  periph_data.voltage_gain[1]                            = 1.00699300f;
+  periph_data.voltage_gain[2]                            = 1.01580135f;
+  periph_data.voltage_gain[3]                            = 0.99365166f;
+  periph_data.voltage_gain[4]                            = 1.02243680f;
+  periph_data.voltage_gain[5]                            = 1.00000000f;
+  periph_data.voltage_gain[6]                            = 1.00446428f;
+  periph_data.ntc_beta                                   = 3950.0f;
+  periph_data.ntc_r_nominal                              = 10000.0f;
+  periph_data.ntc_r_fixed                                = 10000.0f;
+  periph_data.ntc_t_nominal                              = 298.15f;
+}
+void Periph_Init(void)
+{
+  // Initialize default peripheral data
+  Periph_SetDefaultData();
+
+  // Keep power on GPIO high
+  periph_gpio.gpio_pwr_on = true;
+
+  //EEPROM_Init();
+  //EEPROM_Read();
+
+  STM32_ADC_Init();
+  ADS131M08_Init();
+  Timer_Init();
+}
+void Periph_Run(void)
+{
+    GPIO_Ctrl();
+}
+void Periph_SetFET(bool state)
+{
+    periph_gpio.gpio_main_drv_enable = state;
+    periph_gpio.gpio_main_fet_enable = state;
+
+    if(state) periph_data.fet_status |= BD_FET_MAIN;
+    else      periph_data.fet_status &= ~BD_FET_MAIN;
+    
+}
+void Periph_SetPreFET(bool state)
+{
+    periph_gpio.gpio_pre_fet_enable = state;
+
+    if(state) periph_data.fet_status |= BD_FET_PRE;
+    else      periph_data.fet_status &= ~BD_FET_PRE;
+}
+void Periph_GetData(Peripheral_Data_t *pd)
+{
+  // During memcpy operation, disable interrupts from ADS to prevent data corruption
+  HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);            // ADS131 DRDY
+  HAL_NVIC_DisableIRQ(ADC1_IRQn);                 // STM32 internal ADC
+
+  memcpy(pd, &periph_data, sizeof(Peripheral_Data_t));
+
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn); 
+  HAL_NVIC_EnableIRQ(ADC1_IRQn);
+  
 }
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -579,7 +755,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     ADS131M08_Read();
   }
 }
-// This callback fires automatically when conversion completes
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if(hadc->Instance == ADC1)
@@ -587,35 +762,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     STM32_ADC_Read();
   }
 }
-void Periph_Init(void)
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    // Keep power on GPIO high
-    OpenBMS_ctrl.gpio_pwr_on = true;
-
-    //EEPROM_Init();
-    //EEPROM_Read();
-
-    ADS131M08_Init();
-    STM32_ADC_Init();
-}
-void Periph_Run(void)
-{
-    GPIO_Ctrl();
-}
-void Periph_SetFET(bool state)
-{
-    OpenBMS_ctrl.gpio_main_drv_enable = state;
-    OpenBMS_ctrl.gpio_main_fet_enable = state;
-}
-void Periph_SetPreFET(bool state)
-{
-    OpenBMS_ctrl.gpio_pre_fet_enable = state;
-}
-void Periph_SetLearningState(bool state)
-{
-    OpenBMS_ctrl.run_learning = state;
-}
-bool Perigh_GetLearningState(void)
-{
-    return OpenBMS_ctrl.run_learning;
+    if (htim->Instance == TIM7)
+    {
+        Periph_50msTimer();
+    }
 }

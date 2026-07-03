@@ -37,6 +37,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include "openbms_data.h"
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -58,6 +59,8 @@ extern SMBUS_HandleTypeDef hsmbus2;
 extern SPI_HandleTypeDef hspi1;
 
 extern UART_HandleTypeDef huart1;
+
+extern TIM_HandleTypeDef htim7;
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/
