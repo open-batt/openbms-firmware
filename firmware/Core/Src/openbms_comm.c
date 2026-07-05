@@ -27,7 +27,6 @@ static Peripheral_Data_t    pd                      = {0};
 static Control_Data_t       cd                      = {0};
 static FuelGauge_Data_t     fg                      = {0};
 
-static void                 Data_SetDefaults(void);
 static CommErrorType_t      Controls_Set(uint8_t address, uint8_t *cmd, uint8_t length);
 static CommErrorType_t      Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data, uint8_t *length, bool write); 
 
@@ -37,9 +36,10 @@ static uint8_t              Checksum(uint8_t *data, uint16_t length);
 static void                 SendResponse(uint8_t *data, uint8_t length);
 static void                 SendError(CommErrorType_t err);
 
+/*
 static void Data_SetDefaults(void)
 {
-    /*
+    
     // -------------------------------------------------------------------------
     // 0x00 — Configuration
     // 0x01 — MainControl
@@ -402,11 +402,15 @@ static void Data_SetDefaults(void)
     // 0xDE — LearningStatus
     // -------------------------------------------------------------------------
     bd.learning_status                            =  0x0000;
-    */
+    
 }
+*/
 static CommErrorType_t Controls_Set(uint8_t address, uint8_t *cmd, uint8_t length)
 {
     CommErrorType_t res = CE_OK;
+
+    // Load data
+    Ctrl_GetData(&cd);
 
     if(length != 1)
     {
@@ -416,14 +420,7 @@ static CommErrorType_t Controls_Set(uint8_t address, uint8_t *cmd, uint8_t lengt
     {
         switch(address)
         {
-            case 0x00: 
-            {
-                if(cmd[0] != 0x00 && cmd[0] != 0x01) res = CE_WRONG_CMD;
-                else Periph_SetFET((bool) cmd[0]);
-            }
-            break;
-
-            case 0x01:
+            case 0x00:
             {
                 if(cmd[0] >= 0x03)
                 {
@@ -432,6 +429,27 @@ static CommErrorType_t Controls_Set(uint8_t address, uint8_t *cmd, uint8_t lengt
                 else 
                 {
                     Ctrl_SetMode((uint16_t) cmd[0]);
+                }
+            }
+            break;
+
+            case 0x01: 
+            {
+                if(cmd[0] != 0x00 && cmd[0] != 0x01) 
+                {
+                    res = CE_WRONG_CMD;
+                }
+                else 
+                {
+                    // Allow FET control only in learning mode
+                    if(cd.main_control & BD_MAIN_CTR_MODE_MASK & BD_MAIN_CTR_MODE_LEARNING)
+                    {
+                        Periph_SetFET((bool) cmd[0]);
+                    }
+                    else 
+                    {
+                        res = CE_RO;
+                    }
                 }
             }
             break;
@@ -896,9 +914,6 @@ static void SendError(CommErrorType_t err)
 }
 void Comm_Init(void)
 {
-    // Initalize structs
-    Data_SetDefaults();
-
     // Start data receiving on UART
     HAL_UARTEx_ReceiveToIdle_DMA(debug_uart, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
 }

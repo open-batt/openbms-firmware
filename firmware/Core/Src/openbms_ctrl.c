@@ -17,22 +17,8 @@
 
 #include "openbms_ctrl.h"
 #include "openbms_periph.h"
-#include "stm32l4xx_hal.h"
-#include "stm32l4xx_hal_pwr_ex.h"
 
-#define BATTERY_CURRENT_IDLE_THRESHOLD_MA   20
-
-typedef enum
-{
-  LS_START,
-  LS_CHECK_STATE,
-
-} LearningState_t;
-
-static LearningState_t  learning_state      = LS_START;
 static Control_Data_t   control_data        = {0};
-
-static uint32_t         learning_timer      = 0;
 static bool             protection_trigger  = false;
 static uint8_t          cell_number         = CELL_NUMBER_DEFAULT;
 
@@ -233,31 +219,6 @@ static void Protection_Check(void)
                               &otp_triggered);    
   }
 }
-static void Run_Learning(void)
-{
-  switch(learning_state)
-  {
-    case LS_START:
-    {
-      // Disable FETs first
-      Periph_SetFET(false);
-      Periph_SetFET(false);
-
-      Timer_Set(&learning_timer);
-      learning_state = LS_CHECK_STATE;
-    }
-    break;
-
-    case LS_CHECK_STATE:
-    {
-      if(Timer_Expired(&learning_timer, 1000))
-      {
-        
-      }
-    }
-    break;
-  }
-}
 static void Ctrl_SetDefaults(void)
 {
   // Configure BMS
@@ -297,23 +258,29 @@ static void Ctrl_SetDefaults(void)
   control_data.ocp_discharge_fast_threshold_ma  = 18000; // 18A
   control_data.ocp_discharge_fast_time_ms       = 1000;  // 1s
 
-  control_data.otp_threshold_c       = 60;      // 60 degrees C
-  control_data.otp_time_ms           = 60000;   // 1 minute
+  control_data.otp_threshold_c                  = 60;    // 60 degrees C
+  control_data.otp_time_ms                      = 60000; // 1 minute
+
+  // Set system information
+  strncpy(control_data.firmware_version,        "1.0.0",         32);
+  strncpy(control_data.hardware_version,        "RevA",          32);
+  strncpy(control_data.manufacturer_name,       "OpenBatt Team", 32);
+  strncpy(control_data.device_name,             "OpenBMS",       32);
+  strncpy(control_data.device_chemistry,        "Li-Ion",        32);
+  strncpy(control_data.manufacturer_data,       "Year 2026",     32);
 
 }
 void Ctrl_Init(void)
 {
   Ctrl_SetDefaults();
   Periph_Init();
-  Periph_SetFET(true);
 }
 void Ctrl_Run(void)
 {
-  uint16_t mode = control_data.main_control & BD_MAIN_CTR_MODE_MASK;
-
-  if(mode & BD_MAIN_CTR_MODE_LEARNING)
+  // Check if in learning mode
+  if(control_data.main_control & BD_MAIN_CTR_MODE_MASK & BD_MAIN_CTR_MODE_LEARNING)
   {
-    Run_Learning();
+
   }
 
   Periph_Run();
