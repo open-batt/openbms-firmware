@@ -551,9 +551,9 @@ static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data
             // -------------------------------------------------------
             case 0x30: { data_point = (void *)&cd.configuration;                              *length = sizeof(cd.configuration);                              } break;
             case 0x31: { data_point = (void *)&cd.main_control;                               *length = sizeof(cd.main_control);                               } break;
-            case 0x32: { data_point = (void *)&cd.pack_capacity;                              *length = sizeof(cd.pack_capacity);                              } break;
-            case 0x33: { data_point = (void *)&cd.voltage_pack_max;                           *length = sizeof(cd.voltage_pack_max);                           } break;
-            case 0x34: { data_point = (void *)&cd.voltage_pack_min;                           *length = sizeof(cd.voltage_pack_min);                           } break;
+            case 0x32: { data_point = (void *)&cd.cell_capacity;                              *length = sizeof(cd.cell_capacity);                              } break;
+            case 0x33: { data_point = (void *)&cd.voltage_cell_max;                           *length = sizeof(cd.voltage_cell_max);                           } break;
+            case 0x34: { data_point = (void *)&cd.voltage_cell_min;                           *length = sizeof(cd.voltage_cell_min);                           } break;
             case 0x35: { data_point = (void *)&cd.charging_term_current;                      *length = sizeof(cd.charging_term_current);                      } break;
             case 0x36: { data_point = (void *)&cd.uvp_slow_threshold_mv;                      *length = sizeof(cd.uvp_slow_threshold_mv);                      } break;
             case 0x37: { data_point = (void *)&cd.uvp_slow_time_ms;                           *length = sizeof(cd.uvp_slow_time_ms);                           } break;

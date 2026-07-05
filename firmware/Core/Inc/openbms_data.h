@@ -7,6 +7,8 @@ extern "C" {
 
 #include "main.h"
 
+#define CELL_NUMBER_DEFAULT                 (7)             // Default cell number is 7
+
 // ---------------------------------------------------------
 // 0x00 — Configuration register bit definitions (read-only)
 // ---------------------------------------------------------
@@ -14,10 +16,9 @@ extern "C" {
 #define BD_CONFIG_USE_I2C                   (1 << 4)        // Bit 4     — I2C enabled
 #define BD_CONFIG_USE_CAN                   (1 << 5)        // Bit 5     — CAN enabled
 #define BD_CONFIG_USE_UART                  (1 << 6)        // Bit 6     — UART enabled
-#define BD_CONFIG_USE_NTC                   (1 << 7)        // Bit 7     — NTC temperature sensor
-#define BD_CONFIG_VOLT_PROT                 (1 << 8)        // Bit 8     — voltage protection
-#define BD_CONFIG_CURR_PROT                 (1 << 9)        // Bit 9     — current protection
-#define BD_CONFIG_TEMP_PROT                 (1 << 10)       // Bit 10    — temperature protection
+#define BD_CONFIG_VOLT_PROT                 (1 << 7)        // Bit 7     — voltage protection
+#define BD_CONFIG_CURR_PROT                 (1 << 8)        // Bit 8     — current protection
+#define BD_CONFIG_TEMP_PROT                 (1 << 9)        // Bit 9     — temperature protection
 
 // -------------------------------------------------------
 // 0x01 — MainControl register bit definitions
@@ -59,13 +60,13 @@ typedef struct __attribute__((packed))
                                                        // Bit 4: I2C
                                                        // Bits 3-0: cell count
     uint16_t main_control;                             // Bit 2-0: 0 - normal mode, 1 - config mode, 2 - learning mode
-    uint32_t pack_capacity;                            // factory capacity in mAh
-    uint16_t voltage_pack_max;                         // max designed pack voltage in mV
-    uint16_t voltage_pack_min;                         // min designed pack voltage in mV
+    uint32_t cell_capacity;                            // factory capacity in mAh
+    uint16_t voltage_cell_max;                         // max designed cell voltage in mV
+    uint16_t voltage_cell_min;                         // min designed cell voltage in mV
     uint16_t charging_term_current;                    // Termination current in mA
 
     // -------------------------------------------------------------------------
-    // Voltage protection configuration
+    // Voltage protection configuration (per-cell)
     // -------------------------------------------------------------------------
 
     uint16_t uvp_slow_threshold_mv;                    // slow UVP threshold in mV
@@ -126,7 +127,7 @@ typedef struct __attribute__((packed))
     char     manufacturer_name[32];                    // "OpenBatt Team" — ASCII null-terminated
     char     device_name[32];                          // "OpenBMS" — ASCII null-terminated
     char     device_chemistry[32];                     // "Li-Ion" — ASCII null-terminated
-    char    manufacturer_data[32];                     // "Year 2026" — ASCII null-terminated
+    char     manufacturer_data[32];                    // "Year 2026" — ASCII null-terminated
 
 } Control_Data_t;
 
@@ -186,7 +187,7 @@ typedef struct __attribute__((packed))
 
 } FuelGauge_Data_t;
 
-typedef struct __attribute__((packed))
+typedef struct
 {
     float       cell_voltage[7];                        // per-cell voltage in mV
     float       cell_voltage_filtered[7];               // per-cell filtered voltage in mV
