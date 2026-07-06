@@ -25,7 +25,7 @@
 #define ADS_FULL_SCALE_GAIN_4                 600.0f
 #define ADS_READ_FILT_COEF                    0.166f
 
-#define HW_CELL_VOLTAGE_RESISTANCE_FACTOR     21.6060606f
+#define HW_CELL_VOLTAGE_RESISTANCE_FACTOR     29.3333333f
 #define HW_BATT_VOLTAGE_RESISTANCE_FACTOR     1
 #define HW_SHUNT_RESISTANCE_MOHM              2.0f
 
@@ -66,6 +66,7 @@ static bool                 temperature_stm32_updated   = true;
 static uint8_t              stm32_adc_conv_index        = 0;
 static float_t              cell_voltage_filt_prev[7]   = {0};
 static float                current_filt_prev           = 0;
+static float                pack_vol_filt_prev          = 0;
 
 static bool                 ads_calibration_start       = false;
 static bool                 ads_calibration_finish      = false;
@@ -503,6 +504,8 @@ static void ADS131M08_Read(void)
   // Extract CH1 - CH7 values and get cell voltages
   if(periph_gpio.gpio_meas_cell_voltage_enable & ads_start_measurements)
   {
+    periph_data.pack_voltage = 0;
+
     // Measure all cell voltages
     for(uint8_t i = 0; i < 7; i++)
     {
@@ -516,7 +519,13 @@ static void ADS131M08_Read(void)
       // Get filtered voltage now
       periph_data.cell_voltage_filtered[i] = cell_voltage_filt_prev[i] + ADS_READ_FILT_COEF * (periph_data.cell_voltage[i] - cell_voltage_filt_prev[i]);
       cell_voltage_filt_prev[i] = periph_data.cell_voltage_filtered[i];
+
+      periph_data.pack_voltage += periph_data.cell_voltage_filtered[i];
     }
+
+    // Get filtered pack voltage
+    periph_data.pack_voltage_filtered = pack_vol_filt_prev + ADS_READ_FILT_COEF * (periph_data.pack_voltage - pack_vol_filt_prev);
+    pack_vol_filt_prev = periph_data.pack_voltage_filtered;
   }
   /*
   else if(gpio_meas_pack_voltage_enable)
@@ -689,13 +698,13 @@ static void Periph_SetDefaultData(void)
   memset(&periph_data, 0, sizeof(Peripheral_Data_t));
 
   periph_data.current_sensor_gain                        = 1.0f;
-  periph_data.voltage_gain[0]                            = 1.02622576f;
-  periph_data.voltage_gain[1]                            = 1.00699300f;
-  periph_data.voltage_gain[2]                            = 1.01580135f;
-  periph_data.voltage_gain[3]                            = 0.99365166f;
-  periph_data.voltage_gain[4]                            = 1.02243680f;
-  periph_data.voltage_gain[5]                            = 1.00000000f;
-  periph_data.voltage_gain[6]                            = 1.00446428f;
+  periph_data.voltage_gain[0]                            = 1.0313507f;
+  periph_data.voltage_gain[1]                            = 1.0011376f;
+  periph_data.voltage_gain[2]                            = 1.0244470f;
+  periph_data.voltage_gain[3]                            = 0.9893198f;
+  periph_data.voltage_gain[4]                            = 1.0129496f;
+  periph_data.voltage_gain[5]                            = 1.0324656f;
+  periph_data.voltage_gain[6]                            = 0.9872386f;
   periph_data.ntc_beta                                   = 3950.0f;
   periph_data.ntc_r_nominal                              = 10000.0f;
   periph_data.ntc_r_fixed                                = 10000.0f;
@@ -709,6 +718,9 @@ void Periph_Init(void)
   // Keep power on GPIO high
   periph_gpio.gpio_pwr_on = true;
 
+  // Keep FET driver enabled (FET is still off)
+  periph_gpio.gpio_main_drv_enable = true;
+
   //EEPROM_Init();
   //EEPROM_Read();
 
@@ -721,8 +733,7 @@ void Periph_Run(void)
     GPIO_Ctrl();
 }
 void Periph_SetFET(bool state)
-{
-    periph_gpio.gpio_main_drv_enable = state;
+{  
     periph_gpio.gpio_main_fet_enable = state;
 
     if(state) periph_data.fet_status |= BD_FET_MAIN;
