@@ -37,6 +37,7 @@ typedef struct
     uint8_t  tx_buffer[UART_TX_BUFFER_SIZE];
     uint16_t rx_length;
     uint8_t  uart_rx_byte;
+    bool     tx_wait;
     bool     frame_ready;
 
 } UART_Command_t;

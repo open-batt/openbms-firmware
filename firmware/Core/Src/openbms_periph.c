@@ -18,7 +18,9 @@
 #include "openbms_comm.h"
 #include "openbms_ctrl.h"
 #include "openbms_data.h"
+#include "stm32l4xx_hal.h"
 #include <math.h>
+#include <stdint.h>
 #include "openbms_periph.h"
 
 #define ADS_FULL_SCALE_GAIN_16                150.0f
@@ -60,10 +62,7 @@ static Peripheral_Data_t    periph_data                 = {0};
 
 static uint64_t             OpenBMS_status              = 0;
 
-static bool                 main_vdd_mv_updated         = false;
-static bool                 temperature_ntc_updated     = false;
-static bool                 temperature_stm32_updated   = true;
-static uint8_t              stm32_adc_conv_index        = 0;
+static uint16_t             stm32_adc_dma_buf[3]        = {0};
 static float_t              cell_voltage_filt_prev[7]   = {0};
 static float                current_filt_prev           = 0;
 static float                pack_vol_filt_prev          = 0;
@@ -425,6 +424,7 @@ static void ADS131M08_Init(void)
     return;
   }
 
+  /*
   // Start internal offset calibration
   ADS131M08_WriteReg(0x09, 0x0001);  // CH0_CFG MUX=01
   ADS131M08_WriteReg(0x0E, 0x0001);  // CH1_CFG MUX=01
@@ -434,6 +434,7 @@ static void ADS131M08_Init(void)
   ADS131M08_WriteReg(0x22, 0x0001);  // CH5_CFG MUX=01
   ADS131M08_WriteReg(0x27, 0x0001);  // CH6_CFG MUX=01
   ADS131M08_WriteReg(0x2C, 0x0001);  // CH7_CFG MUX=01
+  */
 
   // Standby the ADS131M08 to allow register configuration
   if(!ADS131M08_Wakeup())
@@ -450,6 +451,7 @@ static void ADS131M08_Init(void)
   HAL_Delay(500);
   ads_calibration_finish = true;
 
+  /*
   // Stop internal offset calibration
   ADS131M08_WriteReg(0x09, 0x0000);  // CH0_CFG MUX=01
   ADS131M08_WriteReg(0x0E, 0x0000);  // CH1_CFG MUX=01
@@ -459,6 +461,7 @@ static void ADS131M08_Init(void)
   ADS131M08_WriteReg(0x22, 0x0000);  // CH5_CFG MUX=01
   ADS131M08_WriteReg(0x27, 0x0000);  // CH6_CFG MUX=01
   ADS131M08_WriteReg(0x2C, 0x0000);  // CH7_CFG MUX=01
+  */
 
   // Wait a bit to settle down, 3-4 samples
   HAL_Delay(10);
@@ -488,9 +491,10 @@ static void ADS131M08_Read(void)
     current = voltage_mv / HW_SHUNT_RESISTANCE_MOHM;
     current -= periph_data.current_sensor_offset;
     current *= 1000.0f;  // Convert to mA
+    current *= -1;       // Change the sign
 
     // Todo: remove hardcoded value
-    current -= 28.3;
+    current -= 8;
     
     current_filtered = current_filt_prev + ADS_READ_FILT_COEF * (current - current_filt_prev);
     current_filt_prev = current_filtered;
@@ -558,7 +562,7 @@ static void ADS131M08_Read(void)
       // Get offset values now
       for(uint8_t i = 0; i <= 7; i++) 
       {
-        ads_cal_val_sum[i] /= ads_cal_val_count;
+        ads_cal_val_sum[i] /= (int32_t) ads_cal_val_count;
 
         if(i == 0) 
         {
@@ -591,63 +595,34 @@ static float NTC_GetTemperature(float r_ntc)
 static void STM32_ADC_Init(void)
 {
   HAL_ADCEx_Calibration_Start(internal_adc, ADC_SINGLE_ENDED);
-  HAL_ADC_Start_IT(internal_adc);
+  HAL_ADC_Start_DMA(internal_adc, (uint32_t*)stm32_adc_dma_buf, 3);
 }
 static void STM32_ADC_Read(void)
 {
-  uint32_t adc_raw = HAL_ADC_GetValue(internal_adc);
+  // Calculate NTC voltage using actual VDD
+  float r_ntc = 10000 / ((4095.0f / (float)stm32_adc_dma_buf[0]) - 1);
 
-  switch(stm32_adc_conv_index)
-  {
-    case 0:         
-    {
-      // Calculate NTC voltage using actual VDD
-      float r_ntc = 10000 / ((4095.0f / (float)adc_raw) - 1);
+  // Get temperature now
+  periph_data.temperature_package = NTC_GetTemperature(r_ntc);
 
-      // Get temperature now
-      periph_data.temperature_package = NTC_GetTemperature(r_ntc);
+  // ST factory calibrated VREFINT value measured at 3.0V, 30°C
+  // Stored in flash at fixed address
+  uint16_t vrefint_cal = *((uint16_t*)0x1FFF75AA);
 
-      // Set flag
-      temperature_ntc_updated = true;
-    }
-    break;
+  // Calculate actual VDD
+  // vrefint_cal was measured at 3.0V so multiply by 3.0
+  periph_data.main_vdd_voltage_mv = (3000.0f * (float)vrefint_cal) / (float)stm32_adc_dma_buf[1];
 
-    case 1:    
-    {
-      // ST factory calibrated VREFINT value measured at 3.0V, 30°C
-      // Stored in flash at fixed address
-      uint16_t vrefint_cal = *((uint16_t*)0x1FFF75AA);
+  // Calculate STM32 temperature
+  uint16_t ts_cal1 = *((uint16_t*)0x1FFF75A8);
+  uint16_t ts_cal2 = *((uint16_t*)0x1FFF75CA);
 
-      // Calculate actual VDD
-      // vrefint_cal was measured at 3.0V so multiply by 3.0
-      periph_data.main_vdd_voltage_mv = (3000.0f * (float)vrefint_cal) / (float)adc_raw;
+  // Scale UP to 3.0V reference — VDD > 3.0V means raw is artificially low
+  float adc_corrected = (float)stm32_adc_dma_buf[2] * (periph_data.main_vdd_voltage_mv / 3000.0f);
 
-      // Set flag true
-      main_vdd_mv_updated = true;
-    }
-    break;
-
-    case 2:
-    {
-      if(main_vdd_mv_updated)
-      {
-        uint16_t ts_cal1 = *((uint16_t*)0x1FFF75A8);
-        uint16_t ts_cal2 = *((uint16_t*)0x1FFF75CA);
-
-        // Scale UP to 3.0V reference — VDD > 3.0V means raw is artificially low
-        float adc_corrected = (float)adc_raw * (periph_data.main_vdd_voltage_mv / 3000.0f);
-
-        periph_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1)
-                                * (adc_corrected - (float)ts_cal1) + 30.0f;
-
-        temperature_stm32_updated = true;
-      }
-    }
-    break;
-  }
-
-  stm32_adc_conv_index++;
-  if(stm32_adc_conv_index == 3) stm32_adc_conv_index = 0;
+  periph_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1)
+                          * (adc_corrected - (float)ts_cal1) + 30.0f;
+  
 }
 static void Timer_Init(void)
 {
@@ -698,13 +673,13 @@ static void Periph_SetDefaultData(void)
   memset(&periph_data, 0, sizeof(Peripheral_Data_t));
 
   periph_data.current_sensor_gain                        = 1.0f;
-  periph_data.voltage_gain[0]                            = 1.0313507f;
-  periph_data.voltage_gain[1]                            = 1.0011376f;
-  periph_data.voltage_gain[2]                            = 1.0244470f;
-  periph_data.voltage_gain[3]                            = 0.9893198f;
-  periph_data.voltage_gain[4]                            = 1.0129496f;
-  periph_data.voltage_gain[5]                            = 1.0324656f;
-  periph_data.voltage_gain[6]                            = 0.9872386f;
+  periph_data.voltage_gain[0]                            = 1.0148891f;
+  periph_data.voltage_gain[1]                            = 1.0103785f;
+  periph_data.voltage_gain[2]                            = 0.9905100f;
+  periph_data.voltage_gain[3]                            = 1.0496543f;
+  periph_data.voltage_gain[4]                            = 0.9842869f;
+  periph_data.voltage_gain[5]                            = 1.0276679f;
+  periph_data.voltage_gain[6]                            = 0.9973599f;
   periph_data.ntc_beta                                   = 3950.0f;
   periph_data.ntc_r_nominal                              = 10000.0f;
   periph_data.ntc_r_fixed                                = 10000.0f;

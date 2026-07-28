@@ -898,7 +898,12 @@ static uint8_t Checksum(uint8_t *data, uint16_t length)
 }
 static void SendResponse(uint8_t *data, uint8_t length)
 {
-    HAL_UART_Transmit_IT(&huart1, (uint8_t *)data, length);
+    // Wait for previous send to finish
+    while(uart_cmd.tx_wait);
+
+    // Raise the flag and send new data
+    uart_cmd.tx_wait = true;
+    HAL_UART_Transmit_DMA(&huart1, (uint8_t *)data, length);
 }
 static void SendError(CommErrorType_t err)
 {
@@ -934,4 +939,12 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
         uart_cmd.frame_ready     = true;
         HAL_UARTEx_ReceiveToIdle_DMA(debug_uart, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
     }
+}
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    // transmission finished — buffer is now safe to reuse/refill
+    uart_cmd.tx_wait = false;
+  }
 }

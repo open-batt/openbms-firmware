@@ -231,7 +231,7 @@ static void Ctrl_SetDefaults(void)
   control_data.main_control            = (BD_MAIN_CTR_MODE_NORMAL << BD_MAIN_CTR_MODE_SHIFT) & BD_MAIN_CTR_MODE_MASK;
 
   // Configure cell data
-  control_data.cell_capacity           = 2500;     // 2.5Ah
+  control_data.cell_capacity           = 2000;     // 2.0Ah
   control_data.voltage_cell_max        = 4200;     // 4.2V
   control_data.voltage_cell_min        = 2500;     // 2.5V
   control_data.charging_term_current   = 100;      // 0.1A
