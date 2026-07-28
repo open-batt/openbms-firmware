@@ -83,11 +83,14 @@ MODE_VERIFY_DELAY_S = 0.05
 PULSE_ON_S  = 2.0
 PULSE_OFF_S = 2.0
 
-# Charging now always terminates purely on a fixed 4.2V/cell ceiling,
-# regardless of what voltage_cell_max reads from the device, and never
-# on current — current-based termination checking is disabled for
-# charging in every mode (C, CP, CHPPC).
-CHARGE_STOP_CELL_MV = 4200
+# Charging termination rules (apply to C, CP, CHPPC):
+#   - hard ceiling: stop immediately if any cell's filtered voltage
+#     reaches CHARGE_STOP_CELL_MV, regardless of current.
+#   - taper/termination-current stop: only evaluated once any cell's
+#     filtered voltage has reached CHARGE_CURRENT_MONITOR_MV — below
+#     that, current is not monitored for termination purposes at all.
+CHARGE_STOP_CELL_MV        = 4300
+CHARGE_CURRENT_MONITOR_MV  = 4100
 
 # ---------------------------------------------------------------
 # HPPC test parameters
@@ -549,16 +552,29 @@ def do_monitor(ser, port):
 #
 # Continuous (C/D) and Pulse (CP/DP, toggling FET ON/OFF every
 # PULSE_ON_S/PULSE_OFF_S):
-#   - C/CP (charging) stop only when any cell's filtered voltage
-#     reaches the fixed CHARGE_STOP_CELL_MV (4.2V) ceiling. Current
-#     is not checked at all for charging termination.
-#   - D/DP (discharging) stop when any cell's filtered voltage
-#     <= voltage_cell_min (read from the device).
+#   - C/CP (charging) stop controlling (and disable the FET) when
+#     either:
+#       a) any cell's filtered voltage reaches CHARGE_STOP_CELL_MV
+#          (hard ceiling, always checked), or
+#       b) filtered current drops to/below charging_term_current —
+#          but only once any cell's filtered voltage has reached
+#          CHARGE_CURRENT_MONITOR_MV (current isn't monitored for
+#          termination before that point). In pulse mode this is
+#          only checked while the FET is ON.
+#   - D/DP (discharging) stop controlling (and disable the FET) when
+#     any cell's filtered voltage <= voltage_cell_min (read from the
+#     device).
+#
+# IMPORTANT: hitting a stop condition does NOT end the script. It
+# just disables the FET (retrying every tick until it succeeds) and
+# the script keeps reading, logging, and displaying at 20Hz — same
+# CSV file — in a passive monitoring state. Only pressing 'q' ends
+# the script.
 #
 # Current-direction (sign) checking is disabled in all modes.
 #
 # In every case, the FET is guaranteed to be disabled on the way
-# out (normal stop, 'q', or a crash).
+# out (stop condition, 'q', or a crash).
 # ---------------------------------------------------------------
 def do_charge_discharge(ser, port, mode):
     is_charging = mode.startswith("charging")
@@ -620,22 +636,25 @@ def do_charge_discharge(ser, port, mode):
         display_iter  = 0
         errors        = 0
         toggle_errors = 0
-        stop_reason   = None
+        disable_errors = 0
+        user_quit       = False
+        stopped         = False   # True once a voltage/current condition has fired
+        final_stop_reason = None
 
-        while stop_reason is None:
+        while not user_quit:
 
             if msvcrt.kbhit():
                 if msvcrt.getwch().lower() == 'q':
-                    stop_reason = "user requested stop ('q')"
+                    user_quit = True
                     break
 
             t_start = time.time()
 
             # -------------------------------------------------------
-            # Pulse toggle — check before reading, so the read reflects
-            # the freshly-commanded state as closely as possible
+            # Pulse toggle — only while still actively controlling.
+            # Once stopped, the FET stays off and this is skipped.
             # -------------------------------------------------------
-            if pulse:
+            if not stopped and pulse:
                 threshold = PULSE_ON_S if phase == "ON" else PULSE_OFF_S
                 if (t_start - phase_start) >= threshold:
                     want_on = (phase == "OFF")
@@ -659,24 +678,54 @@ def do_charge_discharge(ser, port, mode):
             cell_v_filt = r['cell_v_filt']
             curr_filt   = r['curr_filt']
 
+            newly_triggered_reason = ''
+
+            if not stopped:
+                # -------------------------------------------------------
+                # Voltage stop condition — evaluated every read, both
+                # continuous and pulse modes, regardless of FET phase.
+                # Charging: hard ceiling at CHARGE_STOP_CELL_MV.
+                # Discharging: device's voltage_cell_min register.
+                # -------------------------------------------------------
+                if cell_v_filt is not None:
+                    for i, vfi in enumerate(cell_v_filt):
+                        if vfi is None:
+                            continue
+                        if is_charging and vfi >= CHARGE_STOP_CELL_MV:
+                            final_stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV >= {CHARGE_STOP_CELL_MV} mV"
+                            break
+                        if (not is_charging) and vfi <= voltage_cell_min:
+                            final_stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV <= min {voltage_cell_min} mV"
+                            break
+
+                # -------------------------------------------------------
+                # Termination-current stop condition — charging only, and
+                # only monitored once any cell's filtered voltage has
+                # reached CHARGE_CURRENT_MONITOR_MV. In pulse mode this is
+                # only meaningful (and only checked) while the FET is ON.
+                # -------------------------------------------------------
+                if final_stop_reason is None and is_charging and cell_v_filt is not None and curr_filt is not None:
+                    voltage_gate = any(vfi is not None and vfi >= CHARGE_CURRENT_MONITOR_MV
+                                       for vfi in cell_v_filt)
+                    current_check_ok = (not pulse) or (phase == "ON")
+                    if voltage_gate and current_check_ok and abs(curr_filt) <= charging_term_current:
+                        final_stop_reason = (f"filtered current {curr_filt:.1f} mA within termination current "
+                                        f"{charging_term_current} mA (monitored above {CHARGE_CURRENT_MONITOR_MV} mV/cell)")
+
+                if final_stop_reason is not None:
+                    stopped = True
+                    newly_triggered_reason = final_stop_reason
+
             # -------------------------------------------------------
-            # Voltage stop condition — evaluated every read, both
-            # continuous and pulse modes, regardless of FET phase.
-            # Charging always terminates on a fixed 4.2V/cell ceiling;
-            # current-based termination checking is disabled for
-            # charging. Discharging still uses the device's
-            # voltage_cell_min register.
+            # Once stopped, keep the FET disabled — retry every tick
+            # until the disable command actually succeeds
             # -------------------------------------------------------
-            if cell_v_filt is not None:
-                for i, vfi in enumerate(cell_v_filt):
-                    if vfi is None:
-                        continue
-                    if is_charging and vfi >= CHARGE_STOP_CELL_MV:
-                        stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV >= {CHARGE_STOP_CELL_MV} mV"
-                        break
-                    if (not is_charging) and vfi <= voltage_cell_min:
-                        stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV <= min {voltage_cell_min} mV"
-                        break
+            if stopped and fet_is_on:
+                ok, info = set_fet(ser, False)
+                if ok:
+                    fet_is_on = False
+                else:
+                    disable_errors += 1
 
             phase_reads += 1
 
@@ -688,7 +737,7 @@ def do_charge_discharge(ser, port, mode):
             log_writer.writerow(make_csv_row(elapsed_s, r['uptime'], r['cell_v'], cell_v_filt,
                                              r['pack_v'], r['pack_vf'], r['current'], curr_filt,
                                              r['temp_c'], r['fet_status'], r['learning_status'],
-                                             commanded_fet_state, stop_reason or ''))
+                                             commanded_fet_state, newly_triggered_reason))
             log_file.flush()
 
             # -------------------------------------------------------
@@ -699,7 +748,8 @@ def do_charge_discharge(ser, port, mode):
 
                 ln(BOLD + CYAN + "=" * 72 + RESET)
                 ln(f"  OpenBMS {label}  —  {port}  —  20Hz read / 5Hz display  —  errors: {errors}"
-                   + (f"  |  toggle errs: {toggle_errors}" if pulse else ""))
+                   + (f"  |  toggle errs: {toggle_errors}" if (pulse and not stopped) else "")
+                   + (f"  |  disable errs: {disable_errors}" if disable_errors else ""))
                 ln(BOLD + CYAN + "=" * 72 + RESET)
 
                 ln()
@@ -717,7 +767,11 @@ def do_charge_discharge(ser, port, mode):
                 ln(f"  Cell voltage max:  {voltage_cell_max} mV")
                 ln(f"  Cell voltage min:  {voltage_cell_min} mV")
 
-                if pulse:
+                if stopped:
+                    ln()
+                    ln(RED + BOLD + "  STOPPED: " + RESET + RED + f"{final_stop_reason}" + RESET)
+                    ln(DIM + "  FET disabled — now monitoring only. Press 'q' to quit." + RESET)
+                elif pulse:
                     threshold_now = PULSE_ON_S if phase == "ON" else PULSE_OFF_S
                     remaining = max(0.0, threshold_now - (time.time() - phase_start))
                     phase_col = GREEN if phase == "ON" else DIM
@@ -734,8 +788,8 @@ def do_charge_discharge(ser, port, mode):
                     vfi = vf[i] if vf else None
                     ln(f"  {cell_color(vfi)}Cell {i+1}  {fmt_f(vi):>10}   {fmt_f(vfi):>10}   "
                        f"{bar(vfi, voltage_cell_min, bar_hi)}{RESET}")
-                if is_charging:
-                    ln(DIM + f"  (charging stop is fixed at {CHARGE_STOP_CELL_MV} mV/cell, current ignored)" + RESET)
+                if is_charging and not stopped:
+                    ln(DIM + f"  (charging stop: any cell >= {CHARGE_STOP_CELL_MV} mV)" + RESET)
 
                 pack_v_volts  = (r['pack_v']  / 1000.0) if r['pack_v']  is not None else None
                 pack_vf_volts = (r['pack_vf'] / 1000.0) if r['pack_vf'] is not None else None
@@ -748,6 +802,12 @@ def do_charge_discharge(ser, port, mode):
                 ln(BOLD + "  Current (mA)" + RESET)
                 ln(f"  Raw:      {current_color(r['current'])}{fmt_f(r['current']):>10} mA{RESET}")
                 ln(f"  Filtered: {current_color(curr_filt)}{fmt_f(curr_filt):>10} mA{RESET}")
+                if is_charging and not stopped:
+                    gate_on = bool(cell_v_filt) and any(
+                        vfi is not None and vfi >= CHARGE_CURRENT_MONITOR_MV for vfi in cell_v_filt)
+                    gate_txt = (GREEN + "ACTIVE" + RESET) if gate_on else (DIM + "waiting for >= " + f"{CHARGE_CURRENT_MONITOR_MV} mV/cell" + RESET)
+                    ln(f"  Term. current stop:  <= {charging_term_current} mA   [{gate_txt}]"
+                       + ("  (checked only while FET is ON)" if pulse else ""))
 
                 ln()
                 ln(BOLD + "  Temperature" + RESET)
@@ -756,7 +816,8 @@ def do_charge_discharge(ser, port, mode):
                 fet_status = r['fet_status']
                 ln()
                 ln(BOLD + "  Status" + RESET)
-                ln(f"  {label}:{' ' * max(1, 16 - len(label))}{GREEN}{BOLD}ACTIVE{RESET}")
+                status_txt = (DIM + "STOPPED (monitoring)" + RESET) if stopped else (GREEN + BOLD + "ACTIVE" + RESET)
+                ln(f"  {label}:{' ' * max(1, 16 - len(label))}{status_txt}")
                 ln(f"  Main FET:         {fet_text(fet_status, BD_FET_MAIN)}")
                 ln(f"  Pre-charge FET:   {fet_text(fet_status, BD_FET_PRE)}")
                 ln(f"  FET Status raw:   {CYAN}{fmt_h(fet_status)}{RESET}")
@@ -771,7 +832,11 @@ def do_charge_discharge(ser, port, mode):
                 time.sleep(sleep_s)
 
         print(RESET)
-        print(f"Stopping {mode}: {stop_reason}")
+        if final_stop_reason:
+            print(f"{mode} stop condition hit: {final_stop_reason}")
+            print("FET was disabled and monitoring continued until you quit.")
+        else:
+            print(f"Stopped {mode}: user requested stop ('q')")
 
         log_file.close()
 
@@ -795,7 +860,7 @@ def do_charge_discharge(ser, port, mode):
 def render_hppc_dashboard(port, label, r, segment_type, target_pct, coulomb_mah, target_mah,
                           rest_remaining_s, voltage_cell_min, voltage_cell_max,
                           charging_term_current, is_charging, errors, log_filename, elapsed_s,
-                          cell_capacity, cell_count):
+                          cell_capacity, cell_count, final_stop_reason=None):
     print(HOME, end='')
 
     ln(BOLD + CYAN + "=" * 72 + RESET)
@@ -819,7 +884,10 @@ def render_hppc_dashboard(port, label, r, segment_type, target_pct, coulomb_mah,
 
     ln()
     ln(BOLD + "  HPPC Segment" + RESET)
-    if segment_type == "REST":
+    if segment_type == "STOPPED":
+        ln(RED + BOLD + "  STOPPED: " + RESET + RED + f"{final_stop_reason}" + RESET)
+        ln(DIM + "  FET disabled — now monitoring only. Press 'q' to quit." + RESET)
+    elif segment_type == "REST":
         ln(f"  Phase:          {DIM}RESTING{RESET}   at checkpoint {target_pct}%"
            f"   (next in {rest_remaining_s:.0f}s)")
     else:
@@ -843,8 +911,8 @@ def render_hppc_dashboard(port, label, r, segment_type, target_pct, coulomb_mah,
         vfi = vf[i] if vf else None
         ln(f"  {cell_color(vfi)}Cell {i+1}  {fmt_f(vi):>10}   {fmt_f(vfi):>10}   "
            f"{bar(vfi, voltage_cell_min, bar_hi)}{RESET}")
-    if is_charging:
-        ln(DIM + f"  (charging stop is fixed at {CHARGE_STOP_CELL_MV} mV/cell, current ignored)" + RESET)
+    if is_charging and segment_type != "STOPPED":
+        ln(DIM + f"  (charging stop: any cell >= {CHARGE_STOP_CELL_MV} mV)" + RESET)
 
     pack_v_volts  = (r['pack_v']  / 1000.0) if r['pack_v']  is not None else None
     pack_vf_volts = (r['pack_vf'] / 1000.0) if r['pack_vf'] is not None else None
@@ -857,6 +925,10 @@ def render_hppc_dashboard(port, label, r, segment_type, target_pct, coulomb_mah,
     ln(BOLD + "  Current (mA)" + RESET)
     ln(f"  Raw:      {current_color(r['current'])}{fmt_f(r['current']):>10} mA{RESET}")
     ln(f"  Filtered: {current_color(r['curr_filt'])}{fmt_f(r['curr_filt']):>10} mA{RESET}")
+    if is_charging and segment_type != "STOPPED":
+        gate_on = bool(vf) and any(vfi is not None and vfi >= CHARGE_CURRENT_MONITOR_MV for vfi in vf)
+        gate_txt = (GREEN + "ACTIVE" + RESET) if gate_on else (DIM + f"waiting for >= {CHARGE_CURRENT_MONITOR_MV} mV/cell" + RESET)
+        ln(f"  Term. current stop:  <= {charging_term_current} mA   [{gate_txt}]")
 
     ln()
     ln(BOLD + "  Temperature" + RESET)
@@ -885,13 +957,20 @@ def render_hppc_dashboard(port, label, r, segment_type, target_pct, coulomb_mah,
 # safety stop condition is hit:
 #   - discharging: any cell's filtered voltage <= voltage_cell_min
 #     (read from the device)
-#   - charging:    any cell's filtered voltage >= CHARGE_STOP_CELL_MV
-#     (fixed 4.2V) — current is not checked at all for charging
-#     termination
+#   - charging: any cell's filtered voltage >= CHARGE_STOP_CELL_MV
+#     (hard ceiling, always checked), OR filtered current drops
+#     to/below charging_term_current — but only once any cell's
+#     filtered voltage has reached CHARGE_CURRENT_MONITOR_MV
 # The safety condition is checked on every read throughout every
 # RAMP segment, so the test can end mid-ramp before reaching the
-# next checkpoint. The FET is guaranteed to be disabled on the way
-# out (normal stop, 'q', or a crash).
+# next checkpoint.
+#
+# IMPORTANT: hitting the safety stop condition does NOT end the
+# script. It disables the FET (retrying every tick until it
+# succeeds) and the checkpoint schedule is abandoned, but the
+# script keeps reading, logging, and displaying at 20Hz — same CSV
+# file — in a passive monitoring state. Only pressing 'q' ends the
+# script.
 # ---------------------------------------------------------------
 def do_hppc(ser, port, mode):
     is_charging = mode.startswith("charging")
@@ -958,10 +1037,11 @@ def do_hppc(ser, port, mode):
         t_start_all  = time.time()
         display_iter = 0
         errors       = 0
-        stop_reason  = None
+        user_quit          = False
+        safety_stop_reason = None
 
         seg_index = 0
-        while seg_index < len(segments) and stop_reason is None:
+        while seg_index < len(segments) and not user_quit and safety_stop_reason is None:
             seg_type, seg_param, seg_target_pct = segments[seg_index]
 
             # =====================================================
@@ -978,10 +1058,10 @@ def do_hppc(ser, port, mode):
                         print(f"WARNING: failed to disable FET before rest ({info})")
 
                 rest_start = time.time()
-                while (time.time() - rest_start) < duration and stop_reason is None:
+                while (time.time() - rest_start) < duration and not user_quit:
                     if msvcrt.kbhit():
                         if msvcrt.getwch().lower() == 'q':
-                            stop_reason = "user requested stop ('q')"
+                            user_quit = True
                             break
 
                     t_start = time.time()
@@ -1010,7 +1090,10 @@ def do_hppc(ser, port, mode):
 
             # =====================================================
             # RAMP segment — FET on, coulomb-count toward target
-            # (or run open-ended if target_mah is None)
+            # (or run open-ended if target_mah is None). If a safety
+            # condition fires, the FET is disabled immediately and
+            # the segment loop (and outer segments loop) ends; the
+            # script then falls through to passive monitoring below.
             # =====================================================
             else:
                 target_mah = seg_param
@@ -1019,18 +1102,17 @@ def do_hppc(ser, port, mode):
                     ok, info = set_fet(ser, True)
                     if not ok:
                         print(f"ERR: set_fet(ENABLE) failed: {info}. Aborting.")
-                        stop_reason = f"FET enable failed: {info}"
-                        break
+                        sys.exit(1)
                     fet_is_on = True
 
                 coulomb_mah   = 0.0
                 last_t        = time.time()
                 segment_done  = False
 
-                while stop_reason is None and not segment_done:
+                while not user_quit and not segment_done and safety_stop_reason is None:
                     if msvcrt.kbhit():
                         if msvcrt.getwch().lower() == 'q':
-                            stop_reason = "user requested stop ('q')"
+                            user_quit = True
                             break
 
                     t_start = time.time()
@@ -1051,24 +1133,42 @@ def do_hppc(ser, port, mode):
 
                     # -------------------------------------------
                     # Safety stop condition — checked every read.
-                    # Charging always uses the fixed 4.2V ceiling
-                    # and ignores current entirely; discharging
-                    # uses the device's voltage_cell_min register.
+                    # Charging: hard ceiling at CHARGE_STOP_CELL_MV,
+                    # plus a termination-current stop that's only
+                    # monitored once any cell reaches
+                    # CHARGE_CURRENT_MONITOR_MV. Discharging: the
+                    # device's voltage_cell_min register.
                     # -------------------------------------------
                     if cell_v_filt is not None:
                         for i, vfi in enumerate(cell_v_filt):
                             if vfi is None:
                                 continue
                             if is_charging and vfi >= CHARGE_STOP_CELL_MV:
-                                stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV >= {CHARGE_STOP_CELL_MV} mV"
+                                safety_stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV >= {CHARGE_STOP_CELL_MV} mV"
                                 break
                             if (not is_charging) and vfi <= voltage_cell_min:
-                                stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV <= min {voltage_cell_min} mV"
+                                safety_stop_reason = f"cell {i+1} filtered voltage {vfi:.1f} mV <= min {voltage_cell_min} mV"
                                 break
 
-                    log_writer.writerow(make_hppc_csv_row(elapsed_s, r, "ON", "RAMP",
+                    if safety_stop_reason is None and is_charging and cell_v_filt is not None and curr_filt is not None:
+                        voltage_gate = any(vfi is not None and vfi >= CHARGE_CURRENT_MONITOR_MV
+                                           for vfi in cell_v_filt)
+                        if voltage_gate and abs(curr_filt) <= charging_term_current:
+                            safety_stop_reason = (f"filtered current {curr_filt:.1f} mA within termination current "
+                                            f"{charging_term_current} mA (monitored above {CHARGE_CURRENT_MONITOR_MV} mV/cell)")
+
+                    newly_triggered_reason = ''
+                    if safety_stop_reason is not None:
+                        newly_triggered_reason = safety_stop_reason
+                        # Disable the FET immediately — retried in the
+                        # passive-monitoring phase below if this fails
+                        ok, info = set_fet(ser, False)
+                        if ok:
+                            fet_is_on = False
+
+                    log_writer.writerow(make_hppc_csv_row(elapsed_s, r, "ON" if fet_is_on else "OFF", "RAMP",
                                                           seg_target_pct, coulomb_mah,
-                                                          stop_reason or ''))
+                                                          newly_triggered_reason))
                     log_file.flush()
 
                     if display_iter % DISPLAY_EVERY == 0:
@@ -1080,7 +1180,7 @@ def do_hppc(ser, port, mode):
 
                     display_iter += 1
 
-                    if stop_reason is None and target_mah is not None and coulomb_mah >= target_mah:
+                    if safety_stop_reason is None and target_mah is not None and coulomb_mah >= target_mah:
                         segment_done = True
 
                     sleep_s = POLL_INTERVAL_S - (time.time() - t_start)
@@ -1089,11 +1189,54 @@ def do_hppc(ser, port, mode):
 
             seg_index += 1
 
+        # -------------------------------------------------------
+        # If a safety condition stopped the test (rather than the
+        # user), the FET is already disabled (or being retried) —
+        # keep reading, logging, and displaying at 20Hz in a passive
+        # monitoring state until the user presses 'q'.
+        # -------------------------------------------------------
+        disable_errors = 0
+        while safety_stop_reason is not None and not user_quit:
+            if msvcrt.kbhit():
+                if msvcrt.getwch().lower() == 'q':
+                    user_quit = True
+                    break
+
+            t_start = time.time()
+            r = read_all_monitor_regs(ser)
+            elapsed_s = time.time() - t_start_all
+
+            if any(v is None for v in r.values()):
+                errors += 1
+
+            if fet_is_on:
+                ok, info = set_fet(ser, False)
+                if ok:
+                    fet_is_on = False
+                else:
+                    disable_errors += 1
+
+            log_writer.writerow(make_hppc_csv_row(elapsed_s, r, "OFF", "STOPPED", None, 0.0, ''))
+            log_file.flush()
+
+            if display_iter % DISPLAY_EVERY == 0:
+                render_hppc_dashboard(port, label, r, "STOPPED", None, 0.0, None, 0.0,
+                                      voltage_cell_min, voltage_cell_max, charging_term_current,
+                                      is_charging, errors, log_filename, elapsed_s,
+                                      cfg['cell_capacity'], cell_count,
+                                      final_stop_reason=safety_stop_reason)
+
+            display_iter += 1
+            sleep_s = POLL_INTERVAL_S - (time.time() - t_start)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
         print(RESET)
-        if stop_reason:
-            print(f"Stopping {mode}: {stop_reason}")
+        if safety_stop_reason:
+            print(f"{mode} safety stop hit: {safety_stop_reason}")
+            print("FET was disabled and monitoring continued until you quit.")
         else:
-            print(f"{label} finished — all checkpoints completed.")
+            print(f"Stopped {mode}: user requested stop ('q')")
 
         log_file.close()
 
