@@ -26,6 +26,11 @@ Learn more at the [NLnet project page](https://nlnet.nl/project/OpenBMS).
 | Implementation on STM32 | ❌ Not started |
 | Test & Bug Fix | ❌ Not started |
 
+## Prerequisites
+- Install STM32CubeIDE for VS Code extension
+- Always open this project via STM32CubeIDE or the extension so `CUBE_BUNDLE_PATH` is set correctly
+- Check that bundle version numbers in `.vscode/settings.json` and `.vscode/launch.json` match your locally installed versions under `%LOCALAPPDATA%\stm32cube\bundles\`
+
 ## 📡 Communication Protocol
 
 OpenBMS implements three communication protocols sharing the same register map:
