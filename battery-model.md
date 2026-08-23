@@ -127,3 +127,105 @@ separate lookup tables for each direction rather than a single shared table.
 
 #### Cell 1 extracted parameters - discharging:
 <img src="images/cell1_param_discharge.png" width="80%"/>
+
+## SOC Estimation with an Extended Kalman Filter
+
+The ECM and the parameter tables above describe how the battery behaves. They 
+do not, by themselves, tell you the SOC — for that, the model has to be run 
+forward against live current and voltage measurements. This section covers 
+how that runs in practice.
+
+### Why Not Just Integrate Current
+
+The simplest possible SOC estimate is coulomb counting: start from a known 
+SOC and integrate current over time, `SOC(t) = SOC(0) + ∫I·dt / Q_nom`. This 
+works, but it has no way to correct itself. Current sensor offset, ADC 
+quantization, and any error in `Q_nom` all integrate too, so the estimate 
+drifts further from the truth the longer the pack runs with no way back. A 
+pack that starts a long trip 2% off will still be 2% off — or worse — 
+whenever it lands, unless something periodically checks the estimate against 
+an independent signal.
+
+The independent signal available here is voltage. The ECM predicts what 
+voltage the cell should show for a given SOC and current; comparing that 
+prediction against the cell's actual measured voltage gives a correction 
+signal that coulomb counting alone can never produce. Combining the two — a 
+model-based prediction and a real measurement — is exactly what a Kalman 
+filter does.
+
+### The Extended Kalman Filter
+
+The filter's state is `[SOC, V_RC1, V_RC2]` — the charge level plus the 
+voltage sitting across each RC branch from the model above. Every step runs 
+in two halves:
+
+- **Predict** — SOC advances by coulomb counting (current × Δt / `Q_nom`), 
+  and V_RC1/V_RC2 decay or charge toward their steady-state values at the 
+  rates set by `τ1`/`τ2` and `R1`/`R2` at the current SOC. This half needs 
+  no measurement at all — it is the same open-loop prediction the ECM makes 
+  on its own.
+
+- **Correct** — the predicted state gives a predicted terminal voltage, 
+  `V_OCV(SOC) + I·R0 + V_RC1 + V_RC2`. The gap between that prediction and 
+  the cell's actual measured voltage is fed back through the OCV curve's 
+  local slope (`dV_OCV/dSOC`) to nudge SOC, V_RC1 and V_RC2 toward whatever 
+  values would have made the prediction match reality — weighted by how much 
+  the filter trusts the model versus the measurement at that moment.
+
+That weighting is what makes it a *Kalman* filter rather than a fixed 
+correction rule: it tracks its own uncertainty about the state and about the 
+measurement, and blends the two accordingly.
+
+### Filter Tuning Parameters
+
+| Parameter | Description | Register |
+|---|---|---|
+| **Q_SOC** | Process noise for the SOC state — how much the filter expects coulomb counting to drift per step | `KF_Q_SOC()` `0xA1` |
+| **Q_RC1** | Process noise for V_RC1 — how much it expects the RC1 model to be off | `KF_Q_RC1()` `0xA2` |
+| **Q_RC2** | Process noise for V_RC2 — how much it expects the RC2 model to be off | `KF_Q_RC2()` `0xA3` |
+| **R_V** | Measurement noise — how much it trusts the voltage sensor itself | `KF_R_V()` `0xA4` |
+| **P0** | Initial covariance — how uncertain the state is right after the seed, before any correction | *(script-side only; no firmware register)* |
+
+Higher process noise (`Q_*`) makes the filter trust the model less and lean 
+harder on the measurement; higher measurement noise (`R_V`) does the 
+opposite. These are reasonable starting points rather than fitted values — 
+there is no independent ground-truth SOC in a normal log to fit them 
+against — and are tuned by hand against how the Kalman trace behaves 
+compared to the open-loop trace.
+
+### Guarding Against Bad Corrections
+
+The correction step assumes any gap between predicted and measured voltage 
+means the state estimate is wrong. That assumption breaks in two situations 
+worth designing around explicitly. Right at a fast current step, a cell's 
+voltage sensor can momentarily disagree with what its `R0` predicts by more 
+than noise alone would explain — trusting that one sample fully can yank SOC 
+by a physically implausible amount in a single step. And with no current 
+flowing at all, coulomb counting says SOC cannot be changing, so any residual 
+during rest can only be an imperfect `R1`/`R2`/`τ1`/`τ2` relaxation fit — 
+never real charge — yet the correction step has no built-in way to know that 
+unless it's told.
+
+The estimator therefore checks each correction before applying it: whether 
+the residual is statistically plausible given the filter's own uncertainty, 
+whether it implies a rate of SOC change coulomb counting could never produce, 
+and whether any current is actually flowing at all. A correction that fails 
+these checks is scaled back or, at rest, blocked from touching SOC 
+entirely — V_RC1 and V_RC2 are still free to absorb it, since a relaxation 
+mismatch is exactly what they're there to represent.
+
+### Example of SOC Estimation
+
+Each run below replays a real log through the model twice — open loop (pure 
+prediction, no correction) and with the Kalman filter — and plots both 
+against the cell's actual measured voltage, the two SOC traces, and the pack 
+current that drove them. The Kalman trace tracking the real voltage 
+noticeably more closely than the open-loop trace is the filter doing its job; 
+persistent daylight between them across a whole run is a sign the underlying 
+parameter table, not the filter, needs a second look.
+
+#### SOC estimation - charging:
+<img src="images/soc_estimator_charge.png" width="80%"/>
+
+#### SOC estimation - discharging:
+<img src="images/soc_estimator_discharge.png" width="80%"/>
