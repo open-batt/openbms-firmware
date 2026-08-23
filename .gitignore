@@ -2,3 +2,4 @@ build
 mx.scratch
 !.settings
 /.tmp.driveupload
+/python_scripts/results

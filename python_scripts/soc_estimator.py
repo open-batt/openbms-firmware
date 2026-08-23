@@ -66,6 +66,16 @@ max_gated_mV in the results table. A cell that gates constantly is a sign its
 R0 (or that voltage channel) is worth a closer look, not just a filter-tuning
 issue.
 
+SOC is only ever corrected while real current is flowing (|I| above
+CURRENT_DEADZONE_A). During rest, a voltage residual can only mean the
+relaxation model (V_RC1/V_RC2, i.e. R1/R2/tau1/tau2) is a bit off -- it can't
+mean real charge moved, since none did -- so the SOC row of the Kalman gain
+is zeroed during rest and only V_RC1/V_RC2 absorb the residual. Without this,
+a relaxation-model mismatch during a long rest reads as a slow, steady SOC
+drift for as long as the rest lasts (this was a real bug, found by comparing
+Kalman SOC against the current trace on an actual HPPC log: SOC kept
+climbing through several-hundred-second rests where current was ~0).
+
 IMPORTANT SIMPLIFYING ASSUMPTIONS (read before trusting the numbers):
   - SOC at t=0 is seeded by inverting the FIRST measured voltage through the
     OCV table directly (ignoring the small IR-drop already present if current
@@ -387,6 +397,22 @@ def run_cell(cell_idx, t, i_pack_a, v_meas, lut_charge, lut_discharge,
         K = (P_pred @ H) / S
         y = v_meas[k] - v_pred
 
+        # ---- SOC observability: with (near) zero current flowing, coulomb
+        # counting says SOC cannot be changing, so any voltage residual right
+        # now can only be explained by V_RC1/V_RC2 (the model's relaxation
+        # estimate being a bit off), never by real charge moving. Block the
+        # SOC row of the gain in that case -- let V_RC1/V_RC2 absorb the
+        # residual as usual, but don't let it leak into SOC. Without this, a
+        # relaxation-model mismatch during a long rest gets misread as a slow,
+        # persistent "charging" and SOC drifts upward all through the rest --
+        # exactly the case with current==0 but SOC still climbing. ----
+        at_rest = abs(i_prev) < CURRENT_DEADZONE_A and abs(i_now) < CURRENT_DEADZONE_A
+        K_for_mean = K.copy()
+        K_for_p = K.copy()
+        if at_rest:
+            K_for_mean[0] = 0.0
+            K_for_p[0] = 0.0
+
         # ---- innovation gating: is this residual plausible? Two tiers:
         # 1) a genuine statistical outlier (NIS test) -- ignore the measurement
         #    entirely this step (no mean update, no covariance shrink either;
@@ -401,7 +427,7 @@ def run_cell(cell_idx, t, i_pack_a, v_meas, lut_charge, lut_discharge,
         #    measurement genuinely was informative) while only throttling how
         #    fast the point estimate is allowed to move avoids that.
         nis = (y * y) / S
-        implied_dsoc = K[0] * y
+        implied_dsoc = K_for_mean[0] * y
         max_dsoc_this_step = MAX_SOC_RATE_PCT_PER_S * dt / 100.0
 
         if nis > GATE_SIGMA ** 2:
@@ -419,8 +445,8 @@ def run_cell(cell_idx, t, i_pack_a, v_meas, lut_charge, lut_discharge,
                 if abs(y) > max_gated_abs_y:
                     max_gated_abs_y = abs(y)
                     t_max_gated = t[k]
-            x_kf = x_pred + scale * K * y
-            P = (np.eye(3) - np.outer(K, H)) @ P_pred
+            x_kf = x_pred + scale * K_for_mean * y
+            P = (np.eye(3) - np.outer(K_for_p, H)) @ P_pred
 
         x_kf[0] = np.clip(x_kf[0], SOC_MIN, SOC_MAX)
 
