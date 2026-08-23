@@ -116,3 +116,14 @@ required for a complete and accurate battery model:
 
 ### Example of battery extracted parameters
 
+The HPPC test is run separately in the charge and discharge directions because 
+the extracted parameters are not the same — R0, R1, τ1, R2, and τ2 differ between 
+charging and discharging at the same SOC due to the asymmetric electrochemical 
+kinetics of the cell. For this reason the firmware stores and interpolates 
+separate lookup tables for each direction rather than a single shared table.
+
+#### Cell 1 extracted parameters - charging:
+<img src="images/cell1_param_charge.png" width="80%"/>
+
+#### Cell 1 extracted parameters - discharging:
+<img src="images/cell1_param_discharge.png" width="80%"/>
