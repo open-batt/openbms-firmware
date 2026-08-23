@@ -84,14 +84,9 @@ Note that C1 and C2 are not stored directly — they are always derived from
 ### Parameter Extraction
 
 There are several methods to extract battery model parameters, each with different 
-trade-offs between accuracy, equipment requirements, and complexity. In this firmware, parameters are extracted offline using two complementary tests:
+trade-offs between accuracy, equipment requirements, and complexity. In this firmware, parameters are extracted offline using **Hybrid Pulse Power Characterization Test**.
 
-- **C/20 low-current OCV test** — a very slow full discharge followed by a full 
-  charge at C/20 rate. Used to extract the **V_OCV vs SOC curve** in both 
-  directions and measure **Q_nom**. The slow rate minimizes polarization so the 
-  measured voltage closely approximates the true open circuit voltage.
-
-- **HPPC test** — current pulses at fixed SOC setpoints across the full SOC range 
+**HPPC test** — current pulses at fixed SOC setpoints across the full SOC range 
   in both discharge and charge directions. Used to extract **R0, R1, τ1, R2, τ2** 
   at each SOC point. The instantaneous voltage drop gives R0 and the relaxation 
   curve after each pulse is fitted using Prony's method to extract the RC parameters.
@@ -101,8 +96,11 @@ direction, covering the full range from 2% to 100% SOC. At runtime the firmware
 interpolates between table entries to get the parameter values at the current 
 operating point.
 
-<br/>
-<img src="images/battery-sample-test.png" alt="2RC Thevenin ECM" width="70%"/>
+#### HPPC battery charging test:
+<img src="images/hppc_charging.png" width="80%"/>
+
+#### HPPC battery discharging test:
+<img src="images/hppc_discharging.png" width="80%"/>
 
 ### Additional Battery Parameters
 
@@ -115,4 +113,6 @@ required for a complete and accurate battery model:
 | **OCV hysteresis** | Difference between charge and discharge OCV curves at the same SOC — 5 to 30 mV depending on chemistry | V |
 | **Q_nom(T)** | Capacity derating with temperature — usable capacity drops significantly below 10°C | Ah |
 | **Self-discharge rate** | Charge lost with no load connected — 1 to 5% per month at 25°C depending on chemistry | % / month |
+
+### Example of battery extracted parameters
 
