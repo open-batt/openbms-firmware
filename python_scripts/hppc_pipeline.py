@@ -19,8 +19,10 @@ Run (Windows, macOS, Linux - just needs Python 3 + numpy/pandas/scipy/matplotlib
     python hppc_pipeline.py C file1.csv file2.csv ...   # auto time-concatenated
     python hppc_pipeline.py D d_hppc_1.csv --outdir C:\some\other\folder
 
-Outputs (default: the same folder this script lives in - see OUTPUT_DIR below),
-all suffixed _charge or _discharge so both directions can coexist in one folder:
+Outputs (default: a "results" folder next to this script - see OUTPUT_DIR below;
+created automatically if missing, and reused as-is if it already exists),
+all suffixed _charge or _discharge so both directions can coexist in one folder --
+running one direction does not remove the other direction's existing results:
     hppc_soc_table_all_cells_{charge|discharge}.csv   ONE file, one row per SOC
         checkpoint (ascending 2-100%), with OCV / R0 / R1 / R2 / tau1 / tau2 /
         capacity as a repeated column group per cell (Cell1_..., Cell2_..., ...)
@@ -142,7 +144,7 @@ FIT_X0 = [0.7, 5.0, 0.3, 100.0]      # [ratio1, tau1, ratio2, tau2]
 FIT_LB = [0.05, 0.5, 0.05, 10.0]
 FIT_UB = [0.95, 60.0, 0.95, 400.0]
 
-OUTPUT_DIR  = os.path.dirname(os.path.abspath(__file__))   # results land next to this script by default
+OUTPUT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")   # results land in ./results next to this script by default
 MAKE_PLOTS  = True                     # one PNG per cell (not CSV clutter, kept by default)
 
 WRITE_DETAILED_PER_CELL_CSVS = False   # True restores the old cellN_*.csv / summary.csv / cell_capacities.csv files
@@ -780,7 +782,8 @@ def main(paths, direction, out_dir=None):
 
     reset_counts()
     out_dir = out_dir or OUTPUT_DIR
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)   # keep existing files (e.g. the other direction's charge/discharge
+                                           # results) -- same-named files still get overwritten on rerun
 
     try:
         df, idle_bias = load_and_validate(paths, direction)
@@ -859,7 +862,8 @@ if __name__ == "__main__":
                          help="C = analyze as a charge test, D = analyze as a discharge test")
     parser.add_argument("csv_files", nargs="+", help="one or more HPPC log CSVs (time-concatenated in order given)")
     parser.add_argument("--outdir", default=None,
-                         help="output folder (default: the folder this script is in)")
+                         help="output folder (default: a 'results' folder next to this script; "
+                              "created if missing, existing files from other runs are kept)")
     parser.add_argument("--detailed", action="store_true",
                          help="also write the old per-cell CSVs (cellN_hppc_params.csv, "
                               "cellN_cycle_diagnostics.csv, summary.csv, cell_capacities.csv)")
