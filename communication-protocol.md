@@ -2,291 +2,381 @@
 
 OpenBMS firmware implements the following communication protocols:
 
-- **SBS v1.1 over I²C/SMBus** — Smart Battery Specification v1.1, compatible with any SBS-compliant host. SMBus address `0x0B`, speed up to 100 kHz, PEC error checking.
-- **Modbus RTU over UART** — 115200 baud, 8N1, same register addresses as SBS. Used for debugging and external communication.
-- **CAN 2.0** — 500 kbit/s, 11-bit identifier, same register addresses as SBS. Used for communication with host, charger and other system components.
+- **OpenBMS binary protocol over UART** — 230400 baud, 8N1, register-based read/write with an 8-bit additive checksum. This is the only protocol currently implemented and is used for host communication, configuration, calibration, data logging and bootloader entry.
+- **SBS v1.1 over I²C/SMBus** — *planned.* The SMBus peripheral is initialized (slave address `0x0B`, PEC enabled) but no protocol handler exists yet.
+- **CAN 2.0** — *planned.* The bxCAN peripheral is initialized (1 Mbit/s, 11-bit identifier) but no protocol handler exists yet.
 
-### SBS v1.1 Protocol
+A reference host implementation of the UART protocol lives in [`flashing_script/read_data.py`](flashing_script/read_data.py) (full register dump) and [`flashing_script/monitor.py`](flashing_script/monitor.py) (live logging).
 
-Registers in range `0x00` - `0x3F` are standard SBS protocol registers and their description can be found in the table below. More information can be found at [SBS Specification](https://sbs-forum.org/specs/sbdat110.pdf).
+## OpenBMS Binary Protocol
+
+The protocol is a simple request/response scheme on a point-to-point UART link. There is no device address — one host talks to one OpenBMS board. Every transaction is initiated by the host; the device never speaks unsolicited.
 
 | Layer | Name | Responsibility |
 |-------|------|----------------|
-| Application | SBS | Register map, data meaning, device addresses, alarm broadcasts, charger negotiation |
-| Transport | SMBus | Transaction types (Read/Write Word, Read Block), PEC, timing rules |
-| Physical | I²C | SDA/SCL lines, electrical signaling, ACK/NACK |
+| Application | OpenBMS register map | Register addresses, data types, access rights, control commands |
+| Transport | OpenBMS frame | Command byte, length byte, additive checksum |
+| Physical | UART | TX/RX lines, 230400 baud 8N1, idle-line frame delimiting |
 
-**Register description:**
+### Frame structure
 
-| Address | Function | Access | Type | Notes |
-|---------|----------|--------|------|-------|
-| 0x00 | ManufacturerAccess() | r/w | word | Default: 0x21; can be changed via write; vendor side-channel for custom commands |
-| 0x01 | RemainingCapacityAlarm() | r/w | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh; 0 disables alarm; default: 0 |
-| 0x02 | RemainingTimeAlarm() | r/w | word | Value in minutes; 0 disables alarm; default: 0 |
-| 0x03 | BatteryMode() | r/w | word | Bit 15: CAPACITY_MODE — default 0 (mA/mAh); 1=10mW/10mWh<br/>Bit 14: CHARGER_MODE — default 0 (broadcast enabled); 1=disable broadcast<br/>Bit 13: ALARM_MODE — default 0 (broadcast enabled); 1=disable broadcast; auto-clears every 60s<br/>Bit 9: PRIMARY_BATTERY — default 0 (secondary role); 1=primary role<br/>Bit 8: CHARGE_CONTROLLER_ENABLED — default 0 (off); 1=on; only effective if bit 0 is set<br/>Bit 7: CONDITION_FLAG — default 0; read-only; 1=conditioning cycle requested<br/>Bit 1: PRIMARY_BATTERY_SUPPORT — default 0; read-only; 1=pack supports primary/secondary switching<br/>Bit 0: INTERNAL_CHARGE_CONTROLLER — default 0; read-only; 1=pack has internal charge controller<br/>Bits 12-10, 6-2: reserved; all bits reset to default on power cycle |
-| 0x04 | AtRate() | r/w | word | CAPACITY_MODE=0: signed mA; CAPACITY_MODE=1: signed 10mW; positive=charge, negative=discharge, zero=default (0); re-write after CAPACITY_MODE change |
-| 0x05 | AtRateTimeToFull() | r | word | Minutes to full at AtRate charge rate — purely hypothetical; valid only when AtRate() > 0; 65535 = not charging or AtRate() ≤ 0 |
-| 0x06 | AtRateTimeToEmpty() | r | word | Minutes to empty at AtRate discharge rate — purely hypothetical; valid only when AtRate() < 0; 65535 = not discharging or AtRate() ≥ 0 |
-| 0x07 | AtRateOK() | r | word | Boolean; 1=battery can sustain AtRate on top of present Current() for 10s; always 1 (TRUE) if AtRate() ≥ 0 |
-| 0x08 | Temperature() | r | word | 0.1K units; e.g. 2981 = 298.1K = 25.0°C; range: 0–6553.5K |
-| 0x09 | Voltage() | r | word | Pack terminal voltage in mV; e.g. 29400 = 29.4V |
-| 0x0A | Current() | r | word | Signed mA; positive = charging current; negative = discharge current; e.g. 2000 = 2A charge, -5000 = 5A discharge |
-| 0x0B | AverageCurrent() | r | word | Signed mA; 1-minute rolling average; same sign convention as Current() |
-| 0x0C | MaxError() | r | word | Gauge accuracy uncertainty in %; 100 = completely uncertain (first boot); converges toward 0 after full cycles |
-| 0x0D | RelativeStateOfCharge() | r | word | SoC as % of FullChargeCapacity(); 0–100%; can briefly exceed 100% during overcharge |
-| 0x0E | AbsoluteStateOfCharge() | r | word | SoC as % of DesignCapacity(); 0–100%; can exceed 100% if learned capacity > design capacity |
-| 0x0F | RemainingCapacity() | r | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh |
-| 0x10 | FullChargeCapacity() | r | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh; learned full capacity updated each cycle |
-| 0x11 | RunTimeToEmpty() | r | word | Minutes at present instantaneous discharge rate; 65535 = not discharging |
-| 0x12 | AverageTimeToEmpty() | r | word | Minutes at 1-minute average discharge rate; 65535 = not discharging |
-| 0x13 | AverageTimeToFull() | r | word | Minutes at 1-minute average charge rate; 65535 = not charging |
-| 0x14 | ChargingCurrent() | r/w | word | Requested charge current in mA broadcast to charger; 65535 = charger should act as voltage source only |
-| 0x15 | ChargingVoltage() | r/w | word | Requested charge voltage in mV broadcast to charger; 65535 = charger should act as current source only |
-| 0x16 | BatteryStatus() / AlarmWarning() | r | word | Bit 15: OVER_CHARGED_ALARM<br/>Bit 14: TERMINATE_CHARGE_ALARM<br/>Bit 13: reserved<br/>Bit 12: OVER_TEMP_ALARM<br/>Bit 11: TERMINATE_DISCHARGE_ALARM<br/>Bit 10: reserved<br/>Bit 9: REMAINING_CAPACITY_ALARM<br/>Bit 8: REMAINING_TIME_ALARM<br/>Bit 7: INITIALIZED — 1=calibrated, 0=calibration lost<br/>Bit 6: DISCHARGING — 1=not charging (includes self-discharge)<br/>Bit 5: FULLY_CHARGED<br/>Bit 4: FULLY_DISCHARGED<br/>Bits 3-0: ERROR_CODE — 0x0=OK, 0x1=Busy, 0x2=Reserved, 0x3=Unsupported, 0x4=Access Denied, 0x5=Overflow, 0x6=Bad Size, 0x7=Unknown |
-| 0x17 | CycleCount() | r | word | Full charge/discharge cycle counter; increments when cumulative discharge ≥ DesignCapacity(); 65535 = ≥65535 cycles |
-| 0x18 | DesignCapacity() | r | word | CAPACITY_MODE=0: value in mAh; CAPACITY_MODE=1: value in 10mWh; nominal factory capacity |
-| 0x19 | DesignVoltage() | r | word | Nominal pack voltage in mV; e.g. 25900 = 25.9V (7S × 3.7V nominal) |
-| 0x1A | SpecificationInfo() | r | word | Bits 15-12: IPScale=0 (×1, no scaling)<br/>Bits 11-8: VScale=0 (×1, no scaling)<br/>Bits 7-4: Version=0x1 (SBS 1.0)<br/>Bits 3-0: Revision=0x1<br/>Packed value: 0x0011<br/>Note: scaling does not apply to ChargingCurrent() and ChargingVoltage() |
-| 0x1B | ManufactureDate() | r | word | Packed: (year−1980)×512 + month×32 + day; e.g. 2026-01-15 = (46×512)+(1×32)+15 = 23599 = 0x5C2F |
-| 0x1C | SerialNumber() | r | word | 16-bit unique serial number; combined with ManufacturerName() and ManufactureDate() forms unique battery ID |
-| 0x1D | — | r | word | Undefined; returns 0x0000 |
-| 0x1E | — | r | word | Undefined; returns 0x0000 |
-| 0x1F | — | r | word | Undefined; returns 0x0000 |
-| 0x20 | ManufacturerName() | r | block | "OpenBatt Team" |
-| 0x21 | DeviceName() | r | block | "OpenBMS" |
-| 0x22 | DeviceChemistry() | r | block | "Li-Ion" |
-| 0x23 | ManufacturerData() | r | block | "Year 2026" |
-| 0x24–0x2F | — | — | — | Optional manufacturer-defined block registers |
-| 0x30–0x3F | — | — | — | Reserved |
+All frames — in both directions — share the same layout and are at least 4 bytes long:
 
-`BatteryStatus()` and `AlarmWarning()` share address `0x16` but work in opposite directions.
-`BatteryStatus()` is host-initiated — the host polls the battery at any time and receives the current status word with the real error code in bits 3–0.
-`AlarmWarning()` is battery-initiated — when any alarm bit is set, the battery becomes bus master and broadcasts the same word unsolicited every 10 seconds until the condition clears, but with the error nibble forced to `0xF` to signal that this is an alarm broadcast and not a response to a command.
+| Command | Address | Length | Data | Checksum |
+|---------|---------|--------|------|----------|
+| 1 byte | 1 byte | 1 byte | N bytes | 1 byte |
 
-| | BatteryStatus() | AlarmWarning() |
-|--|----------------|----------------|
-| Direction | Host reads from battery | Battery broadcasts to host and/or charger |
-| Trigger | Host polls at any time | Battery sends when any alarm bit is set |
-| Error nibble | Actual error code | Forced to 0xF (all ones) before sending |
-| Interval | On demand | Every 10 seconds until condition clears |
-| Bits 9–8 alarms | Sent to host only when read | Sent to host only |
-| Bits 15–11 alarms | Sent to host only when read | Sent to both host and charger |
+- **Command** — frame type, see the table below.
+- **Address** — register address, `0x00`–`0xFF`. `0x00` in ACK and error frames.
+- **Length** — payload size in **bytes** (not elements, not 16-bit words). `0x00` for read requests, ACK frames and command frames with no payload.
+- **Data** — `Length` bytes of payload, **little-endian**, laid out exactly as the corresponding C struct field.
+- **Checksum** — sum of all preceding bytes of the frame, modulo 256.
 
-## SBS v1.1 extended non-standard registers
+Total frame size is always `Length + 4` bytes.
 
-Registers in range `0x40` - `0xFF` are OpenBMS-specific extensions and are not part of the SBS v1.1 specification. They follow the same SMBus transaction conventions as standard SBS registers (Read Word, Write Word, Read Block) to maintain compatibility with any SBS-compliant host, but their content and meaning are specific to OpenBMS firmware.
+Register data is a raw memory image of the firmware's struct field. The host must know each register's type and element count in advance — the protocol carries no type information. See the register map below.
 
-**Register description:**
+### Command codes
 
-| Address | Function | Access | Type | Notes |
-|---------|----------|--------|------|-------|
-| 0x40 | Configuration() | r/w | word | Bits 15-7: reserved<br/>Bit 6: UART state - 0=disable, 1=enable<br/>Bit 5: CAN 2.0 state - 0=disable, 1=enable<br/>Bit 4: I2C state - 0=disable, 1=enable<br/>Bits 3-0: cell count - valid range 2-7 |
-| 0x41 | MainControl() | r/w | word | Bits 15-6: reserved<br/>Bit 5: temperature protections - 0=disable, 1=enable<br/>Bit 4: current protections - 0=disable, 1=enable<br/>Bit 3: voltage protections - 0=disable, 1=enable<br/>Bit 2: reserved<br/>Bit 1: test mode - 0=normal, 1=test<br/>Bit 0: OpenBMS state - 0=disable, 1=enable |
-| 0x42 | FETState() | r/w | word | Bits 15-2: reserved<br/>Bit 1: aux FET state - 0=disable, 1=enable<br/>Bit 0: main FETs state - 0=disable, 1=enable |
-| 0x43 | VoltageProtectionControl() | r/w | block | Bytes 0-1: slow UVP threshold - UINT16 mV, range 0-65535<br/>Bytes 2-3: slow UVP detection time - UINT16 ms, range 0-65535<br/>Bytes 4-5: fast UVP threshold - UINT16 mV, range 0-65535<br/>Bytes 6-7: fast UVP detection time - UINT16 ms, range 0-65535<br/>Bytes 8-9: slow OVP threshold - UINT16 mV, range 0-65535<br/>Bytes 10-11: slow OVP detection time - UINT16 ms, range 0-65535<br/>Bytes 12-13: fast OVP threshold - UINT16 mV, range 0-65535<br/>Bytes 14-15: fast OVP detection time - UINT16 ms, range 0-65535 |
-| 0x44 | CurrentProtectionControl() | r/w | block | Bytes 0-1: charge OCP threshold - UINT16 mA, range 0-65535<br/>Bytes 2-3: charge OCP detection time - UINT16 ms, range 0-65535<br/>Bytes 4-5: slow discharge OCP threshold - UINT16 mA, range 0-65535<br/>Bytes 6-7: slow discharge OCP detection time - UINT16 ms, range 0-65535<br/>Bytes 8-9: fast discharge OCP threshold - UINT16 mA, range 0-65535<br/>Bytes 10-11: fast discharge OCP detection time - UINT16 ms, range 0-65535 |
-| 0x45 | TemperatureProtectionControl() | r/w | block | Bytes 0-1: OTP threshold - UINT16 °C, range 0-65535<br/>Bytes 2-3: OTP detection time - UINT16 ms, range 0-65535 |
-| 0x48 | CellVoltage() | r | block | Per-cell voltages — 7 × UINT16 mV = 14 bytes<br/>Bytes 0-1: Cell 1 voltage<br/>Bytes 2-3: Cell 2 voltage<br/>Bytes 4-5: Cell 3 voltage<br/>Bytes 6-7: Cell 4 voltage<br/>Bytes 8-9: Cell 5 voltage<br/>Bytes 10-11: Cell 6 voltage<br/>Bytes 12-13: Cell 7 voltage |
-| 0x49 | CellTemperature() | r | block | Per-cell temperatures — 7 × INT16 0.1°C = 14 bytes<br/>Bytes 0-1: Cell 1 temperature<br/>Bytes 2-3: Cell 2 temperature<br/>Bytes 4-5: Cell 3 temperature<br/>Bytes 6-7: Cell 4 temperature<br/>Bytes 8-9: Cell 5 temperature<br/>Bytes 10-11: Cell 6 temperature<br/>Bytes 12-13: Cell 7 temperature |
-| 0x4A | FETStatus() | r | word | Actual FET state readback<br/>Bits 15-2: reserved<br/>Bit 1: aux FET state - 0=off, 1=on<br/>Bit 0: main FETs state - 0=off, 1=on |
-| 0x4B | CellSoC() | r | block | Per-cell SoC — 7 × UINT8 % = 7 bytes<br/>Byte 0: Cell 1 SoC<br/>Byte 1: Cell 2 SoC<br/>Byte 2: Cell 3 SoC<br/>Byte 3: Cell 4 SoC<br/>Byte 4: Cell 5 SoC<br/>Byte 5: Cell 6 SoC<br/>Byte 6: Cell 7 SoC |
-| 0x4C | CellSoH() | r | block | Per-cell SoH — 7 × UINT8 % = 7 bytes<br/>Byte 0: Cell 1 SoH<br/>Byte 1: Cell 2 SoH<br/>Byte 2: Cell 3 SoH<br/>Byte 3: Cell 4 SoH<br/>Byte 4: Cell 5 SoH<br/>Byte 5: Cell 6 SoH<br/>Byte 6: Cell 7 SoH |
-| 0x4D | CellRemainingCapacity() | r | block | Per-cell remaining capacity — 7 × UINT16 mAh = 14 bytes<br/>Bytes 0-1: Cell 1<br/>Bytes 2-3: Cell 2<br/>Bytes 4-5: Cell 3<br/>Bytes 6-7: Cell 4<br/>Bytes 8-9: Cell 5<br/>Bytes 10-11: Cell 6<br/>Bytes 12-13: Cell 7 |
-| 0x4E | CellSelfDischarge() | r | block | Per-cell self-discharge rate — 7 × UINT16 mAh/month = 14 bytes<br/>Bytes 0-1: Cell 1<br/>Bytes 2-3: Cell 2<br/>Bytes 4-5: Cell 3<br/>Bytes 6-7: Cell 4<br/>Bytes 8-9: Cell 5<br/>Bytes 10-11: Cell 6<br/>Bytes 12-13: Cell 7 |
-| 0x4F | FaultSnapshot() | r | block | Snapshot at last fault event — 18 bytes<br/>Bytes 0-1: Cell 1 voltage - UINT16 mV<br/>Bytes 2-3: Cell 2 voltage - UINT16 mV<br/>Bytes 4-5: Cell 3 voltage - UINT16 mV<br/>Bytes 6-7: Cell 4 voltage - UINT16 mV<br/>Bytes 8-9: Cell 5 voltage - UINT16 mV<br/>Bytes 10-11: Cell 6 voltage - UINT16 mV<br/>Bytes 12-13: Cell 7 voltage - UINT16 mV<br/>Bytes 14-15: current at fault - INT16 mA<br/>Byte 16: temperature at fault - UINT8 °C<br/>Byte 17: SoC at fault - UINT8 % |
-| 0x50 | FaultHistory() | r | block | Last 8 fault events — 8 × (UINT8 fault code + UINT32 timestamp) = 40 bytes<br/>Each entry: Byte 0 = fault code, Bytes 1-4 = Unix timestamp<br/>Entry 1 (oldest): Bytes 0-4<br/>Entry 2: Bytes 5-9<br/>Entry 3: Bytes 10-14<br/>Entry 4: Bytes 15-19<br/>Entry 5: Bytes 20-24<br/>Entry 6: Bytes 25-29<br/>Entry 7: Bytes 30-34<br/>Entry 8 (latest): Bytes 35-39 |
-| 0x51 | ProtectionEventCounters() | r | block | Per-protection trigger counters — 7 cells × 5 protections × UINT16 = 70 bytes<br/>Per cell order: OVP counter, UVP counter, OCP counter, OTP counter, UTP counter<br/>Cell 1: Bytes 0-9<br/>Cell 2: Bytes 10-19<br/>Cell 3: Bytes 20-29<br/>Cell 4: Bytes 30-39<br/>Cell 5: Bytes 40-49<br/>Cell 6: Bytes 50-59<br/>Cell 7: Bytes 60-69 |
-| 0x52 | CurrentSensorCalibration() | r/w | block | Current sensor offset + gain — 2 × INT16 = 4 bytes<br/>Bytes 0-1: offset calibration value<br/>Bytes 2-3: gain calibration value |
-| 0x53 | VoltageCalibration() | r/w | block | Per-cell ADC offset + gain — 7 × 2 × INT16 = 28 bytes<br/>Cell 1: Bytes 0-1 offset, Bytes 2-3 gain<br/>Cell 2: Bytes 4-5 offset, Bytes 6-7 gain<br/>Cell 3: Bytes 8-9 offset, Bytes 10-11 gain<br/>Cell 4: Bytes 12-13 offset, Bytes 14-15 gain<br/>Cell 5: Bytes 16-17 offset, Bytes 18-19 gain<br/>Cell 6: Bytes 20-21 offset, Bytes 22-23 gain<br/>Cell 7: Bytes 24-25 offset, Bytes 26-27 gain |
-| 0x54 | TemperatureCalibration() | r/w | block | Temperature sensor offset — UINT8 °C = 1 byte<br/>Byte 0: temperature sensor offset calibration value |
-| 0x55 | CellBalancingEnergy() | r | block | Per-cell accumulated balancing energy — 7 × UINT16 mWh = 14 bytes<br/>Bytes 0-1: Cell 1<br/>Bytes 2-3: Cell 2<br/>Bytes 4-5: Cell 3<br/>Bytes 6-7: Cell 4<br/>Bytes 8-9: Cell 5<br/>Bytes 10-11: Cell 6<br/>Bytes 12-13: Cell 7 |
-| 0x56 | CellBalancingTime() | r | block | Per-cell accumulated balancing time — 7 × UINT16 minutes = 14 bytes<br/>Bytes 0-1: Cell 1<br/>Bytes 2-3: Cell 2<br/>Bytes 4-5: Cell 3<br/>Bytes 6-7: Cell 4<br/>Bytes 8-9: Cell 5<br/>Bytes 10-11: Cell 6<br/>Bytes 12-13: Cell 7 |
-| 0x57 | CellDeepestDischarge() | r | block | Per-cell lowest SoC ever recorded — 7 × UINT8 % = 7 bytes<br/>Byte 0: Cell 1<br/>Byte 1: Cell 2<br/>Byte 2: Cell 3<br/>Byte 3: Cell 4<br/>Byte 4: Cell 5<br/>Byte 5: Cell 6<br/>Byte 6: Cell 7 |
-| 0x58 | CellMaxTemperature() | r | block | Per-cell highest temperature ever recorded — 7 × UINT8 °C = 7 bytes<br/>Byte 0: Cell 1<br/>Byte 1: Cell 2<br/>Byte 2: Cell 3<br/>Byte 3: Cell 4<br/>Byte 4: Cell 5<br/>Byte 5: Cell 6<br/>Byte 6: Cell 7 |
-| 0x59 | CellQmax() | r | block | Per-cell learned maximum capacity — 7 × UINT16 mAh = 14 bytes<br/>Bytes 0-1: Cell 1<br/>Bytes 2-3: Cell 2<br/>Bytes 4-5: Cell 3<br/>Bytes 6-7: Cell 4<br/>Bytes 8-9: Cell 5<br/>Bytes 10-11: Cell 6<br/>Bytes 12-13: Cell 7 |
-| 0x5A | FirmwareVersion() | r | block | Firmware version string — ASCII, null-terminated |
-| 0x5B | HardwareVersion() | r | block | Hardware version string — ASCII, null-terminated |
-| 0x5C | BoardSerialNumber() | r | block | Board serial number string — ASCII, null-terminated |
-| 0x5D | LastCommunicationTimestamp() | r | block | Timestamp of last host communication — UINT32 Unix timestamp = 4 bytes<br/>Bytes 0-3: Unix timestamp |
-| 0x5E | UptimeCounter() | r | word | Total uptime since first boot — UINT32 seconds |
-| 0x5F | BalancingStatus() | r | word | Bitmask — which cells are currently balancing<br/>Bits 15-7: reserved<br/>Bit 6: Cell 7<br/>Bit 5: Cell 6<br/>Bit 4: Cell 5<br/>Bit 3: Cell 4<br/>Bit 2: Cell 3<br/>Bit 1: Cell 2<br/>Bit 0: Cell 1 |
-| 0x60 | BalancingControl() | r/w | word | Force balancing on/off per cell — bitmask<br/>Bits 15-7: reserved<br/>Bit 6: Cell 7<br/>Bit 5: Cell 6<br/>Bit 4: Cell 5<br/>Bit 3: Cell 4<br/>Bit 2: Cell 3<br/>Bit 1: Cell 2<br/>Bit 0: Cell 1 |
+| Code | Name | Direction | Description |
+|------|------|-----------|-------------|
+| 0x01 | `CC_WRITE` | host → device | Write a register. Device answers with ACK or error. |
+| 0x02 | `CC_READ` | both | Host request (`Length` = 0) and device response (`Length` = register size). |
+| 0x03 | `CC_ACK` | device → host | Write or control command accepted. `Address` and `Length` are both `0x00`. |
+| 0x04 | `CC_ERROR` | device → host | Request rejected. Payload is a single error code byte. |
+| 0x05 | `CC_CMD` | host → device | Execute a control action rather than write a register. See [Control commands](#control-commands). |
+| 0x42 | `CC_BOOTLOADER` | host → device | Erase the application flag and reboot into the bootloader. `0x42` is ASCII `B`. |
 
-## UART Protocol
+### Error codes
 
-OpenBMS uses Modbus RTU over UART for communication with external devices. Modbus register addresses are identical to SBS/I²C register addresses, so the same register map applies to both communication interfaces.
+Errors are returned as `[0x04][0x00][0x01][error code][checksum]`.
 
-### Modbus RTU frame structure
+| Code | Name | Meaning |
+|------|------|---------|
+| 0x00 | `CE_OK` | No error — never transmitted, internal success value only |
+| 0x01 | `CE_WRONG_CMD` | Unknown command byte, or a `CC_CMD` frame with a payload length other than 1, or a control command value out of range |
+| 0x02 | `CE_BAD_CRC` | Checksum mismatch |
+| 0x03 | `CE_NO_REG` | Register address is not mapped |
+| 0x04 | `CE_RO` | Write attempted on a read-only register, or FET control requested outside learning mode |
 
-| Device Address | Function Code | Data | CRC-16/IBM |
-|----------------|---------------|------|------------|
-| 1 byte | 1 byte | N bytes | 2 bytes |
+### Read transaction
 
-### Supported function codes
+The host sends a read request with `Length` set to `0x00`. The device replies with the register's **full native size** — a requested length is ignored, and there is no partial or block-offset read.
 
-| Code | Name | Description |
-|------|------|-------------|
-| 0x03 | Read Holding Registers | Read one or more 16-bit registers |
-| 0x06 | Write Single Register | Write one 16-bit register |
-| 0x10 | Write Multiple Registers | Write multiple 16-bit registers |
-
-### Example — Read cell voltages
-
-Host reads 7 cell voltages from register `0x48` (`CellVoltage()`):
-
-**Request:**
+**Request — read `CellVoltage()` at `0x00`:**
 ```
-01  03  00 48  00 07  B6 54
-│   │   └──┘   └──┘   └─────  CRC (2 bytes)
-│   │   │      └────────────  quantity — read 7 registers
-│   │   └───────────────────  start address — 0x0048
-│   └───────────────────────  function code — Read Holding Registers
-└───────────────────────────  device address — 0x01
+02  00  00  02
+│   │   │   └───── checksum — (0x02 + 0x00 + 0x00) & 0xFF
+│   │   └───────── length — always 0x00 for a read request
+│   └───────────── register address — 0x00
+└───────────────── command — CC_READ
 ```
 
 **Response:**
 ```
-01 03 0E 0F A0 0F A2 0F 9E 0F A1 0F 9F 0F A0 0F A3 4E 4A
-│  │  │  └─ 7 × UINT16 cell voltages in mV
-│  │  └─ byte count — 14 bytes (7 registers × 2 bytes)
-│  └─ function code — echo
-└─ device address — echo
+02 00 1C 00 60 67 45 00 20 67 45 ... 00 70 67 45 12
+│  │  │  └─ 7 × float32 LE — cell voltages in mV (3702.0, 3698.0, ...)
+│  │  └─ length — 28 bytes (7 × 4)
+│  └─ register address echo — 0x00
+└─ command echo — CC_READ
 ```
 
-### Example — Write FET state
-
-Host writes to `FETState()` at `0x42`:
-
-**Request:**
+**Request and response — `FETStatus()` at `0x09`:**
 ```
-01  06  00 42  00 01  49 28
-│   │   └──┘   └──┘   └─────  CRC (2 bytes)
-│   │   │      └────────────  value — 0x0001 (main FETs on)
-│   │   └───────────────────  register address — 0x0042
-│   └───────────────────────  function code — Write Single Register
-└───────────────────────────  device address — 0x01
+02  09  00  0B                  ← request
+02  09  02  03 00  10           ← response: uint16 LE 0x0003 (main FETs on, pre-FET on)
 ```
 
-**Response — echo of request if successful:**
+**Response — `FirmwareVersion()` at `0x52`:**
 ```
-01 06 00 42 00 01 49 28
+02 52 20 31 2E 30 2E 30 00 00 ... 00 61
+│  │  │  └─ char[32] — "1.0.0", null-padded
+│  │  └─ length — 32 bytes
+│  └─ register address echo — 0x52
+└─ command echo — CC_READ
 ```
 
-### Error response
+While a read is being served, the ADS131M08 `DRDY` interrupt (`EXTI15_10`) and the STM32 internal ADC interrupt (`ADC1`) are masked so the measurement buffers cannot be updated mid-copy. They are re-enabled immediately after.
 
-| Exception code | Meaning |
-|----------------|---------|
-| 0x01 | Illegal function code |
-| 0x02 | Illegal data address |
-| 0x03 | Illegal data value |
-| 0x04 | Device failure |
+### Write transaction
 
-**Error response frame:**
+The host sends the register's **full native size** as payload. The device answers with a bare ACK — it does not echo the written value.
+
+**Request — write `TemperatureOffset()` at `0x12` = 1.5 °C:**
 ```
-01  83  02  50 41
-│   │   │   └───── CRC (2 bytes)
-│   │   └───────── exception code
-│   └───────────── function code | 0x80 — error flag
-└───────────────── device address
+01  12  04  00 00 C0 3F  16
+│   │   │   └────────┘   └───── checksum
+│   │   │   └────────────────── data — float32 LE 1.5
+│   │   └────────────────────── length — 4 bytes
+│   └────────────────────────── register address — 0x12
+└────────────────────────────── command — CC_WRITE
 ```
+
+**Request — write `OVP_SlowThreshold()` at `0x3A` = 4220 mV:**
+```
+01  3A  02  7C 10  C9
+            └───┘   └───── checksum
+            └───────────── data — uint16 LE 4220
+```
+
+**Response — ACK (identical for every successful write and control command):**
+```
+03  00  00  03
+│   │   │   └───── checksum
+│   │   └───────── length — always 0x00
+│   └───────────── address — always 0x00
+└───────────────── command — CC_ACK
+```
+
+### Control commands
+
+`CC_CMD` frames trigger an action instead of writing a register. The payload length must be exactly **1 byte**; any other length returns `CE_WRONG_CMD`. Control command addresses are a separate address space from the register map.
+
+| Address | Command | Payload | Notes |
+|---------|---------|---------|-------|
+| 0x00 | SetMode | 1 byte — `0`, `1` or `2` | `0` = normal, `1` = config, `2` = learning. Values ≥ `0x03` return `CE_WRONG_CMD`. Writes the mode field of `MainControl()`. |
+| 0x01 | SetMainFET | 1 byte — `0` or `1` | `0` = FETs off, `1` = FETs on. Accepted **only in learning mode**; in normal or config mode the device returns `CE_RO`. Any value other than `0`/`1` returns `CE_WRONG_CMD`. |
+
+**Request — enter learning mode:**
+```
+05  00  01  02  08
+│   │   │   │   └───── checksum
+│   │   │   └───────── payload — mode 2 (learning)
+│   │   └───────────── length — 1 byte
+│   └───────────────── control command address — 0x00 (SetMode)
+└───────────────────── command — CC_CMD
+```
+
+**Request — turn main FETs on (learning mode only):**
+```
+05  01  01  01  08
+```
+
+Both are answered with the standard ACK frame, or `CE_RO` if the mode gate rejects it:
+```
+04  00  01  04  09
+```
+
+### Bootloader entry
+
+`CC_BOOTLOADER` (`0x42`, ASCII `B`) is handled **before** checksum validation, so a single unframed `0x42` byte is enough. The firmware erases the application flag page, replies with the ASCII string `"1\n"`, waits 100 ms and issues a system reset into the bootloader.
+
+The bootloader itself speaks a separate line-based ASCII protocol on the same UART at the same baud rate. `flashing_script/flash.py` drives the full sequence:
+
+| Command | Meaning | Response |
+|---------|---------|----------|
+| `B\n` | Ping | `0` = bootloader active · `1` = application running, it will reset into the bootloader · `2` = bootloader start failed |
+| `E\n` | Erase application flash | `0` = OK |
+| `P,<intel hex line>\n` | Program one Intel HEX record | `0` = OK · `1` = EOF record |
+| `C,<size>,<crc32>\n` | Verify image — CRC-32/MPEG-2, matching the STM32 HAL CRC peripheral | `0` = match |
+| `A\n` | Set application flag | `0` = OK |
+| `R\n` | Reset into the application | — |
+
+The application starts at `0x0800A000`; `main()` sets `SCB->VTOR` accordingly.
 
 ### UART settings
 
 | Parameter | Value |
 |-----------|-------|
-| Baud rate | 115200 |
+| Peripheral | USART1 |
+| Baud rate | 230400 |
 | Data bits | 8 |
 | Parity | None |
 | Stop bits | 1 |
-| Frame end | 3.5 character times silence (~0.3ms at 115200) |
+| Flow control | None |
+| Frame delimiting | Idle line — `HAL_UARTEx_ReceiveToIdle_DMA()`, one idle character time (~43 µs at 230400) |
+| RX / TX | DMA1 Channel 5 (RX) and Channel 4 (TX), 2048-byte buffers each |
+| Max payload | 168 bytes — the largest register is `Cell_Covariance()` at `0xA8` |
 
-### CAN 2.0 Protocol
+A frame must be transmitted as one continuous burst. Any idle gap inside a frame closes it early and the partial frame will be rejected on the checksum.
 
-OpenBMS uses CAN 2.0 (bxCAN) for communication with external devices. The STM32L431CCU6 has one CAN 2.0 peripheral (bxCAN) with a maximum payload of 8 bytes per frame.
+## Register map
 
-CAN protocol follows the same register map and function codes as the Modbus RTU over UART interface — same register addresses, same function codes, same data format. This means any register readable over UART is also readable over CAN using identical addressing.
+Registers are grouped into three banks, each backed by one firmware data structure. The banks are not contiguous — every address outside the ranges listed below returns `CE_NO_REG`.
 
-#### CAN frame structure
+| Bank | Range | Structure | Source module |
+|------|-------|-----------|---------------|
+| Peripheral data | `0x00` – `0x12` | `Peripheral_Data_t` | `openbms_periph.c` |
+| Control data | `0x30` – `0x57` | `Control_Data_t` | `openbms_ctrl.c` |
+| Fuel gauge data | `0x80` – `0xAC` | `FuelGauge_Data_t` | fuel gauge (not yet wired in) |
+| — | `0x13` – `0x2F`, `0x58` – `0x7F`, `0xAD` – `0xFF` | unmapped | returns `CE_NO_REG` |
 
-| CAN ID | Byte 0 | Byte 1-2 | Byte 3 | Byte 4-7 |
-|--------|--------|----------|--------|----------|
-| 11-bit | function code | register address | sequence byte | data |
+`Type` is the C type of the underlying struct field; `Size` is the exact payload length in bytes for both reads and writes.
 
-No CRC needed — CAN 2.0 hardware handles error detection automatically.
+### Peripheral data — `0x00` – `0x12`
 
-### CAN IDs
+Live measurements and sensor calibration, refreshed from the peripheral module on every access.
 
-| Direction | CAN ID |
-|-----------|--------|
-| Host → OpenBMS (request) | 0x600 + node ID |
-| OpenBMS → Host (response) | 0x580 + node ID |
-| OpenBMS broadcast | 0x180 + node ID |
+| Address | Register | Access | Type | Size | Notes |
+|---------|----------|--------|------|------|-------|
+| 0x00 | CellVoltage() | r | float[7] | 28 | Per-cell voltage in mV, cell 1 first |
+| 0x01 | CellVoltageFiltered() | r | float[7] | 28 | Filtered per-cell voltage in mV — this is what the voltage protections evaluate |
+| 0x02 | PackVoltage() | r | float | 4 | Pack terminal voltage in mV |
+| 0x03 | PackVoltageFiltered() | r | float | 4 | Filtered pack voltage in mV |
+| 0x04 | PackCurrent() | r | float | 4 | Instantaneous current in mA; signed |
+| 0x05 | PackCurrentFiltered() | r | float | 4 | Filtered current in mA — this is what the current protections evaluate |
+| 0x06 | TemperaturePackage() | r | float | 4 | NTC pack temperature in °C — this is what the temperature protection evaluates |
+| 0x07 | TemperatureSTM32() | r | float | 4 | Internal MCU die temperature in °C |
+| 0x08 | MainVddVoltage() | r | float | 4 | System VDD in mV; nominally 3300 |
+| 0x09 | FETStatus() | r | uint16 | 2 | Bits 15-9: reserved<br/>Bits 8-2: balancer FETs — bit 2 = cell 1 … bit 8 = cell 7; 0=off, 1=on<br/>Bit 1: pre-FET state — 0=off, 1=on<br/>Bit 0: main FETs state — 0=off, 1=on |
+| 0x0A | CurrentSensorOffset() | r/w | float | 4 | Current sensor offset calibration |
+| 0x0B | CurrentSensorGain() | r/w | float | 4 | Current sensor gain calibration |
+| 0x0C | VoltageOffset() | r/w | float[7] | 28 | Per-cell ADC offset calibration |
+| 0x0D | VoltageGain() | r/w | float[7] | 28 | Per-cell ADC gain calibration |
+| 0x0E | NTC_Beta() | r/w | float | 4 | NTC beta value from datasheet, e.g. 3950.0 |
+| 0x0F | NTC_R_Nominal() | r/w | float | 4 | NTC nominal resistance at 25 °C in Ω |
+| 0x10 | NTC_R_Fixed() | r/w | float | 4 | Divider resistor in Ω, e.g. 10000.0 |
+| 0x11 | NTC_T_Nominal() | r/w | float | 4 | NTC nominal temperature in K, e.g. 298.15 |
+| 0x12 | TemperatureOffset() | r/w | float | 4 | Temperature sensor offset in °C |
 
-Default node ID is `0x01`, configurable via `Configuration()` register at `0x40`.
+### Control data — `0x30` – `0x57`
 
-### Function codes — same as Modbus RTU
+Configuration, protection thresholds, fault records, lifetime counters and device identity.
 
-| Code | Name |
-|------|------|
-| 0x03 | Read register |
-| 0x06 | Write single register |
-| 0x10 | Write multiple registers |
-| 0x83 | Error response |
+| Address | Register | Access | Type | Size | Notes |
+|---------|----------|--------|------|------|-------|
+| 0x30 | Configuration() | r/w | uint16 | 2 | Bits 15-10: reserved<br/>Bit 9: temperature protection — 0=disable, 1=enable<br/>Bit 8: current protection — 0=disable, 1=enable<br/>Bit 7: voltage protection — 0=disable, 1=enable<br/>Bit 6: UART state — 0=disable, 1=enable<br/>Bit 5: CAN 2.0 state — 0=disable, 1=enable<br/>Bit 4: I²C state — 0=disable, 1=enable<br/>Bits 3-0: cell count — valid range 2-7<br/>Default: `0x0387` (7 cells, all three protections enabled) |
+| 0x31 | MainControl() | r/w | uint16 | 2 | Bits 15-2: reserved<br/>Bits 1-0: operating mode — `0`=normal, `1`=config, `2`=learning, `3`=reserved<br/>Default: `0x0000` (normal). Prefer the `CC_CMD` SetMode command over writing this register directly. |
+| 0x32 | CellCapacity() | r/w | uint32 | 4 | Factory cell capacity in mAh; default 2000 |
+| 0x33 | MaxCellVoltage() | r/w | uint16 | 2 | Max designed cell voltage in mV; default 4200 |
+| 0x34 | MinCellVoltage() | r/w | uint16 | 2 | Min designed cell voltage in mV; default 2500 |
+| 0x35 | ChargingTerminationCurrent() | r/w | uint16 | 2 | Termination current in mA; default 100 |
+| 0x36 | UVP_SlowThreshold() | r/w | uint16 | 2 | Slow undervoltage threshold in mV; default 2700 |
+| 0x37 | UVP_SlowTime() | r/w | uint16 | 2 | Slow UVP detection time in ms; default 20000; `0` disables this protection |
+| 0x38 | UVP_FastThreshold() | r/w | uint16 | 2 | Fast undervoltage threshold in mV; default 2500 |
+| 0x39 | UVP_FastTime() | r/w | uint16 | 2 | Fast UVP detection time in ms; default 500; `0` disables |
+| 0x3A | OVP_SlowThreshold() | r/w | uint16 | 2 | Slow overvoltage threshold in mV; default 4220 |
+| 0x3B | OVP_SlowTime() | r/w | uint16 | 2 | Slow OVP detection time in ms; default 20000; `0` disables |
+| 0x3C | OVP_FastThreshold() | r/w | uint16 | 2 | Fast overvoltage threshold in mV; default 4300 |
+| 0x3D | OVP_FastTime() | r/w | uint16 | 2 | Fast OVP detection time in ms; default 500; `0` disables |
+| 0x3E | OCP_ChargeThreshold() | r/w | uint16 | 2 | Charge overcurrent threshold in mA; default 4000 |
+| 0x3F | OCP_ChargeTime() | r/w | uint16 | 2 | Charge OCP detection time in ms; default 10000; `0` disables |
+| 0x40 | OCP_DischargeSlowThreshold() | r/w | uint16 | 2 | Slow discharge overcurrent threshold in mA; default 15000 |
+| 0x41 | OCP_DischargeSlowTime() | r/w | uint16 | 2 | Slow discharge OCP detection time in ms; default 10000; `0` disables |
+| 0x42 | OCP_DischargeFastThreshold() | r/w | uint16 | 2 | Fast discharge overcurrent threshold in mA; default 18000 |
+| 0x43 | OCP_DischargeFastTime() | r/w | uint16 | 2 | Fast discharge OCP detection time in ms; default 1000; `0` disables |
+| 0x44 | OTP_Threshold() | r/w | uint16 | 2 | Overtemperature threshold in °C; default 60 |
+| 0x45 | OTP_Time() | r/w | uint16 | 2 | OTP detection time in ms; default 60000; `0` disables |
+| 0x46 | FaultSnapshotVoltage() | r | uint16[7] | 14 | Per-cell voltage at last fault in mV |
+| 0x47 | FaultSnapshotCurrent() | r | int16 | 2 | Current at last fault in mA; signed |
+| 0x48 | FaultSnapshotTemperature() | r | uint8 | 1 | Temperature at last fault in °C |
+| 0x49 | FaultSnapshotSoC() | r | uint8 | 1 | SoC at last fault in % |
+| 0x4A | FaultCode() | r | uint8[8] | 8 | Last 8 fault codes; entry 0 = oldest, entry 7 = latest |
+| 0x4B | FaultTimestamp() | r | uint32[8] | 32 | Unix timestamps matching `FaultCode()`, same ordering |
+| 0x4C | CellBalancingEnergy() | r | uint16[7] | 14 | Per-cell accumulated balancing energy in mWh |
+| 0x4D | CellBalancingTime() | r | uint16[7] | 14 | Per-cell accumulated balancing time in minutes |
+| 0x4E | CellDeepestDischarge() | r | uint8[7] | 7 | Per-cell lowest SoC ever recorded in % |
+| 0x4F | CellMaxTemperature() | r | uint8[7] | 7 | Per-cell highest temperature ever recorded in °C |
+| 0x50 | LastCommunicationTimestamp() | r | uint32 | 4 | Time of last host communication in ms since boot; not yet updated by the firmware |
+| 0x51 | UptimeCounter() | r | uint64 | 8 | Total uptime in ms; rollover-safe accumulation of the HAL tick |
+| 0x52 | FirmwareVersion() | r | char[32] | 32 | ASCII, null-padded — "1.0.0" |
+| 0x53 | HardwareVersion() | r | char[32] | 32 | ASCII, null-padded — "RevA" |
+| 0x54 | ManufacturerName() | r | char[32] | 32 | ASCII, null-padded — "OpenBatt Team" |
+| 0x55 | DeviceName() | r | char[32] | 32 | ASCII, null-padded — "OpenBMS" |
+| 0x56 | DeviceChemistry() | r | char[32] | 32 | ASCII, null-padded — "Li-Ion" |
+| 0x57 | ManufacturerData() | r | char[32] | 32 | ASCII, null-padded — "Year 2026" |
 
-### Example — Read FET status
+Protection thresholds are evaluated every 50 ms against the *filtered* measurements. A protection fires only after its condition has held continuously for the configured detection time; a detection time of `0` disables that individual protection regardless of the `Configuration()` enable bit.
 
-Host reads `FETStatus()` from register `0x4A`:
+> **Note:** `0x32`–`0x34` are per-cell quantities in the firmware (`cell_capacity`, `voltage_cell_max`, `voltage_cell_min`) but are labelled `PackCapacity` / `MaxPackVoltage` / `MinPackVoltage` in `flashing_script/read_data.py`. The names above follow the firmware.
 
-**Request:**
-```
-CAN ID: 0x601
-03  00 4A  01  00 00 00 00
-│   └──┘   │   └────────────  padding
-│   │      └────────────────  sequence byte — 0x01
-│   └───────────────────────  register address — 0x004A
-└───────────────────────────  function code — read
-```
+### Fuel gauge data — `0x80` – `0xAC`
 
-**Response:**
-```
-CAN ID: 0x581
-03  00 4A  01  00 03  00 00
-│   └──┘   │   └──┘   └─────  padding
-│   │      │   └────────────  register value — 0x0003 (main FETs on, aux FET on)
-│   │      └────────────────  sequence byte echo — 0x01
-│   └───────────────────────  register address echo — 0x004A
-└───────────────────────────  function code echo
-```
+Gauge outputs, the OCV/ECM cell model, temperature-dependent capacity, Kalman filter tuning and per-cell filter and aging state.
 
-### Multi-frame transfers
+All 20-element tables share the SOC breakpoints defined by `SOC_Grid()` at `0x86` — 0 % to 95 % in 5 % steps by default. All 5-element tables share the temperature breakpoints defined by `Q_Nom_TempSetpoints()` at `0x93`. See [battery-model.md](battery-model.md) for the model these parameters feed.
 
-Since CAN 2.0 is limited to 8 bytes per frame and Byte 3 is reserved for the sequence byte, each frame carries 4 bytes of data (Bytes 4-7). Block registers larger than 4 bytes are split across multiple frames:
+| Address | Register | Access | Type | Size | Notes |
+|---------|----------|--------|------|------|-------|
+| 0x80 | RelativeSoC() | r | uint8 | 1 | Pack SoC as % of full charge capacity; 0-100 |
+| 0x81 | CellSoC() | r | uint8[7] | 7 | Per-cell SoC in %; 0-100 |
+| 0x82 | CellSoH() | r | uint8[7] | 7 | Per-cell SoH in %; 0-100 |
+| 0x83 | CellRemainingCapacity() | r | uint16[7] | 14 | Per-cell remaining capacity in mAh |
+| 0x84 | CellSelfDischarge() | r | uint16[7] | 14 | Per-cell self-discharge rate in mAh/month |
+| 0x85 | CellQmax() | r | uint16[7] | 14 | Per-cell learned maximum capacity in mAh |
+| 0x86 | SOC_Grid() | r/w | float[20] | 80 | SOC breakpoints in %; default 0 to 95 in 5 % steps |
+| 0x87 | OCV_Discharge() | r/w | float[20] | 80 | Open-circuit voltage discharge curve in V per cell |
+| 0x88 | OCV_Charge() | r/w | float[20] | 80 | Open-circuit voltage charge curve in V per cell |
+| 0x89 | R0_Discharge() | r/w | float[20] | 80 | Series resistance, discharge, in Ω |
+| 0x8A | R1_Discharge() | r/w | float[20] | 80 | First RC resistance, discharge, in Ω |
+| 0x8B | Tau1_Discharge() | r/w | float[20] | 80 | First RC time constant, discharge, in s |
+| 0x8C | R2_Discharge() | r/w | float[20] | 80 | Second RC resistance, discharge, in Ω |
+| 0x8D | Tau2_Discharge() | r/w | float[20] | 80 | Second RC time constant, discharge, in s |
+| 0x8E | R0_Charge() | r/w | float[20] | 80 | Series resistance, charge, in Ω |
+| 0x8F | R1_Charge() | r/w | float[20] | 80 | First RC resistance, charge, in Ω |
+| 0x90 | Tau1_Charge() | r/w | float[20] | 80 | First RC time constant, charge, in s |
+| 0x91 | R2_Charge() | r/w | float[20] | 80 | Second RC resistance, charge, in Ω |
+| 0x92 | Tau2_Charge() | r/w | float[20] | 80 | Second RC time constant, charge, in s |
+| 0x93 | Q_Nom_TempSetpoints() | r/w | float[5] | 20 | Temperature breakpoints in °C; default −20, −10, 0, 25, 45 |
+| 0x94 | Q_Nom_TempCapacity() | r/w | float[5] | 20 | Capacity in Ah at each temperature breakpoint |
+| 0x95 | Q_Nom() | r/w | float | 4 | Nominal capacity at 25 °C in Ah |
+| 0x96 | CoulombicEfficiency() | r/w | float | 4 | Typically 0.995 to 0.999 |
+| 0x97 | R0_Ref() | r/w | float | 4 | R0 reference at 25 °C in Ω |
+| 0x98 | R1_Ref() | r/w | float | 4 | R1 reference at 25 °C in Ω |
+| 0x99 | Tau1_Ref() | r/w | float | 4 | tau1 reference at 25 °C in s |
+| 0x9A | R2_Ref() | r/w | float | 4 | R2 reference at 25 °C in Ω |
+| 0x9B | Tau2_Ref() | r/w | float | 4 | tau2 reference at 25 °C in s |
+| 0x9C | Ea_R0() | r/w | float | 4 | Arrhenius activation energy for R0 in J/mol |
+| 0x9D | Ea_R1() | r/w | float | 4 | Arrhenius activation energy for R1 in J/mol |
+| 0x9E | Ea_Tau1() | r/w | float | 4 | Arrhenius activation energy for tau1 in J/mol |
+| 0x9F | Ea_R2() | r/w | float | 4 | Arrhenius activation energy for R2 in J/mol |
+| 0xA0 | Ea_Tau2() | r/w | float | 4 | Arrhenius activation energy for tau2 in J/mol |
+| 0xA1 | KF_Q_SOC() | r/w | float | 4 | Kalman process noise — SOC state |
+| 0xA2 | KF_Q_RC1() | r/w | float | 4 | Kalman process noise — V_RC1 state |
+| 0xA3 | KF_Q_RC2() | r/w | float | 4 | Kalman process noise — V_RC2 state |
+| 0xA4 | KF_R_V() | r/w | float | 4 | Kalman measurement noise — voltage sensor, V² |
+| 0xA5 | Cell_SOC_f() | r | float[7] | 28 | Last estimated SOC per cell, 0.0 to 1.0 |
+| 0xA6 | Cell_VRC1() | r | float[7] | 28 | Last estimated V_RC1 per cell in V |
+| 0xA7 | Cell_VRC2() | r | float[7] | 28 | Last estimated V_RC2 per cell in V |
+| 0xA8 | Cell_Covariance() | r/w | float[7][6] | 168 | Covariance upper triangle per cell, row-major by cell<br/>Per-cell order: `P00, P01, P02, P11, P12, P22`<br/>Cell 1: bytes 0-23 · Cell 2: bytes 24-47 · … · Cell 7: bytes 144-167 |
+| 0xA9 | Cell_Q_Nom() | r | float[7] | 28 | Per-cell capacity after aging in Ah |
+| 0xAA | Cell_R0_Scale() | r | float[7] | 28 | Per-cell R0 growth factor; 1.0 = nominal |
+| 0xAB | CycleCount() | r | uint16 | 2 | Charge/discharge cycle counter |
+| 0xAC | LearningStatus() | r | uint16 | 2 | Kalman filter convergence and learning state flags |
 
-```
-CAN ID: 0x581
-│ 03 00 48 01 XX XX XX XX  ← sequence 01 — Cell 1 and Cell 2 voltages
-│ 03 00 48 02 XX XX XX XX  ← sequence 02 — Cell 3 and Cell 4 voltages
-│ 03 00 48 03 XX XX XX XX  ← sequence 03 — Cell 5 and Cell 6 voltages
-│ 03 00 48 04 XX XX 00 00  ← sequence 04 — Cell 7 voltage + padding
-```
+## Planned interfaces
 
-### Error response
+Both peripherals below are initialized by `main.c` but have no protocol handler in `openbms_comm.c` yet. The intent is for both to expose the same register map and the same command and error codes as the UART protocol, so that any register reachable over UART is reachable over SMBus and CAN with identical addressing.
 
-```
-CAN ID: 0x581
-83  00 4A  01  02  00 00 00
-│   └──┘   │   │   └────────  padding
-│   │      │   └────────────  exception code — 0x02 = illegal data address
-│   │      └────────────────  sequence byte — 0x01
-│   └───────────────────────  register address echo — 0x004A
-└───────────────────────────  function code | 0x80 — error flag (0x03 | 0x80 = 0x83)
-```
-
-### CAN bus settings
+### SBS v1.1 over I²C/SMBus — planned
 
 | Parameter | Value |
 |-----------|-------|
-| Bit rate | 500 kbit/s |
-| Termination | 120Ω at each end of the bus |
-| Max nodes | 127 |
+| Peripheral | I2C2 in SMBus slave mode |
+| Slave address | `0x0B` (7-bit) |
+| PEC | Enabled |
+| Timeouts | `TIDLE` and `TEXTEN` enabled |
+| Bus speed | ~100 kHz |
+| Status | Hardware initialized, no protocol handler |
+
+The plan is a Smart Battery Specification v1.1 compliant register map at `0x00`–`0x3F` with the OpenBMS registers exposed as manufacturer-defined extensions above `0x40`. Refer to the [SBS Specification](https://sbs-forum.org/specs/sbdat110.pdf) for the standard portion.
+
+> **Note:** `I2C1` is a separate master-mode bus used internally for the on-board 4 kB EEPROM at address `0xA0`. It is not a host interface.
+
+### CAN 2.0 — planned
+
+| Parameter | Value |
+|-----------|-------|
+| Peripheral | CAN1 (bxCAN) on PA11 / PA12 |
+| Bit rate | 1 Mbit/s — prescaler 8, BS1 7 TQ, BS2 2 TQ, SJW 1 TQ at 80 MHz PCLK1 |
 | Frame format | CAN 2.0A — 11-bit identifier |
+| Max payload | 8 bytes per frame |
+| Auto bus-off recovery | Enabled |
+| Auto retransmission | Enabled |
+| Interrupts | `CAN1_RX0`, `CAN1_TX`, `CAN1_SCE` enabled |
+| Termination | 120 Ω at each end of the bus |
+| Status | Hardware initialized, no protocol handler |
+
+Because bxCAN carries at most 8 bytes per frame while several registers are far larger — `Cell_Covariance()` alone is 168 bytes — a multi-frame transport with a sequence byte will be required. The frame layout, CAN IDs and node addressing are not yet fixed and will be specified once the handler is implemented.
+
+## Notes for implementers
+
+Behaviour worth knowing when writing a host tool against the current firmware:
+
+- **Reads return the whole register.** The length byte in a read request is ignored; the device always sends the register's full native size. There is no partial read and no block offset.
+- **Writes must carry the whole register.** The firmware copies the register's native size out of the receive buffer regardless of the length the host declared. A short write will pull in whatever follows in the buffer, so always send exactly `Size` bytes.
+- **The device never initiates traffic.** There are no alarm broadcasts, no unsolicited status frames and no charger negotiation. A host that needs alarm awareness must poll `FETStatus()`, the fault registers and the measurement registers.
+- **One transaction at a time.** There is no sequence or transaction ID, so the host must wait for a response before issuing the next request. The reference scripts flush the input buffer before each request.
+- **Register writes are not yet persisted or propagated.** Writable registers in the peripheral and control banks are copied into a module-local snapshot inside `openbms_comm.c`; there is no setter path back into `openbms_periph.c` or `openbms_ctrl.c`, and nothing is written to EEPROM. Writes therefore do not currently take effect and do not survive a reset.
+- **The fuel gauge bank is not yet wired up.** `0x80`–`0xAC` are served from a zero-initialized static structure — the fuel gauge module does not populate it yet, so these registers read as zeros.
+- **`0xAD`–`0xD9` decode into the fuel gauge bank but map to nothing.** They return `CE_NO_REG` like any other unmapped address.
