@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+read_all_registers.py
+======================
+Reads and prints every register in the OpenBMS UART register map -- a full
+dump for a quick "is the board alive and sane" check. Register addresses,
+names, types and element counts below are kept in sync with the register
+map in communication-protocol.md; if that file changes, update the three
+lists below (PERIPH_REGISTERS / CTRL_REGISTERS / FUEL_REGISTERS) to match.
+
+Run:
+    python read_all_registers.py <COM_PORT>
+    python read_all_registers.py COM3
+
+(Renamed from read_data.py -- same tool, name now describes what it does.)
+"""
 
 import sys
 import serial
@@ -84,9 +99,9 @@ CTRL_REGISTERS = [
     # System control
     Reg(0x30, "Configuration",                  "flags",    'H', 1 ),
     Reg(0x31, "MainControl",                    "flags",    'H', 1 ),
-    Reg(0x32, "PackCapacity",                   "mAh",      'I', 1 ),
-    Reg(0x33, "MaxPackVoltage",                 "mV",       'H', 1 ),
-    Reg(0x34, "MinPackVoltage",                 "mV",       'H', 1 ),
+    Reg(0x32, "CellCapacity",                   "mAh",      'I', 1 ),
+    Reg(0x33, "MaxCellVoltage",                 "mV",       'H', 1 ),
+    Reg(0x34, "MinCellVoltage",                 "mV",       'H', 1 ),
     Reg(0x35, "ChargingTerminationCurrent",     "mA",       'H', 1 ),
     # Voltage protection
     Reg(0x36, "UVP_SlowThreshold",              "mV",       'H', 1 ),
@@ -322,8 +337,8 @@ def read_registers(ser, registers, errors):
 # ---------------------------------------------------------------
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python read_data.py <COM_PORT>")
-        print("Example: python read_data.py COM3")
+        print("Usage: python read_all_registers.py <COM_PORT>")
+        print("Example: python read_all_registers.py COM3")
         sys.exit(1)
 
     port = sys.argv[1]

@@ -28,15 +28,10 @@ Learn more at the [NLnet project page](https://nlnet.nl/project/OpenBMS).
 
 ## Prerequisites
 - Install STM32CubeIDE for VS Code extension
-- Always open this project via STM32CubeIDE or the extension so `CUBE_BUNDLE_PATH` is set correctly
-- Check that bundle version numbers in `.vscode/settings.json` and `.vscode/launch.json` match your locally installed versions under `%LOCALAPPDATA%\stm32cube\bundles\`
+- Check that bundle version numbers in `firmware/.vscode/settings.json` and `firmware/.vscode/launch.json` match your locally installed versions under `%LOCALAPPDATA%\stm32cube\bundles\`
 
-## 📡 Communication Protocol
+## 📚 Documentation
 
-OpenBMS implements three communication protocols sharing the same register map:
-
-- **SBS v1.1 over I²C/SMBus** — Smart Battery Specification v1.1, compatible with any SBS-compliant host. SMBus address `0x0B`, speed up to 100 kHz, PEC error checking.
-- **Modbus RTU over UART** — 115200 baud, 8N1, same register addresses as SBS. Used for debugging and external communication.
-- **CAN 2.0** — 500 kbit/s, 11-bit identifier, same register addresses as SBS. Used for communication with host, charger and other system components.
-
-Full protocol documentation can be found in [communication-protocol.md](communication-protocol.md).
+- **[communication-protocol.md](communication-protocol.md)** — full wire protocol. The OpenBMS binary protocol over UART is implemented; I²C and CAN 2.0 are planned (draft frame formats included).
+- **[battery-model.md](battery-model.md)** — 2-RC equivalent circuit battery model, HPPC parameter extraction, and SOC estimation via an Extended Kalman Filter.
+- **[python-script.md](python-script.md)** — reference for the host-side scripts in `python_scripts/` (flashing firmware, running hardware tests, analyzing logs).

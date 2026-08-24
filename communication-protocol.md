@@ -3,10 +3,10 @@
 OpenBMS firmware implements the following communication protocols:
 
 - **OpenBMS binary protocol over UART** — 230400 baud, 8N1, register-based read/write with an 8-bit additive checksum. This is the only protocol currently implemented and is used for host communication, configuration, calibration, data logging and bootloader entry.
-- **SBS v1.1 over I²C/SMBus** — *planned.* The SMBus peripheral is initialized (slave address `0x0B`, PEC enabled) but no protocol handler exists yet.
+- **I²C** — *planned.* The I2C2 peripheral is initialized in SMBus slave mode (slave address `0x0B`, PEC enabled) but no protocol handler exists yet.
 - **CAN 2.0** — *planned.* The bxCAN peripheral is initialized (1 Mbit/s, 11-bit identifier) but no protocol handler exists yet.
 
-A reference host implementation of the UART protocol lives in [`flashing_script/read_data.py`](flashing_script/read_data.py) (full register dump) and [`flashing_script/monitor.py`](flashing_script/monitor.py) (live logging).
+A reference host implementation of the UART protocol lives in [`python_scripts/read_all_registers.py`](python_scripts/read_all_registers.py) (full register dump) and [`python_scripts/battery_cycler.py`](python_scripts/battery_cycler.py) (live logging).
 
 ## OpenBMS Binary Protocol
 
@@ -278,7 +278,7 @@ Configuration, protection thresholds, fault records, lifetime counters and devic
 
 Protection thresholds are evaluated every 50 ms against the *filtered* measurements. A protection fires only after its condition has held continuously for the configured detection time; a detection time of `0` disables that individual protection regardless of the `Configuration()` enable bit.
 
-> **Note:** `0x32`–`0x34` are per-cell quantities in the firmware (`cell_capacity`, `voltage_cell_max`, `voltage_cell_min`) but are labelled `PackCapacity` / `MaxPackVoltage` / `MinPackVoltage` in `flashing_script/read_data.py`. The names above follow the firmware.
+> **Note:** `0x32`–`0x34` are per-cell quantities in the firmware (`cell_capacity`, `voltage_cell_max`, `voltage_cell_min`), matching `CellCapacity()` / `MaxCellVoltage()` / `MinCellVoltage()` above. `python_scripts/read_all_registers.py` uses these same names.
 
 ### Fuel gauge data — `0x80` – `0xAC`
 
@@ -336,9 +336,9 @@ All 20-element tables share the SOC breakpoints defined by `SOC_Grid()` at `0x86
 
 ## Planned interfaces
 
-Both peripherals below are initialized by `main.c` but have no protocol handler in `openbms_comm.c` yet. The intent is for both to expose the same register map and the same command and error codes as the UART protocol, so that any register reachable over UART is reachable over SMBus and CAN with identical addressing.
+Both peripherals below are initialized by `main.c` but have no protocol handler in `openbms_comm.c` yet — **nothing in this section is implemented**. The intent is for both to expose the same register map and the same command and error codes as the UART protocol (`CC_READ`, `CC_WRITE`, `CC_ACK`, `CC_ERROR`, `CC_CMD` and the `CE_*` error codes, unchanged), so that any register reachable over UART is reachable over I²C and CAN with identical addressing. The framing below is a draft of what each handler is expected to implement, written down now so host-side tooling can be designed in parallel — it is not a commitment, and specifics may well change once a handler actually exists and gets tested against real hardware.
 
-### SBS v1.1 over I²C/SMBus — planned
+### I²C — planned
 
 | Parameter | Value |
 |-----------|-------|
@@ -349,7 +349,7 @@ Both peripherals below are initialized by `main.c` but have no protocol handler 
 | Bus speed | ~100 kHz |
 | Status | Hardware initialized, no protocol handler |
 
-The plan is a Smart Battery Specification v1.1 compliant register map at `0x00`–`0x3F` with the OpenBMS registers exposed as manufacturer-defined extensions above `0x40`. Refer to the [SBS Specification](https://sbs-forum.org/specs/sbdat110.pdf) for the standard portion.
+**Planned frame format (draft):** the same `[Command][Address][Length][Data][Checksum]` frame used on UART, carried as the data of a single SMBus block-write (host → device request) or block-read (device → host response). Standard SMBus block transfers cap at 32 data bytes, which covers every register except the handful of large fuel-gauge tables (`Cell_Covariance()` at 168 bytes is the largest) — those will need more than one block transaction, most likely paged with an offset appended after the register address. The exact paging scheme isn't fixed yet; PEC (already enabled on the peripheral) would sit alongside or replace the additive checksum, whichever turns out simpler once a handler is written.
 
 > **Note:** `I2C1` is a separate master-mode bus used internally for the on-board 4 kB EEPROM at address `0xA0`. It is not a host interface.
 
@@ -367,7 +367,17 @@ The plan is a Smart Battery Specification v1.1 compliant register map at `0x00`�
 | Termination | 120 Ω at each end of the bus |
 | Status | Hardware initialized, no protocol handler |
 
-Because bxCAN carries at most 8 bytes per frame while several registers are far larger — `Cell_Covariance()` alone is 168 bytes — a multi-frame transport with a sequence byte will be required. The frame layout, CAN IDs and node addressing are not yet fixed and will be specified once the handler is implemented.
+**Planned frame format (draft):** two fixed 11-bit identifiers — `0x100` for host → device requests and `0x101` for device → host responses — since this stays a point-to-point link with no multi-device addressing to design in yet.
+
+Because bxCAN carries at most 8 bytes per frame while several registers are far larger (`Cell_Covariance()` alone is 168 bytes), the plan is to reuse the ISO 15765-2 ("ISO-TP") single/first/consecutive-frame pattern rather than invent a new one, carrying the same `[Command][Address][Length][Data][Checksum]` frame as the payload:
+
+| First byte(s) | Frame type | Carries |
+|----------------|------------|---------|
+| `0x0N` | Single frame | The whole OpenBMS frame in the remaining 7 bytes, when `N` (its length) is ≤ 7 — most requests, ACKs and small registers |
+| `0x1L` `LL` | First frame | 12-bit total length split across the low nibble of byte 0 and all of byte 1, then the first 6 bytes of the OpenBMS frame |
+| `0x2N` | Consecutive frame | The next 7 bytes, `N` a wrapping 0–15 sequence number |
+
+A read of `CellVoltage()` (`0x00`) returns a 32-byte OpenBMS frame (command + address + length + 28 bytes of data + checksum) — too big for one CAN frame. It would arrive as one first frame (6 bytes) plus four consecutive frames (7+7+7+5 bytes) carrying the remaining 26. The CAN IDs and this framing are a starting point for the handler, not a fixed spec — they will be finalized once one is actually implemented and run against the bus.
 
 ## Notes for implementers
 
