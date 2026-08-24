@@ -30,7 +30,7 @@ extern "C" {
 #define BD_MAIN_CTR_MODE_LEARNING           (0x02)          // Bits 1-0  — learning mode
 
 // -------------------------------------------------------
-// 0x39 — FETStatus register bit definitions (read-only)
+// 0x09 — FETStatus register bit definitions (read-only)
 // -------------------------------------------------------
 #define BD_FET_MAIN                     (1 << 0)        // Bit 0     — main FETs state
 #define BD_FET_PRE                      (1 << 1)        // Bit 1     — pre-FET state

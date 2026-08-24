@@ -161,7 +161,7 @@ Both are answered with the standard ACK frame, or `CE_RO` if the mode gate rejec
 
 `CC_BOOTLOADER` (`0x42`, ASCII `B`) is handled **before** checksum validation, so a single unframed `0x42` byte is enough. The firmware erases the application flag page, replies with the ASCII string `"1\n"`, waits 100 ms and issues a system reset into the bootloader.
 
-The bootloader itself speaks a separate line-based ASCII protocol on the same UART at the same baud rate. `flashing_script/flash.py` drives the full sequence:
+The bootloader itself speaks a separate line-based ASCII protocol on the same UART at the same baud rate. `python_scripts/flash.py` drives the full sequence:
 
 | Command | Meaning | Response |
 |---------|---------|----------|

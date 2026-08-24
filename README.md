@@ -4,7 +4,7 @@
 ![License](https://img.shields.io/badge/license-MIT-7c5cbf)
 
 [OpenBMS](https://github.com/open-batt/openbms-hardware) firmware runs on STM32L4 microcontroller and is written in bare C. It consists of two layers:
-- Peripheral control and communication protocol handler - initializes and runs all peripherals on STM32L4, reads ADC, controls GPIO, handles communication on I2C, UART and CAN.
+- Peripheral control and communication protocol handler - initializes and runs all peripherals on STM32L4, reads ADC, controls GPIO, and implements the host communication protocol over UART (I2C and CAN peripherals are initialized but not yet handled — see [communication-protocol.md](communication-protocol.md)).
 - Algorithms - battery fuel gauge algorithm, charge, discharge and cell balancing control, protections.
 
 ## ❤️ Funding
