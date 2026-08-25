@@ -18,6 +18,7 @@
 #include "openbms_comm.h"
 #include "openbms_periph.h"
 #include "openbms_ctrl.h"
+#include "openbms_fuelgauge.h"
 
 #define APP_FLAG_FLASH_LAGE  19U
 
@@ -467,8 +468,9 @@ static CommErrorType_t Controls_Set(uint8_t address, uint8_t *cmd, uint8_t lengt
 }
 static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data, uint8_t *length, bool write)
 {
-    void    *data_point = NULL;
-    bool     ro         = false;
+    void    *data_point    = NULL;
+    bool     ro            = false;
+    bool     is_fuel_gauge = false;
 
     if(address <= 0x2F)
     {
@@ -612,6 +614,9 @@ static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data
     }
     else if(address >= 0x80 && address <= 0xD9)
     {
+        // Load data
+        FuelGauge_GetData(&fg);
+        is_fuel_gauge = true;
         switch (address)
         {
             // -------------------------------------------------------
@@ -621,16 +626,16 @@ static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data
             // 0x83 — CellRemainingCapacity[7] (read-only)
             // 0x84 — CellSelfDischarge[7] (read-only)
             // 0x85 — CellQmax[7] (read-only)
-            // 0xB6 — SOC grid[20]
-            // 0xB7 — OCV discharge[20]
-            // 0xB8 — OCV charge[20]
-            // 0xB9 — R0 discharge[20]    
-            // 0xBA — R1 discharge[20]
-            // 0xBB — tau1 discharge[20]  
-            // 0xBC — R2 discharge[20]
-            // 0xBD — tau2 discharge[20]
-            // 0xBE — R0 charge[20]    
-            // 0xBF — R1 charge[20]
+            // 0x86 — SOC grid[20]
+            // 0x87 — OCV discharge[20]
+            // 0x88 — OCV charge[20]
+            // 0x89 — R0 discharge[20]
+            // 0x8A — R1 discharge[20]
+            // 0x8B — tau1 discharge[20]
+            // 0x8C — R2 discharge[20]
+            // 0x8D — tau2 discharge[20]
+            // 0x8E — R0 charge[20]
+            // 0x8F — R1 charge[20]
             // 0x90 — tau1 charge[20]  
             // 0x91 — R2 charge[20]
             // 0x92 — tau2 charge[20]
@@ -722,6 +727,16 @@ static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data
     else if(write && !ro)
     {
         memcpy(data_point, raw_data, *length);
+
+        // The fuel gauge owns its registers, so a write has to be pushed back
+        // rather than left in this module's copy. Safe to write the whole
+        // struct: it was refreshed immediately above, and the estimator runs
+        // from Ctrl_Run() in the same superloop, so it cannot have advanced
+        // in between.
+        if(is_fuel_gauge)
+        {
+            FuelGauge_SetData(&fg);
+        }
     }
     else
     {

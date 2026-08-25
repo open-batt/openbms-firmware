@@ -131,7 +131,15 @@ typedef struct __attribute__((packed))
 
 } Control_Data_t;
 
-typedef struct __attribute__((packed))
+// The fuel gauge estimator takes float pointers into this struct and
+// dereferences them directly, so every float member has to sit on a 4-byte
+// boundary — on Cortex-M4 an unaligned VLDR raises a UsageFault rather than
+// just being slow. Packing alone gives the struct an alignment of 1 and would
+// land soc_grid on offset 58, so the reserved bytes below realign the float
+// block and aligned(4) pins the struct itself. openbms_fuelgauge.c holds this
+// with static assertions; adding a field above soc_grid without adjusting the
+// padding will fail the build rather than fault on hardware.
+typedef struct __attribute__((packed, aligned(4)))
 {
     // -------------------------------------------------------------------------
     // Fuel gauge registers
@@ -144,6 +152,8 @@ typedef struct __attribute__((packed))
     uint16_t    cell_remaining_capacity[7];               // per-cell remaining capacity in mAh
     uint16_t    cell_self_discharge[7];                   // per-cell self-discharge rate in mAh/month
     uint16_t    cell_qmax[7];                             // per-cell learned maximum capacity in mAh
+
+    uint8_t     reserved[2];                              // padding — keeps the float block below 4-byte aligned
 
     float       soc_grid[20];                             // SOC setpoints in %
     float       ocv_dis[20];                              // OCV discharge curve in V

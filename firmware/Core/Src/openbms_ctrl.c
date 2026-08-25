@@ -17,6 +17,7 @@
 
 #include "openbms_ctrl.h"
 #include "openbms_periph.h"
+#include "openbms_fuelgauge.h"
 
 static Control_Data_t   control_data        = {0};
 static bool             protection_trigger  = false;
@@ -274,6 +275,7 @@ void Ctrl_Init(void)
 {
   Ctrl_SetDefaults();
   Periph_Init();
+  FuelGauge_Init();
 }
 void Ctrl_Run(void)
 {
@@ -284,6 +286,15 @@ void Ctrl_Run(void)
   }
 
   Periph_Run();
+
+  // Run the SOC estimator in normal mode only. It rate-limits itself to
+  // FG_UPDATE_PERIOD_MS internally, and measures its own elapsed time, so a
+  // spell in config or learning mode is skipped rather than integrated over.
+  if((control_data.main_control & BD_MAIN_CTR_MODE_MASK) == BD_MAIN_CTR_MODE_NORMAL)
+  {
+    FuelGauge_Run();
+  }
+
   Time_Update();
 }
 void Ctrl_GetData(Control_Data_t *data)

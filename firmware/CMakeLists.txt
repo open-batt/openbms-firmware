@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/openbms_ctrl.c
     Core/Src/openbms_comm.c
     Core/Src/openbms_periph.c
+    Core/Src/openbms_fuelgauge.c
 )   
 
 # Add include paths
