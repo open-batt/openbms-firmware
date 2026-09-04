@@ -22,9 +22,9 @@ Learn more at the [NLnet project page](https://nlnet.nl/project/OpenBMS).
 | Module | Status |
 |--------|--------|
 | Communication Protocol Define | ✅ Done |
-| Fuel Gauge Algorithms | 🔜 Planned |
-| Implementation on STM32 | ❌ Not started |
-| Test & Bug Fix | ❌ Not started |
+| Fuel Gauge Algorithms | ✅ Done |
+| Implementation on STM32 | 🚧 In progress |
+| Test & Bug Fix | 🚧 In progress |
 
 ## Prerequisites
 - Install STM32CubeIDE for VS Code extension
@@ -32,6 +32,13 @@ Learn more at the [NLnet project page](https://nlnet.nl/project/OpenBMS).
 
 ## 📚 Documentation
 
+- **[how-to-use.md](how-to-use.md)** — end-to-end walkthrough: first-time setup, flashing, running HPPC tests, and turning the data into a working SOC estimate.
+- **[battery-model.md](battery-model.md)** — 2-RC equivalent circuit battery model, HPPC parameter extraction, and SOC estimation via an Extended Kalman Filter, with a worked 7-cell hardware example.
 - **[communication-protocol.md](communication-protocol.md)** — full wire protocol. The OpenBMS binary protocol over UART is implemented; I²C and CAN 2.0 are planned (draft frame formats included).
-- **[battery-model.md](battery-model.md)** — 2-RC equivalent circuit battery model, HPPC parameter extraction, and SOC estimation via an Extended Kalman Filter.
 - **[python-script.md](python-script.md)** — reference for the host-side scripts in `python_scripts/` (flashing firmware, running hardware tests, analyzing logs).
+
+## 🔗 Connected Projects
+
+- **[openbms-hardware](https://github.com/open-batt/openbms-hardware)** — the PCB and hardware design this firmware runs on.
+- **[openbms-test-bench-hardware](https://github.com/open-batt/openbms-test-bench-hardware)** — the test bench hardware used for HPPC characterization and validation.
+- **[openbms-studio](https://github.com/open-batt/openbms-studio)** — the desktop app for configuring and monitoring the board (in progress).
