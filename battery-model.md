@@ -214,18 +214,110 @@ these checks is scaled back or, at rest, blocked from touching SOC
 entirely — V_RC1 and V_RC2 are still free to absorb it, since a relaxation 
 mismatch is exactly what they're there to represent.
 
-### Example of SOC Estimation
 
-Each run below replays a real log through the model twice — open loop (pure 
-prediction, no correction) and with the Kalman filter — and plots both 
-against the cell's actual measured voltage, the two SOC traces, and the pack 
-current that drove them. The Kalman trace tracking the real voltage 
-noticeably more closely than the open-loop trace is the filter doing its job; 
-persistent daylight between them across a whole run is a sign the underlying 
-parameter table, not the filter, needs a second look.
+## Example: Estimating a 7-Cell Battery
+
+Here a 7-cell Li-Ion 2000 mAh battery pack is being estimated, with a 10k NTC 
+resistor built inside and an XT60 connector.
+
+<img src="images/battery.jpg" width="80%"/>
+
+### Setup
+
+<img src="images/setup.jpg" width="80%"/>
+
+Battery charging was ran with 2 A, and discharging was ran also with 2 A by 
+enabling two of the test bench's 25 Ω resistors in parallel. `battery_cycler.py` 
+was ran to perform the charging and discharging (HPPC modes), then 
+`hppc_pipeline.py` was ran on the resulting logs to extract the per-cell 
+parameters — once for the charge log, once for the discharge log.
+
+### Estimated Battery Parameters (all cells)
+
+#### R0 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_R0_charge.png" width="80%"/>
+
+#### R0 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_R0_discharge.png" width="80%"/>
+
+#### R1 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_R1_charge.png" width="80%"/>
+
+#### R1 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_R1_discharge.png" width="80%"/>
+
+#### R2 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_R2_charge.png" width="80%"/>
+
+#### R2 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_R2_discharge.png" width="80%"/>
+
+#### τ1 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_tau1_charge.png" width="80%"/>
+
+#### τ1 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_tau1_discharge.png" width="80%"/>
+
+#### τ2 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_tau2_charge.png" width="80%"/>
+
+#### τ2 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_tau2_discharge.png" width="80%"/>
+
+#### OCV vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_OCV_charge.png" width="80%"/>
+
+#### OCV vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_OCV_discharge.png" width="80%"/>
+
+### Estimated Capacity per Cell
+
+Capacity is taken over the 2.5 V-4.2 V OCV range, from the same `hppc_pipeline.py` 
+run as the parameters above:
+
+| Cell | Charge Capacity 2.5V-4.2V [mAh] | Discharge Capacity 2.5V-4.2V [mAh] |
+|---|---|---|
+| 1 | 2113.1 | 1999.4 |
+| 2 | 2047.0 | 2003.8 |
+| 3 | 2033.4 | 1994.4 |
+| 4 | 2031.9 | 1995.9 |
+| 5 | 2033.3 | 1998.0 |
+| 6 | 2012.1 | 2000.9 |
+| 7 | 1973.3 | 2000.5 |
+
+### Example of SOC Estimation (Kalman filter)
+
+This was done using `soc_estimator.py`. Each run below replays a real log 
+through the model twice — open loop (pure prediction, no correction) and with 
+the Kalman filter — and plots both against the cell's actual measured voltage, 
+the two SOC traces, and the pack current that drove them. The Kalman trace 
+tracking the real voltage noticeably more closely than the open-loop trace is 
+the filter doing its job; persistent daylight between them across a whole run 
+is a sign the underlying parameter table, not the filter, needs a second look.
 
 #### SOC estimation - charging:
 <img src="images/soc_estimator_charge.png" width="80%"/>
 
 #### SOC estimation - discharging:
 <img src="images/soc_estimator_discharge.png" width="80%"/>
+
+### Conclusion
+
+The estimation looks correct overall. R0 and OCV both follow the shape expected from 
+a 2-RC Li-ion model, and all 7 cells track each other tightly on both, which shows 
+the pack is reasonably balanced. Discharge capacity also lands close to the rated 
+2000 mAh across all cells.
+
+Two smaller things stand out: Cell 6's discharge τ2 spikes above 95% SOC while every 
+other cell drops, which looks like a fitting artifact rather than real cell 
+behaviour. And Cell 1's charge OCV sits a bit below the other six, which pulls its 
+charge capacity estimate up to 2113 mAh. In general, charge capacities spread more 
+across cells (7%) than discharge capacities do (0.5%), so the discharge numbers are 
+the more reliable of the two for now.
+
+The Kalman-filtered SOC estimate also holds up well: in both the charge and 
+discharge runs above, the Kalman-corrected voltage tracks the real measured voltage 
+closely, while the open-loop estimate drifts away over time (on the charge run it 
+undershoots and only reaches ~97% SOC by the end, versus 100% for the real pack and 
+the Kalman estimate). That confirms the filter is correcting properly with these 
+parameter tables.

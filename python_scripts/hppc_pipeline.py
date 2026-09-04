@@ -26,7 +26,10 @@ running one direction does not remove the other direction's existing results:
     hppc_soc_table_all_cells_{charge|discharge}.csv   ONE file, one row per SOC
         checkpoint (ascending 2-100%), with OCV / R0 / R1 / R2 / tau1 / tau2 /
         capacity as a repeated column group per cell (Cell1_..., Cell2_..., ...)
-    cell{N}_diagnostics_{charge|discharge}.png   capacity/OCV-SOC/impedance plots
+    cell{N}_diagnostics_{charge|discharge}.png   capacity/OCV-SOC/impedance plots, one cell at a time
+    all_cells_{R0,R1,R2,tau1,tau2,OCV}_{charge|discharge}.png   six diagrams, each one
+        parameter vs. SOC with every cell overlaid on the same axes -- lets you spot
+        cell-to-cell spread (a weak cell, a mismatched R0, ...) at a glance
 
 No log file is written. Every sanity-check finding prints directly to the console,
 tagged and colored by severity:
@@ -754,6 +757,37 @@ def make_plots(cell_idx, curve, diag, out_dir, direction_label):
     plt.close(fig)
 
 
+def make_all_cells_plots(tables, out_dir, direction_label):
+    """One diagram per parameter -- R0, R1, R2, tau1, tau2, OCV -- with all
+    cells overlaid against the shared SOC grid. Lets you spot cell-to-cell
+    spread (a weak cell, a mismatched R0, ...) at a glance instead of paging
+    through each cell's own cell{N}_diagnostics_{direction}.png one at a time.
+    `tables` is the list of per-cell resampled tables built in main() (each
+    already on the same fixed SOC grid, so the overlay lines up point-for-point)."""
+    tag = f" ({direction_label})"
+    cmap = plt.get_cmap("tab10")
+    colors = [cmap(i % 10) for i in range(len(tables))]
+
+    def _plot_one(column, scale, ylabel, title, fname):
+        fig, ax = plt.subplots(figsize=(8, 5.5))
+        for cell_idx, table in enumerate(tables, start=1):
+            ax.plot(table["SOC_pct"], table[column] * scale, "o-", lw=1.3, ms=4,
+                    color=colors[cell_idx - 1], label=f"Cell {cell_idx}")
+        ax.set_xlabel("SOC [%]"); ax.set_ylabel(ylabel)
+        ax.set_title(title + tag)
+        ax.legend(ncol=2, fontsize=9); ax.grid(True)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, fname), dpi=140)
+        plt.close(fig)
+
+    _plot_one("R0_ohm", 1000.0, "R0 [mOhm]", "R0 vs SOC - all cells", f"all_cells_R0_{direction_label}.png")
+    _plot_one("R1_ohm", 1000.0, "R1 [mOhm]", "R1 vs SOC - all cells", f"all_cells_R1_{direction_label}.png")
+    _plot_one("R2_ohm", 1000.0, "R2 [mOhm]", "R2 vs SOC - all cells", f"all_cells_R2_{direction_label}.png")
+    _plot_one("tau1_s", 1.0, "tau1 [s]", "tau1 vs SOC - all cells", f"all_cells_tau1_{direction_label}.png")
+    _plot_one("tau2_s", 1.0, "tau2 [s]", "tau2 vs SOC - all cells", f"all_cells_tau2_{direction_label}.png")
+    _plot_one("OCV_V", 1.0, "OCV [V]", "OCV vs SOC - all cells", f"all_cells_OCV_{direction_label}.png")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -815,6 +849,9 @@ def main(paths, direction, out_dir=None):
             print(f"  rest-fit RMSE mean/max {summary['mean_rest_fit_rmse_mV']:.2f}/"
                   f"{summary['max_rest_fit_rmse_mV']:.2f} mV\n")
 
+        if MAKE_PLOTS:
+            make_all_cells_plots(tables, out_dir, label)
+
         # ---- the one combined deliverable ----
         combined = build_combined_wide_table(np.array(TARGET_SOC_PCT, dtype=float), tables, summaries)
         combined_path = os.path.join(out_dir, f"hppc_soc_table_all_cells_{label}.csv")
@@ -869,7 +906,8 @@ if __name__ == "__main__":
                               "cellN_cycle_diagnostics.csv, summary.csv, cell_capacities.csv)")
     parser.add_argument("--curves", action="store_true",
                          help="also write cellN_ocv_soc_curve.csv (fine-resolution OCV-SOC curve)")
-    parser.add_argument("--no-plots", action="store_true", help="skip the cellN_diagnostics.png plots")
+    parser.add_argument("--no-plots", action="store_true",
+                         help="skip the cellN_diagnostics.png plots and the all_cells_*.png overlay plots")
     args = parser.parse_args()
 
     if args.detailed:
