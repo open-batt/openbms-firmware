@@ -16,478 +16,296 @@
   */
 
 #include "openbms_ctrl.h"
-#include "openbms_comm.h"
-#include "stm32l4xx_hal_gpio.h"
+#include "openbms_periph.h"
+#include "openbms_fuelgauge.h"
 
-ADC_HandleTypeDef   *internal_adc    = &hadc1;
-CAN_HandleTypeDef   *host_can        = &hcan1;
-CRC_HandleTypeDef   *hw_crc          = &hcrc;
-I2C_HandleTypeDef   *eeprom_i2c      = &hi2c1;
-SMBUS_HandleTypeDef *host_smbus      = &hsmbus2;
-SPI_HandleTypeDef   *adc_spi         = &hspi1;
+static Control_Data_t   control_data        = {0};
+static bool             protection_trigger  = false;
+static uint8_t          cell_number         = CELL_NUMBER_DEFAULT;
 
-uint64_t                OpenBMS_status   = 0;
-OpenBMS_Data_t          OpenBMS_data     = {0};
-OpenBMS_Config_t        OpenBMS_config   = {0};
-OpenBMS_Ctrl_t          OpenBMS_ctrl     = {0};
-
-static void HandleError(OpenBMS_Status_t error)
+static void Timer_Set(uint32_t *timer)
 {
-  OpenBMS_status |= (1ULL << error);
+  *timer = HAL_GetTick();
 }
-static void EEPROM_Init(void)
+static bool Timer_Expired(uint32_t *timer, uint32_t timeout_ms)
 {
-  uint8_t data[2];
-
-  // Read first 2 bytes of EEPROM identification page to verify communication
-  if(HAL_I2C_Master_Receive(eeprom_i2c, EEPROM_I2C_ADDRESS | 0x01, data, 2, EEPROM_I2C_ID_TIMEOUT) != HAL_OK)
+  uint32_t current_time = HAL_GetTick();
+  if((current_time - *timer) >= timeout_ms)
   {
-    HandleError(OPENBMS_EEPROM_ID_READ_FAIL);
-    return;
+    return true;
   }
-
-  // Check if the EEPROM returns the expected identification bytes
-  if(data[0] != 0x20 || data[1] != 0xE0)
+  else 
   {
-    HandleError(OPENBMS_EEPROM_ID_VAL_FAIL);
-    return;
+    return false;
   }
 }
-static void EEPROM_Read(void)
+static void Time_Update(void)
 {
-  uint32_t crc_stored   = 0;
-  uint32_t crc_calc     = 0;
-  uint8_t  data[32];
-  uint16_t total_bytes  = sizeof(OpenBMS_Config_t);
-  uint16_t bytes_read   = 0;
-  uint8_t  *dest        = (uint8_t *)&OpenBMS_config;
-  uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);  // Last 4 bytes of EEPROM
+  static uint32_t tick_prev = 0;
+  static uint32_t time_ms   = 0;
 
-  // Read struct starting at address 0x0000
-  while(bytes_read < total_bytes)
-  {
-    uint16_t chunk_size = total_bytes - bytes_read;
-    if(chunk_size > 32)
-    {
-      chunk_size = 32;
-    }
+  uint32_t tick_now  = HAL_GetTick();
+  uint32_t tick_diff = tick_now - tick_prev;   // correct even on rollover
+  time_ms           += tick_diff;
+  tick_prev          = tick_now;
 
-    if(HAL_I2C_Mem_Read(eeprom_i2c,
-                        EEPROM_I2C_ADDRESS,
-                        bytes_read,
-                        I2C_MEMADD_SIZE_16BIT,
-                        data,
-                        chunk_size,
-                        EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
-    {
-      HandleError(OPENBMS_EEPROM_READ_FAIL);
-      return;
-    }
-
-    memcpy(dest + bytes_read, data, chunk_size);
-    bytes_read += chunk_size;
-  }
-
-  // Read CRC from last 4 bytes of EEPROM
-  if(HAL_I2C_Mem_Read(eeprom_i2c,
-                      EEPROM_I2C_ADDRESS,
-                      crc_address,
-                      I2C_MEMADD_SIZE_16BIT,
-                      (uint8_t *)&crc_stored,
-                      sizeof(uint32_t),
-                      EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
-  {
-    HandleError(OPENBMS_EEPROM_READ_FAIL);
-    return;
-  }
-
-  // Calculate CRC32 over read struct and compare with stored CRC
-  crc_calc = HAL_CRC_Calculate(hw_crc, (uint32_t *)&OpenBMS_config, total_bytes / sizeof(uint32_t));
-
-  if(crc_calc != crc_stored)
-  {
-    HandleError(OPENBMS_EEPROM_CRC_FAIL);
-    return;
-  }
+  control_data.uptime_counter = time_ms;
 }
-static void EEPROM_Update(void)
+static bool Protection_OverTriggered(float *value, uint8_t value_count, float threshold, uint32_t timeout_ms, uint32_t *timer, bool *triggered)
 {
-  uint8_t  eeprom_buf[32];
-  uint8_t  struct_buf[32];
-  uint16_t total_bytes  = sizeof(OpenBMS_Config_t);
-  uint16_t bytes_done   = 0;
-  uint8_t  *src         = (uint8_t *)&OpenBMS_config;
-  uint32_t crc_calc     = 0;
-  uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);
+  uint32_t elapsed;
+  bool     threshold_exceeded = false;
 
-  while(bytes_done < total_bytes)
+  if(timeout_ms > 0)
   {
-    uint16_t chunk_size = total_bytes - bytes_done;
-    if(chunk_size > 32)
+    if(value_count == 1)
     {
-      chunk_size = 32;
+      if(*value > threshold) threshold_exceeded = true;
     }
-
-    // Read 32 bytes from EEPROM
-    if(HAL_I2C_Mem_Read(eeprom_i2c,
-                        EEPROM_I2C_ADDRESS,
-                        bytes_done,
-                        I2C_MEMADD_SIZE_16BIT,
-                        eeprom_buf,
-                        chunk_size,
-                        EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
+    else 
     {
-      HandleError(OPENBMS_EEPROM_READ_FAIL);
-      return;
-   }
-
-    // Copy corresponding chunk from struct
-    memcpy(struct_buf, src + bytes_done, chunk_size);
-
-    // Compare EEPROM chunk with struct chunk
-    if(memcmp(eeprom_buf, struct_buf, chunk_size) != 0)
-    {
-      // Data differs — write struct chunk to EEPROM
-      if(HAL_I2C_Mem_Write(eeprom_i2c,
-                            EEPROM_I2C_ADDRESS,
-                            bytes_done,
-                            I2C_MEMADD_SIZE_16BIT,
-                            struct_buf,
-                            chunk_size,
-                            EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
+      for(uint8_t i = 0; i < value_count; i++)
       {
-        HandleError(OPENBMS_EEPROM_WRITE_FAIL);
-        return;
+        if(value[i] > threshold) 
+        {
+          threshold_exceeded = true;
+          break;
+        }
       }
-
-      // M24C32 requires up to 5ms write cycle time — wait before next operation
-      HAL_Delay(5);
     }
 
-    bytes_done += chunk_size;
-  }
-
-  // Calculate new CRC32 over entire struct
-  crc_calc = HAL_CRC_Calculate(&hcrc, (uint32_t *)&OpenBMS_config, sizeof(OpenBMS_Config_t));
-
-  // Write CRC to last 4 bytes of EEPROM
-  if(HAL_I2C_Mem_Write(eeprom_i2c,
-                        EEPROM_I2C_ADDRESS,
-                        crc_address,
-                        I2C_MEMADD_SIZE_16BIT,
-                        (uint8_t *)&crc_calc,
-                        sizeof(uint32_t),
-                        EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
-  {
-    HandleError(OPENBMS_EEPROM_WRITE_FAIL);
-    return;
-  }
-
-  // Wait for final CRC write cycle to complete
-  HAL_Delay(5);
-}
-static bool ADS131M08_ReadReg(uint8_t reg, uint16_t *status, uint8_t* value)
-{
-  // According to datasheet, if word is set to 24 bits, then total SPI transacation has 30 bytes
-  // First 3 bytes are command, followed by 24 bytes of response, followed by 3 bytes of CRC
-  uint8_t tx_buff[30] = {0};
-  uint8_t rx_buff[30] = {0};
-  uint16_t cmd;
-  bool res = true;
-
-  cmd = 0xA000 | ((uint16_t)reg << 7);
-  tx_buff[0] = (cmd >> 8) & 0xFF;
-  tx_buff[1] =  cmd       & 0xFF;
-
-  // CS low
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
-
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
-  {
-    res = false;
-  }
-
-  // CS high
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
-
-  // Assign status word and value from response
-  *status = (rx_buff[0] << 8) | rx_buff[1];
-  memcpy(value, &rx_buff[2], 24);
-
-  return res;
-}
-static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
-{
-  uint8_t tx_buff[6] = {0};
-  uint8_t rx_buff[6] = {0};
-  uint16_t cmd;
-  bool res = true;
-
-  cmd = 0x6000 | ((uint16_t)reg << 7);
-  tx_buff[0] = (cmd >> 8) & 0xFF;
-  tx_buff[1] =  cmd       & 0xFF;
-  tx_buff[2] = 0x00;
-
-  tx_buff[3] = 0x00;
-  tx_buff[4] = (value >> 8) & 0xFF;
-  tx_buff[5] =  value       & 0xFF;
-
-    // CS low
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
-
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 6, ADS131M0_SPI_TIMEOUT) != HAL_OK)
-  {
-    res = false;
-  }
-
-  // CS high
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
-  return res;
-}
-static void ADS131M08_Init(void)
-{
-  uint8_t rx_data[30] = {0};
-  uint16_t status;
-
-  // Read ADC ID register (0x00) to verify communication
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // To read out register, actually one more transaction is needed after writing the command, 
-  // so read ID register again to get the value
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // Check if ID is good
-  if(rx_data[0] != 0x28)
-  {
-    HandleError(OPENBMS_ADS131M08_ID_FAIL);
-    return;
-  }
-
-  // Initilize CLOCK register, all channels enabled, SPS set to 125
-  if(!ADS131M08_WriteReg(0x03, 0xFF13))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // Initilize GAIN1 register, PGA3 = PGA2 = PGA1 = 4, PGA0 = 16
-  if(!ADS131M08_WriteReg(0x04, 0x2224))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // Initilize GAIN2 register, PGA7 = PGA6 = PGA5 = PGA4 = 4
-  if(!ADS131M08_WriteReg(0x05, 0x2222))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-}
-static void ADS131M08_Read(void)
-{
-  uint8_t rx_data[30] = {0};
-  uint16_t status;
-  int32_t raw_value;
-  float voltage_mv;
-
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
-  {
-    HandleError(OPENBMS_ADS131M08_READ_FAIL);
-  }
-
-  // Extract CH0 value, get battery current by dividing voltage by shunt resistance
-  raw_value = ((int32_t)rx_data[0] << 24) | (rx_data[1] << 16) | (rx_data[2] << 8);
-  raw_value >>= 8;
-  voltage_mv = (float)raw_value * (150.0f / 16777216.0f);
-  voltage_mv /= OpenBMS_config.shunt_resistance_mohms;
-  OpenBMS_data.pack_current = voltage_mv;
-
-  // Set update flags
-  OpenBMS_data.pack_current_updated   = true;
-
-  // Extract CH1 - CH7 values and get cell voltages
-  if(OpenBMS_ctrl.meas_pack_voltage_enable & OpenBMS_ctrl.meas_cell_voltage_enable)
-  {
-    // Only measure pack voltage from channel 7
-    raw_value = ((int32_t)rx_data[7*3+0] << 24) | (rx_data[7*3+1] << 16) | (rx_data[7*3+2] << 8);
-    raw_value >>= 8;
-    voltage_mv = (float)raw_value * (600.0f / 16777216.0f);
-    OpenBMS_data.pack_voltage = voltage_mv / OpenBMS_config.batt_voltage_resistance_factor;
-
-    // Set update flags
-    OpenBMS_data.pack_voltage_updated = true;
-  }
-  else if(OpenBMS_ctrl.meas_cell_voltage_enable)
-  {
-    // Measure all cell voltages
-    for(uint8_t i = 1; i <= 7; i++)
+    if(threshold_exceeded)
     {
-      raw_value = ((int32_t)rx_data[i*3+0] << 24) | (rx_data[i*3+1] << 16) | (rx_data[i*3+2] << 8);
-      raw_value >>= 8;
-      voltage_mv = (float)raw_value * (600.0f / 16777216.0f);
-      voltage_mv /= OpenBMS_config.cell_voltage_resistance_factor;
-      OpenBMS_data.cell_voltage[i-1] = voltage_mv;
-    }
-
-    // Set update flags
-    OpenBMS_data.cell_voltage_updated = true;
-  }
-}
-static float NTC_GetTemperature(float ntc_mv, float vdd_mv)
-{
-    if(ntc_mv >= vdd_mv || ntc_mv <= 0.0f)
-    {
-        return -273.15f;
-    }
-
-    float r_ntc = OpenBMS_config.ntc_r_fixed * (ntc_mv / (vdd_mv - ntc_mv));
-
-    if(r_ntc <= 0.0f)
-    {
-        return -273.15f;
-    }
-
-    float temp_k = 1.0f / ((1.0f / OpenBMS_config.ntc_t_nominal) + (1.0f / OpenBMS_config.ntc_beta) * logf(r_ntc / OpenBMS_config.ntc_r_nominal)
-    );
-
-    return temp_k - 273.15f;
-}
-static void STM32_ADC_Init(void)
-{
-  HAL_ADCEx_Calibration_Start(internal_adc, ADC_SINGLE_ENDED);
-  HAL_ADC_Start_IT(internal_adc);
-}
-static void STM32_ADC_Read(void)
-{
-  switch(ADC_CHANNEL_ID_MASK & internal_adc->Instance->SQR1)
-  {
-    case ADC_CHANNEL_16:         
-    {
-      uint32_t adc_ntc_raw     = HAL_ADC_GetValue(internal_adc); 
-
-      if(OpenBMS_data.vdd_mv_updated)
+      if(!(*triggered))
       {
-        // Calculate NTC voltage using actual VDD
-        float ntc_mv = ((float)adc_ntc_raw / 4095.0f) * OpenBMS_data.vdd_mv;
-
-        // Get temperature now
-        OpenBMS_data.temperature_ntc = NTC_GetTemperature(ntc_mv, OpenBMS_data.vdd_mv);
-
-        // Set flag
-        OpenBMS_data.temperature_ntc_updated = true;
+        *timer = HAL_GetTick();
+        *triggered = true;
       }
-
+      else 
+      {
+        elapsed = HAL_GetTick() - *timer;
+        if(elapsed > timeout_ms)
+        {
+          return true;
+        }
+      }
     }
-    break;
-
-    case ADC_CHANNEL_VREFINT:    
+    else 
     {
-      uint32_t adc_vrefint_raw = HAL_ADC_GetValue(internal_adc);
-
-      // ST factory calibrated VREFINT value measured at 3.0V, 30°C
-      // Stored in flash at fixed address
-      uint16_t vrefint_cal = *((uint16_t*)0x1FFF75AA);
-
-      // Calculate actual VDD
-      // vrefint_cal was measured at 3.0V so multiply by 3.0
-      OpenBMS_data.vdd_mv = (3000.0f * (float)vrefint_cal) / (float)adc_vrefint_raw;
-
-      // Set flag true
-      OpenBMS_data.vdd_mv_updated = true;
+      *triggered = false;
     }
-    break;
+  }
 
-    case ADC_CHANNEL_TEMPSENSOR: 
+  return false;
+}
+static bool Protection_UnderTriggered(float *value, uint8_t value_count, float threshold, uint32_t timeout_ms, uint32_t *timer, bool *triggered)
+{
+  uint32_t elapsed;
+  bool     threshold_exceeded = false;
+
+  if(timeout_ms > 0)
+  {
+    if(value_count == 1)
     {
-      uint32_t adc_temp_raw = HAL_ADC_GetValue(internal_adc); 
-
-      // Calculate STM32 die temperature using actual VDD
-      // ST factory cal values
-      uint16_t ts_cal1 = *((uint16_t*)0x1FFF75A8);  // TS_CAL1 at 30°C, 3.0V
-      uint16_t ts_cal2 = *((uint16_t*)0x1FFF75CA);  // TS_CAL2 at 130°C, 3.0V
-      OpenBMS_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1) * ((float)adc_temp_raw - (float)ts_cal1) + 30.0f;
-
-      // Set flag true
-      OpenBMS_data.temperature_stm32_updated = true;
+      if(*value < threshold) threshold_exceeded = true;
     }
-    break;
+    else 
+    {
+      for(uint8_t i = 0; i < value_count; i++)
+      {
+        if(value[i] < threshold) 
+        {
+          threshold_exceeded = true;
+          break;
+        }
+      }
+    }
+
+    if(threshold_exceeded)
+    {
+      if(!(*triggered))
+      {
+        *timer = HAL_GetTick();
+        *triggered = true;
+      }
+      else 
+      {
+        elapsed = HAL_GetTick() - *timer;
+        if(elapsed > timeout_ms)
+        {
+          return true;
+        }
+      }
+    }
+    else 
+    {
+      *triggered = false;
+    }
   }
+
+  return false;
 }
-static void GPIO_Ctrl(void)
+static void Protection_Check(void)
 {
-  // Set main FET state
-  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.main_fet_enable);
+  // Check for overvoltage, undervoltage, overcurrent, and overtemperature conditions
+  // If any protection condition is met, take appropriate action (e.g., disable FETs)
 
-  // Set precharge/predischarge FET state
-  HAL_GPIO_WritePin(DRV_PRE_FET_EN_GPIO_Port, DRV_PRE_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.pre_fet_enable);
+  static uint32_t ovp_slow_timer        = 0;
+  static uint32_t ovp_fast_timer        = 0;
+  static uint32_t uvp_slow_timer        = 0;
+  static uint32_t uvp_fast_timer        = 0;
+  static uint32_t ocp_chg_timer         = 0;
+  static uint32_t ocp_dchg_slow_timer   = 0;
+  static uint32_t ocp_dchg_fast_timer   = 0;
+  static uint32_t otp_timer             = 0;
 
-  // Enable cell voltage measuring
-  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) OpenBMS_ctrl.meas_cell_voltage_enable);
+  static bool ovp_slow_triggered        = false;
+  static bool ovp_fast_triggered        = false;
+  static bool uvp_slow_triggered        = false;
+  static bool uvp_fast_triggered        = false;
+  static bool ocp_chg_triggered         = false;
+  static bool ocp_dchg_slow_triggered   = false;
+  static bool ocp_dchg_fast_triggered   = false;
+  static bool otp_triggered             = false;
 
-  // Enable pack voltage measuring
-  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) OpenBMS_ctrl.meas_pack_voltage_enable);
+  Peripheral_Data_t pd;
+  Periph_GetData(&pd);
 
-  // Set balancer
-  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[0]);
-  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[1]);
-  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[2]);
-  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[3]);
-  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[4]);
-  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[5]);
-  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[6]);
-  
-  // Set main power signal on to keep OpenBMS on
-  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) OpenBMS_ctrl.pwr_on);
-
-  // Read driver fault pin, inverse state
-  OpenBMS_ctrl.fet_driver_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GPIO_Port, DRV_FLT_Pin));
-
-  // Read driver gate fault pin, inverse state
-  OpenBMS_ctrl.fet_driver_gate_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GD_GPIO_Port, DRV_FLT_GD_Pin));
-
-  // Read wake up pin, active high
-  OpenBMS_ctrl.wake_up = (bool)HAL_GPIO_ReadPin(WAKE_UP_GPIO_Port, WAKE_UP_Pin);
-
-  // Read VCC power good pin
-  OpenBMS_ctrl.vcc_power_good = (bool)HAL_GPIO_ReadPin(PWR_PG_GPIO_Port, PWR_PG_Pin);
-
-}
-void OpenBMS_Ctrl_Init(void)
-{
-  OpenBMS_Comm_Init();
-  //EEPROM_Init();
-  //EEPROM_Read();
-
-  //ADS131M08_Init();
-
-  //STM32_ADC_Init();
-}
-void OpenBMS_Ctrl_Run(void)
-{
-  //GPIO_Ctrl();
-  OpenBMS_Comm_Run();
-}
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-  if (GPIO_Pin == ADC_DRDY_Pin)
+  // Voltage protection enabled
+  if(control_data.configuration & BD_CONFIG_VOLT_PROT)
   {
-    ADS131M08_Read();
+    protection_trigger |= Protection_OverTriggered(pd.cell_voltage_filtered, cell_number, control_data.ovp_slow_threshold_mv, 
+                              control_data.ovp_slow_time_ms, &ovp_slow_timer, 
+                              &ovp_slow_triggered);
+
+    protection_trigger |= Protection_OverTriggered(pd.cell_voltage_filtered, cell_number, control_data.ovp_fast_threshold_mv, 
+                              control_data.ovp_fast_time_ms, &ovp_fast_timer, 
+                              &ovp_fast_triggered);
+
+    protection_trigger |= Protection_UnderTriggered(pd.cell_voltage_filtered, cell_number, control_data.uvp_slow_threshold_mv, 
+                              control_data.uvp_slow_time_ms, &uvp_slow_timer, 
+                              &uvp_slow_triggered);
+
+    protection_trigger |= Protection_UnderTriggered(pd.cell_voltage_filtered, cell_number, control_data.uvp_fast_threshold_mv, 
+                              control_data.uvp_fast_time_ms, &uvp_fast_timer, 
+                              &uvp_fast_triggered);
+                              
+  }
+
+  // Current protection enabled
+  if(control_data.configuration & BD_CONFIG_CURR_PROT)
+  {
+    float c = pd.pack_current_filtered;
+
+    protection_trigger |= Protection_OverTriggered(&c, 1, control_data.ocp_charge_threshold_ma, 
+                              control_data.ocp_charge_time_ms, &ocp_chg_timer, 
+                              &ocp_chg_triggered);
+
+    protection_trigger |= Protection_OverTriggered(&c, 1, control_data.ocp_discharge_slow_threshold_ma, 
+                              control_data.ocp_discharge_slow_time_ms, &ocp_dchg_slow_timer, 
+                              &ocp_dchg_slow_triggered);
+
+    protection_trigger |= Protection_OverTriggered(&c, 1, control_data.ocp_discharge_fast_threshold_ma, 
+                              control_data.ocp_discharge_fast_time_ms, &ocp_dchg_fast_timer, 
+                              &ocp_dchg_fast_triggered);
+  }
+
+  // Temperature protection enabled
+  if(control_data.configuration & BD_CONFIG_TEMP_PROT)
+  {
+    float t = pd.temperature_package;
+
+    protection_trigger |= Protection_OverTriggered(&t, 1, control_data.otp_threshold_c, 
+                              control_data.otp_time_ms, &otp_timer, 
+                              &otp_triggered);    
   }
 }
-// This callback fires automatically when conversion completes
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+static void Ctrl_SetDefaults(void)
 {
-  if(hadc->Instance == ADC1)
+  // Configure BMS
+  control_data.configuration           = 7 & BD_CONFIG_CELL_COUNT_MASK;   // 7-cell battery pack
+  control_data.configuration          |= BD_CONFIG_VOLT_PROT;             // Enable voltage protection
+  control_data.configuration          |= BD_CONFIG_CURR_PROT;             // Enable current protection
+  control_data.configuration          |= BD_CONFIG_TEMP_PROT;             // Enable temp protection
+
+  // Configure mode
+  control_data.main_control            = (BD_MAIN_CTR_MODE_NORMAL << BD_MAIN_CTR_MODE_SHIFT) & BD_MAIN_CTR_MODE_MASK;
+
+  // Configure cell data
+  control_data.cell_capacity           = 2000;     // 2.0Ah
+  control_data.voltage_cell_max        = 4200;     // 4.2V
+  control_data.voltage_cell_min        = 2500;     // 2.5V
+  control_data.charging_term_current   = 100;      // 0.1A
+
+  // Set protection thresholds
+  control_data.ovp_slow_threshold_mv   = 4220;    // 4.22V
+  control_data.ovp_slow_time_ms        = 20000;   // 20s
+
+  control_data.ovp_fast_threshold_mv   = 4300;    // 4.30V
+  control_data.ovp_fast_time_ms        = 500;     // 0.5s
+
+  control_data.uvp_slow_threshold_mv   = 2700;    // 2.7V
+  control_data.uvp_slow_time_ms        = 20000;   // 20s
+
+  control_data.uvp_fast_threshold_mv   = 2500;    // 2.5V
+  control_data.uvp_fast_time_ms        = 500;     // 0.5s
+
+  control_data.ocp_charge_threshold_ma          = 4000;  // 4A
+  control_data.ocp_charge_time_ms               = 10000; // 10s
+
+  control_data.ocp_discharge_slow_threshold_ma  = 15000; // 15A
+  control_data.ocp_discharge_slow_time_ms       = 10000; // 10s
+
+  control_data.ocp_discharge_fast_threshold_ma  = 18000; // 18A
+  control_data.ocp_discharge_fast_time_ms       = 1000;  // 1s
+
+  control_data.otp_threshold_c                  = 60;    // 60 degrees C
+  control_data.otp_time_ms                      = 60000; // 1 minute
+
+  // Set system information
+  strncpy(control_data.firmware_version,        "1.0.0",         32);
+  strncpy(control_data.hardware_version,        "RevA",          32);
+  strncpy(control_data.manufacturer_name,       "OpenBatt Team", 32);
+  strncpy(control_data.device_name,             "OpenBMS",       32);
+  strncpy(control_data.device_chemistry,        "Li-Ion",        32);
+  strncpy(control_data.manufacturer_data,       "Year 2026",     32);
+
+}
+void Ctrl_Init(void)
+{
+  Ctrl_SetDefaults();
+  Periph_Init();
+  FuelGauge_Init();
+}
+void Ctrl_Run(void)
+{
+  // Check if in learning mode
+  if(control_data.main_control & BD_MAIN_CTR_MODE_MASK & BD_MAIN_CTR_MODE_LEARNING)
   {
-    STM32_ADC_Read();
+
   }
+
+  Periph_Run();
+
+  // Run the SOC estimator in normal mode only. It rate-limits itself to
+  // FG_UPDATE_PERIOD_MS internally, and measures its own elapsed time, so a
+  // spell in config or learning mode is skipped rather than integrated over.
+  if((control_data.main_control & BD_MAIN_CTR_MODE_MASK) == BD_MAIN_CTR_MODE_NORMAL)
+  {
+    FuelGauge_Run();
+  }
+
+  Time_Update();
+}
+void Ctrl_GetData(Control_Data_t *data)
+{
+  memcpy(data, &control_data, sizeof(Control_Data_t));
+}
+void Ctrl_SetMode(uint16_t mode)
+{
+  control_data.main_control = (control_data.main_control & ~BD_MAIN_CTR_MODE_MASK) | (mode & BD_MAIN_CTR_MODE_MASK);
+}
+void Periph_50msTimer(void)
+{
+  Protection_Check();
 }

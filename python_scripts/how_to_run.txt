@@ -1,0 +1,3 @@
+python hppc_pipeline.py C logs\c_hppc_full.csv
+python hppc_pipeline.py D logs\d_hppc_full.csv
+python kalman_soc_estimator.py --charge-table results\hppc_soc_table_all_cells_charge.csv --discharge-table results\hppc_soc_table_all_cells_discharge.csv

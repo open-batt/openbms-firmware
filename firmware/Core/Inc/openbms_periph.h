@@ -1,0 +1,44 @@
+#ifndef OPENBMS_PERIPH_H
+#define OPENBMS_PERIPH_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "main.h"
+
+#define EEPROM_I2C_ADDRESS          0xA0
+#define EEPROM_SIZE                 4096
+#define EEPROM_I2C_ID_TIMEOUT       50
+#define EEPROM_I2C_READ_TIMEOUT     10
+#define EEPROM_I2C_WRITE_TIMEOUT    20
+
+#define ADS131M0_SPI_TIMEOUT        100
+
+typedef enum 
+{
+    OPENBMS_EEPROM_ID_READ_FAIL,
+    OPENBMS_EEPROM_ID_VAL_FAIL,
+    OPENBMS_EEPROM_READ_FAIL,
+    OPENBMS_EEPROM_WRITE_FAIL,
+    OPENBMS_EEPROM_CRC_FAIL,
+
+    OPENBMS_ADS131M08_READ_FAIL,
+    OPENBMS_ADS131M08_INIT_FAIL,
+    OPENBMS_ADS131M08_ID_FAIL,
+    
+} OpenBMS_Status_t;
+
+void Periph_Init(void);
+void Periph_Run(void);
+void Periph_SetFET(bool state);
+void Periph_SetPreFET(bool state);
+
+void Periph_GetData(Peripheral_Data_t *pd);
+void Periph_50msTimer(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
