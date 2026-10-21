@@ -1,0 +1,58 @@
+{
+    "cell_count": 7,
+    "use_i2c": false,
+    "use_can": false,
+    "use_uart": false,
+    "volt_protection": true,
+    "current_protection": true,
+    "temp_protection": true,
+
+    "cell_capacity": 2000,
+    "voltage_cell_max": 4200,
+    "voltage_cell_min": 2800,
+    "charging_term_current": 100,
+
+    "uvp_slow_threshold_mv": 2700,
+    "uvp_slow_time_ms": 10000,
+    "uvp_fast_threshold_mv": 2500,
+    "uvp_fast_time_ms": 1000,
+    "ovp_slow_threshold_mv": 4250,
+    "ovp_slow_time_ms": 10000,
+    "ovp_fast_threshold_mv": 4300,
+    "ovp_fast_time_ms": 1000,
+
+    "ocp_charge_threshold_ma": 2500,
+    "ocp_charge_time_ms": 5000,
+    "ocp_discharge_slow_threshold_ma": 15000,
+    "ocp_discharge_slow_time_ms": 2000,
+    "ocp_discharge_fast_threshold_ma": 20000,
+    "ocp_discharge_fast_time_ms": 100,
+
+    "otp_threshold_c": 60,
+    "otp_time_ms": 5000,
+
+    "charge_stop_cell_mv": 4200,
+    "charge_monitor_cell_mv": 4100,
+    "utp_threshold_c": 0,
+    "utp_time_ms": 5000,
+    "otp_charge_threshold_c": 45,
+    "ocv_v_lo_mv": 2800,
+    "ocv_v_hi_mv": 4200,
+
+    "current_sensor_gain": 1.0,
+    "voltage_gain": [1.0148891, 1.0103785, 0.9905100, 1.0496543, 0.9842869, 1.0276679, 0.9973599],
+    "ntc_beta": 3950.0,
+    "ntc_r_nominal": 10000.0,
+    "ntc_r_fixed": 10000.0,
+    "ntc_t_nominal": 298.15,
+    "temperature_offset": 0.0,
+    "shunt_resistance_mohm": 2.0,
+    "current_bias_ma": 8.0,
+
+    "firmware_version": "1.0.0",
+    "hardware_version": "1.0",
+    "manufacturer_name": "OpenBatt Team",
+    "device_name": "OpenBMS",
+    "device_chemistry": "Li-Ion",
+    "manufacturer_data": "Year 2026"
+}

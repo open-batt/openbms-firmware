@@ -26,7 +26,8 @@
   *             residual is fed back through the local OCV slope dV_OCV/dSOC.
   *
   * Model parameters come from the fuel gauge registers (FuelGauge_Data_t),
-  * which hold the HPPC-derived lookup tables the Python pipeline produces.
+  * which hold the HPPC lookup tables. They are filled by the on-board HPPC
+  * extraction (openbms_hppc_extract.c) or written by the host.
   * See battery-model.md for the theory and python-script.md for the pipeline.
   *
   * Differences from the Python reference, all deliberate:
@@ -37,9 +38,8 @@
   *   - Outside the table range the lookups clamp to the end value instead of
   *     extrapolating, which keeps a below-2%-SOC reading from running off a
   *     steep extrapolated curve.
-  *   - One shared parameter table serves all cells, scaled per cell by
-  *     cell_q_nom_ah[] and cell_r0_scale[]; the Python pipeline keeps a full
-  *     table per cell. Measured cell-to-cell R0 spread is only ~0.4%.
+  *   - Every cell has its own tables and capacity (FuelGauge_Cell_t), like the
+  *     per-cell tables of the Python pipeline.
   *
   ******************************************************************************
   */
@@ -51,7 +51,6 @@
 #include <string.h>
 #include <stddef.h>
 
-#define FG_CELL_COUNT                   (CELL_NUMBER_DEFAULT)
 #define FG_TABLE_POINTS                 (20)
 
 // The lookups below take float pointers into FuelGauge_Data_t and dereference
@@ -65,8 +64,13 @@ _Static_assert(_Alignof(FuelGauge_Data_t) % 4 == 0,
                "FuelGauge_Data_t must be 4-byte aligned for float access");
 _Static_assert(offsetof(FuelGauge_Data_t, soc_grid) % 4 == 0,
                "soc_grid misaligned — adjust the reserved padding in openbms_data.h");
-_Static_assert(offsetof(FuelGauge_Data_t, cell_r0_scale) % 4 == 0,
-               "cell_r0_scale misaligned — a float member above it changed size");
+_Static_assert(offsetof(FuelGauge_Data_t, cell) % 4 == 0,
+               "cell misaligned — a float member above it changed size");
+_Static_assert(sizeof(FuelGauge_Cell_t) % 4 == 0,
+               "FuelGauge_Cell_t must be a multiple of 4 bytes so every cell stays aligned");
+// FuelGauge_SetData checks soc_grid up to cycle_count as one block of floats
+_Static_assert((offsetof(FuelGauge_Data_t, cycle_count) - offsetof(FuelGauge_Data_t, soc_grid)) % sizeof(float) == 0,
+               "the float block from soc_grid to cycle_count must hold only floats");
 
 // -------------------------------------------------------------------------
 // Filter tuning — see soc_estimator.py, whose values these mirror
@@ -91,6 +95,7 @@ _Static_assert(offsetof(FuelGauge_Data_t, cell_r0_scale) % 4 == 0,
 
 #define FG_SOC_MIN                      (0.0f)
 #define FG_SOC_MAX                      (1.0f)
+#define FG_REMAINING_MAX_MAH            ((float)UINT16_MAX)    // cell_remaining_capacity is a 16-bit register
 
 // Initial covariance. battery-model.md notes P0 is script-side only with no
 // register of its own, so it lives here; the values match the p0_soc/p0_vrc1/
@@ -104,8 +109,8 @@ _Static_assert(offsetof(FuelGauge_Data_t, cell_r0_scale) % 4 == 0,
 #define FG_MIN_TAU_S                    (0.001f)
 #define FG_MIN_INNOVATION_COV           (1e-12f)
 
-// A gap longer than this means the estimator was not running — config mode,
-// a stall, or the first pass after boot. Integrating the current we happen to
+// A gap longer than this means the estimator was not running — an HPPC test,
+// waiting for the config, a stall, or the first pass after boot. Integrating the current we happen to
 // see now across the whole gap would inject a large bogus charge, so the step
 // is skipped and the timebase resynchronised instead.
 #define FG_MAX_DT_S                     (0.5f)
@@ -135,10 +140,12 @@ static uint32_t           fg_init_tick        = 0;
 static float              fg_prev_current_a   = 0.0f;
 static bool               fg_branch_charge    = true;
 static bool               fg_seeded           = false;
+static uint8_t            fg_cell_count       = 0;      // cells in use, from cfg.cell_count
 
 static void  FuelGauge_SetDefaults(void);
 static void  FuelGauge_Seed(const Peripheral_Data_t *pd, float current_a);
 static void  FuelGauge_UpdateOutputs(void);
+static bool  FuelGauge_AllFinite(const float *values, uint32_t count);
 static bool  FuelGauge_UpdateCell(uint8_t idx, float dt_s, float i_prev_a, float i_now_a,
                                   float v_meas_v, const FuelGauge_Branch_t *predict,
                                   const FuelGauge_Branch_t *measure, bool at_rest);
@@ -146,6 +153,17 @@ static bool  FuelGauge_UpdateCell(uint8_t idx, float dt_s, float i_prev_a, float
 // -------------------------------------------------------------------------
 // Table lookups
 // -------------------------------------------------------------------------
+static bool FuelGauge_AllFinite(const float *values, uint32_t count)
+{
+  for(uint32_t i = 0; i < count; i++)
+  {
+    if(!isfinite(values[i]))
+    {
+      return false;
+    }
+  }
+  return true;
+}
 static uint8_t FuelGauge_Segment(float soc_pct, float *frac)
 {
   // Returns the upper index of the SOC grid segment containing soc_pct, and
@@ -234,25 +252,27 @@ static bool FuelGauge_SelectBranch(float current_a, bool prev_charge)
 
   return prev_charge;
 }
-static void FuelGauge_GetBranch(bool charge, FuelGauge_Branch_t *branch)
+static void FuelGauge_GetBranch(bool charge, uint8_t cell, FuelGauge_Branch_t *branch)
 {
+  const FuelGauge_Cell_t *model = &fuelgauge_data.cell[cell];
+
   if(charge)
   {
-    branch->ocv  = fuelgauge_data.ocv_chg;
-    branch->r0   = fuelgauge_data.r0_chg;
-    branch->r1   = fuelgauge_data.r1_chg;
-    branch->r2   = fuelgauge_data.r2_chg;
-    branch->tau1 = fuelgauge_data.tau1_chg;
-    branch->tau2 = fuelgauge_data.tau2_chg;
+    branch->ocv  = model->ocv_chg;
+    branch->r0   = model->r0_chg;
+    branch->r1   = model->r1_chg;
+    branch->r2   = model->r2_chg;
+    branch->tau1 = model->tau1_chg;
+    branch->tau2 = model->tau2_chg;
   }
   else
   {
-    branch->ocv  = fuelgauge_data.ocv_dis;
-    branch->r0   = fuelgauge_data.r0_dis;
-    branch->r1   = fuelgauge_data.r1_dis;
-    branch->r2   = fuelgauge_data.r2_dis;
-    branch->tau1 = fuelgauge_data.tau1_dis;
-    branch->tau2 = fuelgauge_data.tau2_dis;
+    branch->ocv  = model->ocv_dis;
+    branch->r0   = model->r0_dis;
+    branch->r1   = model->r1_dis;
+    branch->r2   = model->r2_dis;
+    branch->tau1 = model->tau1_dis;
+    branch->tau2 = model->tau2_dis;
   }
 }
 
@@ -275,7 +295,7 @@ static bool FuelGauge_UpdateCell(uint8_t idx, float dt_s, float i_prev_a, float 
   float p12 = fuelgauge_data.cell_p[idx][4];
   float p22 = fuelgauge_data.cell_p[idx][5];
 
-  float capacity_ah = fuelgauge_data.cell_q_nom_ah[idx];
+  float capacity_ah = fuelgauge_data.cell[idx].capacity_ah;
   bool  gated       = false;
 
   if(capacity_ah < FG_MIN_CAPACITY_AH) capacity_ah = FG_MIN_CAPACITY_AH;
@@ -311,7 +331,7 @@ static bool FuelGauge_UpdateCell(uint8_t idx, float dt_s, float i_prev_a, float 
   p22 = a2 * a2 * p22 + fuelgauge_data.kf_q_rc2;
 
   // ---------------- measurement ----------------
-  float r0     = FuelGauge_Lookup(measure->r0, soc) * fuelgauge_data.cell_r0_scale[idx];
+  float r0     = FuelGauge_Lookup(measure->r0, soc);
   float v_pred = FuelGauge_Lookup(measure->ocv, soc) + i_now_a * r0 + vrc1 + vrc2;
   float h0     = FuelGauge_LookupSlope(measure->ocv, soc);
 
@@ -406,6 +426,37 @@ static bool FuelGauge_UpdateCell(uint8_t idx, float dt_s, float i_prev_a, float 
     p22 = n20 * mm20 + n21 * mm21 + n22 * mm22 + k2 * k2 * r_v;
   }
 
+  // A NaN or inf passes every clamp and would stay in the state for good, so the
+  // cell starts again from its OCV table. With a broken OCV table the cell reads 0.
+  float state[9] = { soc, vrc1, vrc2, p00, p01, p02, p11, p12, p22 };
+
+  if(!FuelGauge_AllFinite(state, 9U))
+  {
+    if(FuelGauge_AllFinite(measure->ocv, FG_TABLE_POINTS))
+    {
+      soc = FuelGauge_OcvToSoc(measure->ocv, v_meas_v);
+    }
+    else
+    {
+      soc = 0.0f;
+    }
+    if(!isfinite(soc))
+    {
+      soc = 0.0f;
+    }
+
+    vrc1 = 0.0f;
+    vrc2 = 0.0f;
+    p00  = FG_P0_SOC;
+    p01  = 0.0f;
+    p02  = 0.0f;
+    p11  = FG_P0_VRC;
+    p12  = 0.0f;
+    p22  = FG_P0_VRC;
+
+    fuelgauge_data.learning_status |= FG_STATUS_NAN_RESET;
+  }
+
   if(soc < FG_SOC_MIN) soc = FG_SOC_MIN;
   if(soc > FG_SOC_MAX) soc = FG_SOC_MAX;
 
@@ -433,11 +484,12 @@ static void FuelGauge_Seed(const Peripheral_Data_t *pd, float current_a)
   // IR drop corrupts the seed — that is exactly the error the filter is meant
   // to correct out over the following seconds.
   bool         charge = FuelGauge_SelectBranch(current_a, true);
-  const float *ocv    = charge ? fuelgauge_data.ocv_chg : fuelgauge_data.ocv_dis;
 
-  for(uint8_t i = 0; i < FG_CELL_COUNT; i++)
+  for(uint8_t i = 0; i < fg_cell_count; i++)
   {
-    fuelgauge_data.cell_soc_f[i] = FuelGauge_OcvToSoc(ocv, pd->cell_voltage_filtered[i] / 1000.0f);
+    const float *ocv = charge ? fuelgauge_data.cell[i].ocv_chg : fuelgauge_data.cell[i].ocv_dis;
+
+    fuelgauge_data.cell_soc_f[i] = FuelGauge_OcvToSoc(ocv, pd->cell_voltage[i] / 1000.0f);
     fuelgauge_data.cell_vrc1[i]  = 0.0f;
     fuelgauge_data.cell_vrc2[i]  = 0.0f;
 
@@ -460,8 +512,16 @@ static void FuelGauge_UpdateOutputs(void)
 {
   uint8_t min_soc = 100;
 
-  for(uint8_t i = 0; i < FG_CELL_COUNT; i++)
+  for(uint8_t i = 0; i < BD_CELL_COUNT_MAX; i++)
   {
+    // Cells not in use read 0 and are left out of the pack SOC
+    if(i >= fg_cell_count)
+    {
+      fuelgauge_data.cell_soc[i]                = 0;
+      fuelgauge_data.cell_remaining_capacity[i] = 0;
+      continue;
+    }
+
     float soc_pct = fuelgauge_data.cell_soc_f[i] * 100.0f;
 
     if(soc_pct <   0.0f) soc_pct =   0.0f;
@@ -471,8 +531,12 @@ static void FuelGauge_UpdateOutputs(void)
 
     if(fuelgauge_data.cell_soc[i] < min_soc) min_soc = fuelgauge_data.cell_soc[i];
 
-    fuelgauge_data.cell_remaining_capacity[i] =
-        (uint16_t)((soc_pct / 100.0f) * fuelgauge_data.cell_q_nom_ah[i] * 1000.0f + 0.5f);
+    // The register is 16 bits, a larger value would not fit the cast
+    float remaining_mah = (soc_pct / 100.0f) * fuelgauge_data.cell[i].capacity_ah * 1000.0f + 0.5f;
+    if(remaining_mah > FG_REMAINING_MAX_MAH) remaining_mah = FG_REMAINING_MAX_MAH;
+    if(remaining_mah <     0.0f) remaining_mah =     0.0f;
+
+    fuelgauge_data.cell_remaining_capacity[i] = (uint16_t)remaining_mah;
   }
 
   // The weakest cell governs the pack — the conservative convention, since
@@ -491,30 +555,35 @@ void FuelGauge_Init(void)
 {
   FuelGauge_SetDefaults();
 
-  fg_last_tick      = HAL_GetTick();
+  fg_last_tick      = BD_GET_TICK();
   fg_init_tick      = fg_last_tick;
   fg_prev_current_a = 0.0f;
   fg_branch_charge  = true;
   fg_seeded         = false;
 }
-void FuelGauge_Run(void)
+void FuelGauge_Run(uint8_t cell_count)
 {
   Peripheral_Data_t  pd;
   FuelGauge_Branch_t branch_predict;
   FuelGauge_Branch_t branch_measure;
 
-  uint32_t now         = HAL_GetTick();
+  uint32_t now         = BD_GET_TICK();
   uint32_t elapsed_ms  = now - fg_last_tick;
-
-  if(elapsed_ms < FG_UPDATE_PERIOD_MS) return;
 
   fg_last_tick = now;
 
+  // A new cell count (config written by the host) starts the filter again from the cell voltages
+  if(cell_count != fg_cell_count)
+  {
+    fg_cell_count = cell_count;
+    fg_seeded     = false;
+  }
+
   Periph_GetData(&pd);
 
-  // pack_current_filtered is in mA and positive while charging, matching the
+  // pack_current is in mA and positive while charging, matching the
   // sign convention of the HPPC tables.
-  float i_now_a = pd.pack_current_filtered / 1000.0f;
+  float i_now_a = pd.pack_current / 1000.0f;
   float dt_s    = (float)elapsed_ms / 1000.0f;
 
   if(!fg_seeded)
@@ -548,13 +617,14 @@ void FuelGauge_Run(void)
                  (fabsf(i_now_a) < FG_CURRENT_DEADZONE_A);
   bool gated   = false;
 
-  FuelGauge_GetBranch(predict_charge, &branch_predict);
-  FuelGauge_GetBranch(measure_charge, &branch_measure);
-
-  for(uint8_t i = 0; i < FG_CELL_COUNT; i++)
+  for(uint8_t i = 0; i < fg_cell_count; i++)
   {
+    // Each cell is predicted and corrected with its own tables
+    FuelGauge_GetBranch(predict_charge, i, &branch_predict);
+    FuelGauge_GetBranch(measure_charge, i, &branch_measure);
+
     gated |= FuelGauge_UpdateCell(i, dt_s, fg_prev_current_a, i_now_a,
-                                  pd.cell_voltage_filtered[i] / 1000.0f,
+                                  pd.cell_voltage[i] / 1000.0f,
                                   &branch_predict, &branch_measure, at_rest);
   }
 
@@ -573,24 +643,80 @@ void FuelGauge_GetData(FuelGauge_Data_t *data)
 {
   memcpy(data, &fuelgauge_data, sizeof(FuelGauge_Data_t));
 }
-void FuelGauge_SetData(const FuelGauge_Data_t *data)
+bool FuelGauge_SetData(const FuelGauge_Data_t *data)
 {
+  // Every float of the model and the filter state (soc_grid up to cycle_count) has to be a
+  // real number, one NaN or inf would end up in the SOC
+  uint32_t count = (offsetof(FuelGauge_Data_t, cycle_count) - offsetof(FuelGauge_Data_t, soc_grid)) / sizeof(float);
+
+  if(!FuelGauge_AllFinite(data->soc_grid, count))
+  {
+    return false;
+  }
+
   memcpy(&fuelgauge_data, data, sizeof(FuelGauge_Data_t));
+  return true;
+}
+void FuelGauge_GetSocGrid(float *grid)
+{
+  memcpy(grid, fuelgauge_data.soc_grid, sizeof(fuelgauge_data.soc_grid));
+}
+void FuelGauge_SetCellTable(uint8_t cell, bool charge, const FuelGauge_Table_t *table)
+{
+  if(cell >= BD_CELL_COUNT_MAX)
+  {
+    return;
+  }
+
+  FuelGauge_Cell_t *c = &fuelgauge_data.cell[cell];
+
+  // A table with a NaN or inf is not taken
+  if(!FuelGauge_AllFinite(table->ocv,  FG_TABLE_POINTS) || !FuelGauge_AllFinite(table->r0,   FG_TABLE_POINTS) ||
+     !FuelGauge_AllFinite(table->r1,   FG_TABLE_POINTS) || !FuelGauge_AllFinite(table->tau1, FG_TABLE_POINTS) ||
+     !FuelGauge_AllFinite(table->r2,   FG_TABLE_POINTS) || !FuelGauge_AllFinite(table->tau2, FG_TABLE_POINTS))
+  {
+    return;
+  }
+
+  if(charge)
+  {
+    memcpy(c->ocv_chg,  table->ocv,  sizeof(c->ocv_chg));
+    memcpy(c->r0_chg,   table->r0,   sizeof(c->r0_chg));
+    memcpy(c->r1_chg,   table->r1,   sizeof(c->r1_chg));
+    memcpy(c->tau1_chg, table->tau1, sizeof(c->tau1_chg));
+    memcpy(c->r2_chg,   table->r2,   sizeof(c->r2_chg));
+    memcpy(c->tau2_chg, table->tau2, sizeof(c->tau2_chg));
+  }
+  else
+  {
+    memcpy(c->ocv_dis,  table->ocv,  sizeof(c->ocv_dis));
+    memcpy(c->r0_dis,   table->r0,   sizeof(c->r0_dis));
+    memcpy(c->r1_dis,   table->r1,   sizeof(c->r1_dis));
+    memcpy(c->tau1_dis, table->tau1, sizeof(c->tau1_dis));
+    memcpy(c->r2_dis,   table->r2,   sizeof(c->r2_dis));
+    memcpy(c->tau2_dis, table->tau2, sizeof(c->tau2_dis));
+  }
+}
+void FuelGauge_SetCellCapacity(uint8_t cell, float capacity_ah)
+{
+  if(cell >= BD_CELL_COUNT_MAX || !isfinite(capacity_ah))
+  {
+    return;
+  }
+  fuelgauge_data.cell[cell].capacity_ah = capacity_ah;
 }
 
 // -------------------------------------------------------------------------
 // Defaults
 //
-// Generated from the HPPC pipeline output in python_scripts/results/:
-// hppc_soc_table_all_cells_{charge,discharge}.csv and kalman_parameters.csv.
-// The 7 per-cell tables are averaged into the single shared table the
-// register map holds; per-cell deviation is carried by cell_q_nom_ah[] and
-// cell_r0_scale[]. A host can overwrite any of this over UART at runtime.
+// Values set at boot. The per-cell tables are not set here, they come from the
+// HPPC extraction or from the host. A host can overwrite any of this over UART
+// at runtime.
 // -------------------------------------------------------------------------
 static void FuelGauge_SetDefaults(void)
 {
   // -------------------------------------------------------------------------
-  // 0x86 — SOC grid (%)
+  // 0xA0 — SOC grid (%)
   //
   // Non-uniform on purpose: denser at both ends, where the OCV curve is
   // steepest and piecewise-linear interpolation costs the most accuracy.
@@ -604,140 +730,15 @@ static void FuelGauge_SetDefaults(void)
   memcpy(fuelgauge_data.soc_grid, soc_grid_vals, sizeof(soc_grid_vals));
 
   // -------------------------------------------------------------------------
-  // 0x87 — OCV discharge (V)
+  // Per-cell model (fuelgauge_data.cell[]: OCV, R0, R1, R2, tau1, tau2 for
+  // discharge and charge, and the capacity): no defaults here, the tables are
+  // zero until the HPPC extraction or the host writes them (0x9F selects the
+  // cell, 0xA1-0xAC the tables, 0xD4 the capacity).
   // -------------------------------------------------------------------------
-  static const float ocv_dis_vals[20] = {
-      3.4575f, 3.4686f, 3.4770f, 3.4870f, 3.5041f,
-      3.5262f, 3.5556f, 3.5885f, 3.6091f, 3.6246f,
-      3.6551f, 3.6970f, 3.7682f, 3.8705f, 3.9674f,
-      4.0203f, 4.0761f, 4.1349f, 4.1740f, 4.2068f
-  };
-  memcpy(fuelgauge_data.ocv_dis, ocv_dis_vals, sizeof(ocv_dis_vals));
 
   // -------------------------------------------------------------------------
-  // 0x88 — OCV charge (V)
-  // -------------------------------------------------------------------------
-  static const float ocv_chg_vals[20] = {
-      3.3798f, 3.4567f, 3.4731f, 3.4814f, 3.4909f,
-      3.5061f, 3.5354f, 3.5827f, 3.6096f, 3.6250f,
-      3.6528f, 3.6926f, 3.7686f, 3.8496f, 3.9456f,
-      3.9977f, 4.0529f, 4.1107f, 4.1497f, 4.2000f
-  };
-  memcpy(fuelgauge_data.ocv_chg, ocv_chg_vals, sizeof(ocv_chg_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x89 — R0 discharge (Ω)
-  // -------------------------------------------------------------------------
-  static const float r0_dis_vals[20] = {
-      0.023994f, 0.023192f, 0.022521f, 0.021976f, 0.021442f,
-      0.021031f, 0.020660f, 0.020315f, 0.020012f, 0.019739f,
-      0.019547f, 0.019609f, 0.019894f, 0.020147f, 0.020227f,
-      0.020339f, 0.020501f, 0.020602f, 0.020576f, 0.020576f
-  };
-  memcpy(fuelgauge_data.r0_dis, r0_dis_vals, sizeof(r0_dis_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x8A — R1 discharge (Ω)
-  // -------------------------------------------------------------------------
-  static const float r1_dis_vals[20] = {
-      0.017715f, 0.015254f, 0.012777f, 0.010933f, 0.010027f,
-      0.009823f, 0.009857f, 0.009926f, 0.009915f, 0.009904f,
-      0.009879f, 0.009788f, 0.009818f, 0.010382f, 0.011271f,
-      0.011418f, 0.010614f, 0.009461f, 0.008702f, 0.008702f
-  };
-  memcpy(fuelgauge_data.r1_dis, r1_dis_vals, sizeof(r1_dis_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x8B — tau1 discharge (s)
-  // -------------------------------------------------------------------------
-  static const float tau1_dis_vals[20] = {
-      13.162f, 12.901f, 12.676f, 12.867f, 13.646f,
-      14.528f, 15.448f, 16.115f, 16.375f, 16.575f,
-      16.426f, 15.289f, 13.780f, 13.560f, 14.673f,
-      15.008f, 14.148f, 13.091f, 12.476f, 12.476f
-  };
-  memcpy(fuelgauge_data.tau1_dis, tau1_dis_vals, sizeof(tau1_dis_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x8C — R2 discharge (Ω)
-  // -------------------------------------------------------------------------
-  static const float r2_dis_vals[20] = {
-      0.009273f, 0.007326f, 0.005910f, 0.005646f, 0.006740f,
-      0.008318f, 0.010173f, 0.011675f, 0.011731f, 0.010602f,
-      0.009018f, 0.008587f, 0.009361f, 0.009283f, 0.007041f,
-      0.004563f, 0.003100f, 0.002485f, 0.002314f, 0.002314f
-  };
-  memcpy(fuelgauge_data.r2_dis, r2_dis_vals, sizeof(r2_dis_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x8D — tau2 discharge (s)
-  // -------------------------------------------------------------------------
-  static const float tau2_dis_vals[20] = {
-      105.446f, 106.610f, 107.807f, 109.516f, 113.634f,
-      119.202f, 125.790f, 129.958f, 128.596f, 127.294f,
-      132.877f, 142.892f, 144.148f, 131.343f, 115.459f,
-      107.425f, 103.355f,  99.141f,  95.629f,  95.629f
-  };
-  memcpy(fuelgauge_data.tau2_dis, tau2_dis_vals, sizeof(tau2_dis_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x8E — R0 charge (Ω)
-  // -------------------------------------------------------------------------
-  static const float r0_chg_vals[20] = {
-      0.036460f, 0.032986f, 0.030064f, 0.028226f, 0.026913f,
-      0.026225f, 0.025413f, 0.024115f, 0.022956f, 0.022369f,
-      0.021716f, 0.020868f, 0.020283f, 0.019682f, 0.019479f,
-      0.019483f, 0.019511f, 0.019569f, 0.019594f, 0.019608f
-  };
-  memcpy(fuelgauge_data.r0_chg, r0_chg_vals, sizeof(r0_chg_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x8F — R1 charge (Ω)
-  // -------------------------------------------------------------------------
-  static const float r1_chg_vals[20] = {
-      0.012893f, 0.012238f, 0.011584f, 0.011235f, 0.010940f,
-      0.010623f, 0.010260f, 0.009872f, 0.009821f, 0.009906f,
-      0.009823f, 0.009598f, 0.009890f, 0.010816f, 0.012165f,
-      0.012716f, 0.012680f, 0.011867f, 0.011514f, 0.011474f
-  };
-  memcpy(fuelgauge_data.r1_chg, r1_chg_vals, sizeof(r1_chg_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x90 — tau1 charge (s)
-  // -------------------------------------------------------------------------
-  static const float tau1_chg_vals[20] = {
-      13.370f, 13.393f, 13.799f, 14.615f, 15.337f,
-      15.468f, 15.354f, 14.927f, 14.637f, 14.623f,
-      14.637f, 14.407f, 14.428f, 15.051f, 16.097f,
-      16.456f, 16.278f, 15.494f, 15.174f, 15.148f
-  };
-  memcpy(fuelgauge_data.tau1_chg, tau1_chg_vals, sizeof(tau1_chg_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x91 — R2 charge (Ω)
-  // -------------------------------------------------------------------------
-  static const float r2_chg_vals[20] = {
-      0.008274f, 0.007936f, 0.007691f, 0.007867f, 0.008243f,
-      0.008246f, 0.007928f, 0.007153f, 0.006756f, 0.007134f,
-      0.008360f, 0.008886f, 0.008193f, 0.007774f, 0.009071f,
-      0.010550f, 0.011611f, 0.011670f, 0.011446f, 0.011411f
-  };
-  memcpy(fuelgauge_data.r2_chg, r2_chg_vals, sizeof(r2_chg_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x92 — tau2 charge (s)
-  // -------------------------------------------------------------------------
-  static const float tau2_chg_vals[20] = {
-      136.349f, 134.047f, 130.108f, 125.350f, 121.328f,
-      119.935f, 119.468f, 120.058f, 120.612f, 120.491f,
-      120.804f, 124.349f, 128.722f, 129.472f, 127.006f,
-      126.493f, 128.016f, 132.348f, 133.844f, 134.035f
-  };
-  memcpy(fuelgauge_data.tau2_chg, tau2_chg_vals, sizeof(tau2_chg_vals));
-
-  // -------------------------------------------------------------------------
-  // 0x93 — Q_nom temperature setpoints
-  // 0x94 — Q_nom capacity at each temperature
+  // 0xAD — Q_nom temperature setpoints
+  // 0xAE — Q_nom capacity at each temperature
   //
   // Reserved: the HPPC pipeline runs at room temperature only, so there is no
   // fitted capacity-vs-temperature curve yet and the estimator does not
@@ -756,8 +757,8 @@ static void FuelGauge_SetDefaults(void)
   }
 
   // -------------------------------------------------------------------------
-  // 0x95 — Nominal capacity at 25°C (mean of the 7 fitted cell capacities)
-  // 0x96 — Coulombic efficiency
+  // 0xAF — Nominal capacity at 25°C
+  // 0xB0 — Coulombic efficiency
   //
   // Coulombic efficiency is stored for completeness but is not applied: the
   // reference estimator does not use it either.
@@ -766,19 +767,7 @@ static void FuelGauge_SetDefaults(void)
   fuelgauge_data.coulombic_efficiency           = 0.998f;
 
   // -------------------------------------------------------------------------
-  // 0x97-0x9B — Reference R/tau at 25°C
-  //
-  // Mid-SOC values from the discharge table, for reference only — the
-  // estimator interpolates the full tables above rather than using these.
-  // -------------------------------------------------------------------------
-  fuelgauge_data.r0_ref                         =   0.019609f;
-  fuelgauge_data.r1_ref                         =   0.009788f;
-  fuelgauge_data.tau1_ref                       =  15.289f;
-  fuelgauge_data.r2_ref                         =   0.008587f;
-  fuelgauge_data.tau2_ref                       = 142.892f;
-
-  // -------------------------------------------------------------------------
-  // 0x9C-0xA0 — Arrhenius activation energies
+  // 0xB6-0xBA — Arrhenius activation energies
   //
   // Reserved for temperature compensation, which is not implemented. Left at
   // zero so nothing reads them as fitted values.
@@ -790,35 +779,25 @@ static void FuelGauge_SetDefaults(void)
   fuelgauge_data.ea_tau2                        = 0.0f;
 
   // -------------------------------------------------------------------------
-  // 0xA1 — Kalman process noise SOC
-  // 0xA2 — Kalman process noise RC1
-  // 0xA3 — Kalman process noise RC2
-  // 0xA4 — Kalman measurement noise (0.005 V sensor sigma, squared)
+  // 0xBB — Kalman process noise SOC
+  // 0xBC — Kalman process noise RC1
+  // 0xBD — Kalman process noise RC2
+  // 0xBE — Kalman measurement noise (0.005 V sensor sigma, squared)
+  //
+  // The process noise is added once per update. 1e-6 was tuned at 20 Hz, so at
+  // 100 Hz (BD_LOOP_PERIOD_MS = 10 ms) it is 2e-7 to keep the same noise per second.
   // -------------------------------------------------------------------------
-  fuelgauge_data.kf_q_soc                       = 1e-6f;
-  fuelgauge_data.kf_q_rc1                       = 1e-6f;
-  fuelgauge_data.kf_q_rc2                       = 1e-6f;
+  fuelgauge_data.kf_q_soc                       = 2e-7f;
+  fuelgauge_data.kf_q_rc1                       = 2e-7f;
+  fuelgauge_data.kf_q_rc2                       = 2e-7f;
   fuelgauge_data.kf_r_v                         = 2.5e-5f;
 
   // -------------------------------------------------------------------------
-  // 0xA9 — Per-cell capacity (Ah), fitted from the HPPC sweep
-  // 0xAA — Per-cell R0 scale against the shared table (1.0 = nominal)
-  // -------------------------------------------------------------------------
-  static const float cell_capacity_vals[7] = {
-      2.0562f, 2.0254f, 2.0139f, 2.0139f, 2.0157f, 2.0065f, 1.9869f
-  };
-  static const float cell_r0_scale_vals[7] = {
-      0.9944f, 1.0027f, 1.0010f, 0.9974f, 1.0005f, 0.9999f, 1.0040f
-  };
-  memcpy(fuelgauge_data.cell_q_nom_ah,  cell_capacity_vals, sizeof(cell_capacity_vals));
-  memcpy(fuelgauge_data.cell_r0_scale,  cell_r0_scale_vals, sizeof(cell_r0_scale_vals));
-
-  // -------------------------------------------------------------------------
-  // 0xA5-0xA8 — Filter state
+  // 0xD0-0xD3 — Filter state
   //
   // Zeroed here; FuelGauge_Seed() fills it from the first voltage reading.
   // -------------------------------------------------------------------------
-  for(uint8_t i = 0; i < FG_CELL_COUNT; i++)
+  for(uint8_t i = 0; i < BD_CELL_COUNT_MAX; i++)
   {
     fuelgauge_data.cell_soc_f[i]                = 0.0f;
     fuelgauge_data.cell_vrc1[i]                 = 0.0f;
@@ -836,8 +815,8 @@ static void FuelGauge_SetDefaults(void)
   }
 
   // -------------------------------------------------------------------------
-  // 0xAB — CycleCount
-  // 0xAC — LearningStatus
+  // 0xD7 — CycleCount
+  // 0x96 — LearningStatus
   // -------------------------------------------------------------------------
   fuelgauge_data.cycle_count                    = 0;
   fuelgauge_data.learning_status                = 0x0000;

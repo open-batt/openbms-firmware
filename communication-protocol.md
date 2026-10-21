@@ -197,7 +197,7 @@ Registers are grouped into three banks, each backed by one firmware data structu
 | Bank | Range | Structure | Source module |
 |------|-------|-----------|---------------|
 | Peripheral data | `0x00` – `0x12` | `Peripheral_Data_t` | `openbms_periph.c` |
-| Control data | `0x30` – `0x57` | `Control_Data_t` | `openbms_ctrl.c` |
+| Config, system and stats data | `0x30` – `0x57` | `Config_Data_t`, `System_Data_t`, `Stats_Data_t` | `openbms_ctrl.c` |
 | Fuel gauge data | `0x80` – `0xAC` | `FuelGauge_Data_t` | fuel gauge (not yet wired in) |
 | — | `0x13` – `0x2F`, `0x58` – `0x7F`, `0xAD` – `0xFF` | unmapped | returns `CE_NO_REG` |
 

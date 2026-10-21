@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
+"""
+flash.py -- program the OpenBMS firmware over UART through the bootloader.
+
+Usage:
+    python flash.py [COM_PORT] <HEX_FILE>
+
+Without COM_PORT the tool pings every serial port on the computer and uses the
+one where an OpenBMS (running the firmware, or sitting in the bootloader)
+answers. With COM_PORT it uses exactly that port.
+
+The saved config in the board's EEPROM is not touched by flashing. If a new
+firmware changes the config layout it refuses the old save and waits in
+WAIT_CONFIG; write the config again with config_tool.py in that case.
+"""
 
 import sys
 import serial
+from serial.tools import list_ports
 import time
 
 # ---------------------------------------------------------------
@@ -10,6 +25,8 @@ import time
 APP_FLASH_START     = 0x0800A000
 BAUD_RATE           = 230400
 TIMEOUT_PING        = 2.0    # seconds — per ping attempt
+TIMEOUT_SCAN        = 0.3    # seconds — per port while looking for the board
+OPEN_SETTLE         = 0.5    # seconds — pause after opening a port
 TIMEOUT_ERASE       = 10.0   # seconds — erase takes ~3s for 108 pages
 TIMEOUT_PROGRAM     = 2.0    # seconds — per line
 TIMEOUT_CRC         = 5.0    # seconds
@@ -152,16 +169,89 @@ def ping_bootloader(ser: serial.Serial) -> bool:
     return False
 
 # ---------------------------------------------------------------
+# Find the board
+#
+# Sends one firmware ping frame [0x0A][0][0][crc] to each serial port. It has
+# no side effects on the board:
+#   firmware     answers an ACK frame (or an error frame on older firmware)
+#   bootloader   reads the frame as a bad text line and answers "255"
+# ---------------------------------------------------------------
+def classify_ping_answer(answer: bytes):
+    # Firmware frame: [cmd][arg][length][payload...][crc], cmd 0x03 = ACK, 0x04 = error
+    if len(answer) >= 4 and answer[0] in (0x03, 0x04):
+        end = 3 + answer[2]
+        if len(answer) > end and sum(answer[:end]) % 256 == answer[end]:
+            return "firmware"
+    if answer.strip() == b"255":
+        return "bootloader"
+    return None
+
+def ping_port(port: str):
+    """Returns "firmware", "bootloader", or None if nothing OpenBMS answers on this port."""
+    try:
+        with serial.Serial(port, BAUD_RATE, timeout=TIMEOUT_SCAN, write_timeout=TIMEOUT_SCAN) as ser:
+            time.sleep(OPEN_SETTLE)     # adapters / boards need a moment after the port opens
+            for _ in range(3):
+                ser.reset_input_buffer()
+                ser.write(bytes([0x0A, 0x00, 0x00, 0x0A]))
+                kind = classify_ping_answer(ser.read(8))
+                if kind:
+                    return kind
+    except (serial.SerialException, OSError):
+        pass    # busy, gone, or not a real serial port -- not our board
+    return None
+
+def find_board():
+    """Pings every serial port, returns the port of the one board that answers."""
+    ports = sorted(p.device for p in list_ports.comports())
+    if not ports:
+        print("ERR: no serial ports found on this computer")
+        sys.exit(1)
+
+    print(f"Looking for the board on {', '.join(ports)}...")
+    found = {}
+    for port in ports:
+        kind = ping_port(port)
+        if kind:
+            found[port] = kind
+
+    if not found:
+        print("ERR: no OpenBMS answered on any port")
+        print("     Make sure the device is powered and connected, and that no other")
+        print("     program is using the port. Pass the port by hand to force one.")
+        sys.exit(1)
+
+    if len(found) > 1:
+        print("ERR: more than one OpenBMS answered: " +
+              ", ".join(f"{p} ({k})" for p, k in found.items()))
+        print("     Pass the port you want.")
+        sys.exit(1)
+
+    port, kind = next(iter(found.items()))
+    print(f"Found the board on {port} ({kind})\n")
+    return port
+
+# ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python flash.py <COM_PORT> <HEX_FILE>")
-        print("Example: python flash.py COM3 firmware.hex")
-        sys.exit(1)
+    hex_file = None
+    port     = None
 
-    port     = sys.argv[1]
-    hex_file = sys.argv[2]
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith(".hex") and hex_file is None:
+            hex_file = arg
+        elif port is None:
+            port = arg
+        else:
+            hex_file = None
+            break
+
+    if hex_file is None:
+        print("Usage: python flash.py [COM_PORT] <HEX_FILE>")
+        print("Example: python flash.py firmware.hex           (finds the port itself)")
+        print("         python flash.py COM3 firmware.hex")
+        sys.exit(1)
 
     # -------------------------------------------------------
     # Parse hex file
@@ -193,8 +283,11 @@ def main():
     print(f"Total lines   : {total_lines}\n")
 
     # -------------------------------------------------------
-    # Open serial port
+    # Open serial port (find it first when none was given)
     # -------------------------------------------------------
+    if port is None:
+        port = find_board()
+
     try:
         ser = serial.Serial(port, BAUD_RATE, timeout=1)
         time.sleep(0.5)

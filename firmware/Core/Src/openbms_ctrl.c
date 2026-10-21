@@ -17,60 +17,86 @@
 
 #include "openbms_ctrl.h"
 #include "openbms_periph.h"
+#include "openbms_error.h"
 #include "openbms_fuelgauge.h"
+#include "openbms_hppc.h"
+#include <stddef.h>
+#include <string.h>
+#include <math.h>
 
-static Control_Data_t   control_data        = {0};
-static bool             protection_trigger  = false;
-static uint8_t          cell_number         = CELL_NUMBER_DEFAULT;
+// What is stored in the EEPROM: a version byte, then the Config_Data_t bytes
+// (the CRC-32 is added by Periph_EepromWriteChecked). The version is kept at 1.
+#define CONFIG_EEPROM_VERSION           1U
 
-static void Timer_Set(uint32_t *timer)
+typedef struct __attribute__((packed))
 {
-  *timer = HAL_GetTick();
-}
-static bool Timer_Expired(uint32_t *timer, uint32_t timeout_ms)
+    uint8_t        version;
+    Config_Data_t  config;
+} Config_Stored_t;
+
+static Config_Data_t    config_data         = {0};
+static System_Data_t    system_data         = {0};
+static Stats_Data_t     stats_data          = {0};
+static Config_Stored_t  stored_image        = {0};   // static: too big for the 1 KB stack
+static bool             protection_reset    = false; // set by Ctrl_ResetProtection, handled in Protection_Check
+#ifdef OPENBMS_SIMULATION
+static uint32_t         sim_tick_ms         = 0;     // simulated time: the sum of the CC_SIM_SAMPLE time steps
+#endif
+
+static bool Ctrl_LoadConfig(void);
+
+// Ctrl_SetConfig checks current_sensor_gain up to firmware_version as one block of floats
+_Static_assert((offsetof(Config_Data_t, firmware_version) - offsetof(Config_Data_t, current_sensor_gain)) % sizeof(float) == 0,
+               "the calibration block from current_sensor_gain to firmware_version must hold only floats");
+
+// True when every calibration float is a real number. The packed struct may leave
+// them unaligned, so each one is copied out before it is checked.
+static bool Ctrl_CalibrationFinite(const Config_Data_t *data)
 {
-  uint32_t current_time = HAL_GetTick();
-  if((current_time - *timer) >= timeout_ms)
+  const uint8_t *block = (const uint8_t *)data + offsetof(Config_Data_t, current_sensor_gain);
+  uint32_t       count = (offsetof(Config_Data_t, firmware_version) - offsetof(Config_Data_t, current_sensor_gain)) / sizeof(float);
+  float          value;
+
+  for(uint32_t i = 0; i < count; i++)
   {
-    return true;
+    memcpy(&value, block + i * sizeof(float), sizeof(float));
+    if(!isfinite(value))
+    {
+      return false;
+    }
   }
-  else 
-  {
-    return false;
-  }
-}
-static void Time_Update(void)
-{
-  static uint32_t tick_prev = 0;
-  static uint32_t time_ms   = 0;
 
-  uint32_t tick_now  = HAL_GetTick();
-  uint32_t tick_diff = tick_now - tick_prev;   // correct even on rollover
-  time_ms           += tick_diff;
-  tick_prev          = tick_now;
-
-  control_data.uptime_counter = time_ms;
+  return true;
 }
-static bool Protection_OverTriggered(float *value, uint8_t value_count, float threshold, uint32_t timeout_ms, uint32_t *timer, bool *triggered)
+// True when the cell count is one the hardware supports
+static bool Ctrl_CellCountValid(uint8_t cell_count)
 {
-  uint32_t elapsed;
-  bool     threshold_exceeded = false;
+  return (cell_count >= BD_CELL_COUNT_MIN) && (cell_count <= BD_CELL_COUNT_MAX);
+}
+
+// True once any of the values has been past the threshold for longer than timeout_ms.
+// over = true: past means above the threshold, over = false: below it. A timeout of 0 disables the check.
+static bool Protection_Triggered(const float *value, uint8_t value_count, float threshold, bool over,
+                                 uint32_t timeout_ms, uint32_t *timer, bool *triggered)
+{
+  bool threshold_exceeded = false;
 
   if(timeout_ms > 0)
   {
-    if(value_count == 1)
+    for(uint8_t i = 0; i < value_count; i++)
     {
-      if(*value > threshold) threshold_exceeded = true;
-    }
-    else 
-    {
-      for(uint8_t i = 0; i < value_count; i++)
+      if(over)
       {
-        if(value[i] > threshold) 
-        {
-          threshold_exceeded = true;
-          break;
-        }
+        if(value[i] > threshold) threshold_exceeded = true;
+      }
+      else
+      {
+        if(value[i] < threshold) threshold_exceeded = true;
+      }
+
+      if(threshold_exceeded)
+      {
+        break;
       }
     }
 
@@ -78,60 +104,12 @@ static bool Protection_OverTriggered(float *value, uint8_t value_count, float th
     {
       if(!(*triggered))
       {
-        *timer = HAL_GetTick();
+        *timer = BD_GET_TICK();
         *triggered = true;
       }
       else 
       {
-        elapsed = HAL_GetTick() - *timer;
-        if(elapsed > timeout_ms)
-        {
-          return true;
-        }
-      }
-    }
-    else 
-    {
-      *triggered = false;
-    }
-  }
-
-  return false;
-}
-static bool Protection_UnderTriggered(float *value, uint8_t value_count, float threshold, uint32_t timeout_ms, uint32_t *timer, bool *triggered)
-{
-  uint32_t elapsed;
-  bool     threshold_exceeded = false;
-
-  if(timeout_ms > 0)
-  {
-    if(value_count == 1)
-    {
-      if(*value < threshold) threshold_exceeded = true;
-    }
-    else 
-    {
-      for(uint8_t i = 0; i < value_count; i++)
-      {
-        if(value[i] < threshold) 
-        {
-          threshold_exceeded = true;
-          break;
-        }
-      }
-    }
-
-    if(threshold_exceeded)
-    {
-      if(!(*triggered))
-      {
-        *timer = HAL_GetTick();
-        *triggered = true;
-      }
-      else 
-      {
-        elapsed = HAL_GetTick() - *timer;
-        if(elapsed > timeout_ms)
+        if((BD_GET_TICK() - *timer) > timeout_ms)
         {
           return true;
         }
@@ -171,141 +149,305 @@ static void Protection_Check(void)
   Peripheral_Data_t pd;
   Periph_GetData(&pd);
 
-  // Voltage protection enabled
-  if(control_data.configuration & BD_CONFIG_VOLT_PROT)
+  // Host reset: forget the running detections, so every protection starts its detection time again
+  if(protection_reset)
   {
-    protection_trigger |= Protection_OverTriggered(pd.cell_voltage_filtered, cell_number, control_data.ovp_slow_threshold_mv, 
-                              control_data.ovp_slow_time_ms, &ovp_slow_timer, 
+    ovp_slow_triggered        = false;
+    ovp_fast_triggered        = false;
+    uvp_slow_triggered        = false;
+    uvp_fast_triggered        = false;
+    ocp_chg_triggered         = false;
+    ocp_dchg_slow_triggered   = false;
+    ocp_dchg_fast_triggered   = false;
+    otp_triggered             = false;
+    protection_reset          = false;
+  }
+
+  // Number of cells to check, from the config (never more than the hardware measures)
+  uint8_t cell_count = config_data.cell_count;
+  if(cell_count > BD_CELL_COUNT_MAX)
+  {
+    cell_count = BD_CELL_COUNT_MAX;
+  }
+
+  // Voltage protection enabled
+  if(config_data.volt_protection)
+  {
+    system_data.protection_trigger |= Protection_Triggered(pd.cell_voltage, cell_count, config_data.ovp_slow_threshold_mv, true, 
+                              config_data.ovp_slow_time_ms, &ovp_slow_timer, 
                               &ovp_slow_triggered);
 
-    protection_trigger |= Protection_OverTriggered(pd.cell_voltage_filtered, cell_number, control_data.ovp_fast_threshold_mv, 
-                              control_data.ovp_fast_time_ms, &ovp_fast_timer, 
+    system_data.protection_trigger |= Protection_Triggered(pd.cell_voltage, cell_count, config_data.ovp_fast_threshold_mv, true, 
+                              config_data.ovp_fast_time_ms, &ovp_fast_timer, 
                               &ovp_fast_triggered);
 
-    protection_trigger |= Protection_UnderTriggered(pd.cell_voltage_filtered, cell_number, control_data.uvp_slow_threshold_mv, 
-                              control_data.uvp_slow_time_ms, &uvp_slow_timer, 
+    system_data.protection_trigger |= Protection_Triggered(pd.cell_voltage, cell_count, config_data.uvp_slow_threshold_mv, false, 
+                              config_data.uvp_slow_time_ms, &uvp_slow_timer, 
                               &uvp_slow_triggered);
 
-    protection_trigger |= Protection_UnderTriggered(pd.cell_voltage_filtered, cell_number, control_data.uvp_fast_threshold_mv, 
-                              control_data.uvp_fast_time_ms, &uvp_fast_timer, 
+    system_data.protection_trigger |= Protection_Triggered(pd.cell_voltage, cell_count, config_data.uvp_fast_threshold_mv, false, 
+                              config_data.uvp_fast_time_ms, &uvp_fast_timer, 
                               &uvp_fast_triggered);
                               
   }
-
-  // Current protection enabled
-  if(control_data.configuration & BD_CONFIG_CURR_PROT)
+  else
   {
-    float c = pd.pack_current_filtered;
-
-    protection_trigger |= Protection_OverTriggered(&c, 1, control_data.ocp_charge_threshold_ma, 
-                              control_data.ocp_charge_time_ms, &ocp_chg_timer, 
-                              &ocp_chg_triggered);
-
-    protection_trigger |= Protection_OverTriggered(&c, 1, control_data.ocp_discharge_slow_threshold_ma, 
-                              control_data.ocp_discharge_slow_time_ms, &ocp_dchg_slow_timer, 
-                              &ocp_dchg_slow_triggered);
-
-    protection_trigger |= Protection_OverTriggered(&c, 1, control_data.ocp_discharge_fast_threshold_ma, 
-                              control_data.ocp_discharge_fast_time_ms, &ocp_dchg_fast_timer, 
-                              &ocp_dchg_fast_triggered);
+    // Not checked: forget the detections, so a re-enabled protection starts its detection time again
+    ovp_slow_triggered        = false;
+    ovp_fast_triggered        = false;
+    uvp_slow_triggered        = false;
+    uvp_fast_triggered        = false;
   }
 
-  // Temperature protection enabled
-  if(control_data.configuration & BD_CONFIG_TEMP_PROT)
+  // Current protection enabled
+  if(config_data.current_protection)
+  {
+    float c = pd.pack_current;         // positive while charging
+    float d = -pd.pack_current;        // positive while discharging
+
+    system_data.protection_trigger |= Protection_Triggered(&c, 1, config_data.ocp_charge_threshold_ma, true, 
+                              config_data.ocp_charge_time_ms, &ocp_chg_timer, 
+                              &ocp_chg_triggered);
+
+    system_data.protection_trigger |= Protection_Triggered(&d, 1, config_data.ocp_discharge_slow_threshold_ma, true, 
+                              config_data.ocp_discharge_slow_time_ms, &ocp_dchg_slow_timer, 
+                              &ocp_dchg_slow_triggered);
+
+    system_data.protection_trigger |= Protection_Triggered(&d, 1, config_data.ocp_discharge_fast_threshold_ma, true, 
+                              config_data.ocp_discharge_fast_time_ms, &ocp_dchg_fast_timer, 
+                              &ocp_dchg_fast_triggered);
+  }
+  else
+  {
+    ocp_chg_triggered         = false;
+    ocp_dchg_slow_triggered   = false;
+    ocp_dchg_fast_triggered   = false;
+  }
+
+  // Temperature protection enabled. With a broken NTC there is no temperature to check,
+  // OPENBMS_NTC_FAULT tells the host instead.
+  if(config_data.temp_protection && !Error_IsSet(OPENBMS_NTC_FAULT))
   {
     float t = pd.temperature_package;
 
-    protection_trigger |= Protection_OverTriggered(&t, 1, control_data.otp_threshold_c, 
-                              control_data.otp_time_ms, &otp_timer, 
+    system_data.protection_trigger |= Protection_Triggered(&t, 1, config_data.otp_threshold_c, true, 
+                              config_data.otp_time_ms, &otp_timer, 
                               &otp_triggered);    
   }
-}
-static void Ctrl_SetDefaults(void)
-{
-  // Configure BMS
-  control_data.configuration           = 7 & BD_CONFIG_CELL_COUNT_MASK;   // 7-cell battery pack
-  control_data.configuration          |= BD_CONFIG_VOLT_PROT;             // Enable voltage protection
-  control_data.configuration          |= BD_CONFIG_CURR_PROT;             // Enable current protection
-  control_data.configuration          |= BD_CONFIG_TEMP_PROT;             // Enable temp protection
-
-  // Configure mode
-  control_data.main_control            = (BD_MAIN_CTR_MODE_NORMAL << BD_MAIN_CTR_MODE_SHIFT) & BD_MAIN_CTR_MODE_MASK;
-
-  // Configure cell data
-  control_data.cell_capacity           = 2000;     // 2.0Ah
-  control_data.voltage_cell_max        = 4200;     // 4.2V
-  control_data.voltage_cell_min        = 2500;     // 2.5V
-  control_data.charging_term_current   = 100;      // 0.1A
-
-  // Set protection thresholds
-  control_data.ovp_slow_threshold_mv   = 4220;    // 4.22V
-  control_data.ovp_slow_time_ms        = 20000;   // 20s
-
-  control_data.ovp_fast_threshold_mv   = 4300;    // 4.30V
-  control_data.ovp_fast_time_ms        = 500;     // 0.5s
-
-  control_data.uvp_slow_threshold_mv   = 2700;    // 2.7V
-  control_data.uvp_slow_time_ms        = 20000;   // 20s
-
-  control_data.uvp_fast_threshold_mv   = 2500;    // 2.5V
-  control_data.uvp_fast_time_ms        = 500;     // 0.5s
-
-  control_data.ocp_charge_threshold_ma          = 4000;  // 4A
-  control_data.ocp_charge_time_ms               = 10000; // 10s
-
-  control_data.ocp_discharge_slow_threshold_ma  = 15000; // 15A
-  control_data.ocp_discharge_slow_time_ms       = 10000; // 10s
-
-  control_data.ocp_discharge_fast_threshold_ma  = 18000; // 18A
-  control_data.ocp_discharge_fast_time_ms       = 1000;  // 1s
-
-  control_data.otp_threshold_c                  = 60;    // 60 degrees C
-  control_data.otp_time_ms                      = 60000; // 1 minute
-
-  // Set system information
-  strncpy(control_data.firmware_version,        "1.0.0",         32);
-  strncpy(control_data.hardware_version,        "RevA",          32);
-  strncpy(control_data.manufacturer_name,       "OpenBatt Team", 32);
-  strncpy(control_data.device_name,             "OpenBMS",       32);
-  strncpy(control_data.device_chemistry,        "Li-Ion",        32);
-  strncpy(control_data.manufacturer_data,       "Year 2026",     32);
-
+  else
+  {
+    otp_triggered             = false;
+  }
 }
 void Ctrl_Init(void)
 {
-  Ctrl_SetDefaults();
   Periph_Init();
   FuelGauge_Init();
+
+  if(Ctrl_LoadConfig())
+  {
+    system_data.ctrl_state = BD_CTRL_STATE_NORMAL_RUN;
+  }
+  else
+  {
+    system_data.ctrl_state = BD_CTRL_STATE_WAIT_CONFIG;
+  }
 }
 void Ctrl_Run(void)
 {
-  // Check if in learning mode
-  if(control_data.main_control & BD_MAIN_CTR_MODE_MASK & BD_MAIN_CTR_MODE_LEARNING)
-  {
+  uint8_t         hppc_direction;
+  uint16_t        hppc_status;
+  uint16_t        hppc_extract_status;
+  bool            run_fet;
+  bool            run_pre_fet;
+  bool            hppc_fet = false;
 
+  // Errors are latched by the module that sees them, the register shows a copy
+  system_data.error_flags = Error_GetFlags();
+
+  // Uptime since this boot (the simulated time in the simulation build)
+  system_data.session_uptime_ms = BD_GET_TICK();
+
+  switch(system_data.ctrl_state)
+  {
+    case BD_CTRL_STATE_WAIT_CONFIG:
+    {
+      // Nothing to do here: Ctrl_SaveConfig leaves this state once the host has saved a config
+    }
+    break;
+
+    case BD_CTRL_STATE_NORMAL_RUN:
+    {
+      // Fuel gauge: one update per loop tick
+      FuelGauge_Run(config_data.cell_count);
+
+      // Normal operation. main_control is the host's request, ctrl_state follows it.
+      if(system_data.main_control == BD_MAIN_CTR_MODE_HPPC)
+      {
+        // The HPPC sequencer owns the FET from now on, a host request must not keep it on
+        system_data.fet_request = false;
+        system_data.ctrl_state  = BD_CTRL_STATE_HPPC_RUN;
+      }
+    }
+    break;
+
+    case BD_CTRL_STATE_HPPC_RUN:
+    {
+      if(system_data.main_control == BD_MAIN_CTR_MODE_NORMAL)
+      {
+        // Back to normal run: stop the test (FET off, sequencer reset) before leaving.
+        // A finished test may still be building its tables, HPPC run is left when that is done.
+        if(Hppc_Stop(&hppc_fet))
+        {
+          system_data.ctrl_state = BD_CTRL_STATE_NORMAL_RUN;
+        }
+      }
+      else if(system_data.protection_trigger)
+      {
+        // A protection tripped: end the test, main_control goes back to normal
+        Hppc_Abort(BD_HPPC_STOP_PROTECTION, &hppc_fet);
+      }
+      else
+      {
+        Hppc_Run(&hppc_fet);
+      }
+
+      // Show the sequencer result in the system registers
+      Hppc_GetStatus(&hppc_direction, &hppc_status, &hppc_extract_status);
+      system_data.hppc_direction      = hppc_direction;      // packed members, so assign through locals
+      system_data.hppc_status         = hppc_status;
+      system_data.hppc_extract_status = hppc_extract_status;
+    }
+    break;
+
+    default: break;
   }
 
+  // Measurement watchdog: no good ADS sample for a while. Only reported, the FET is not switched by it.
+  if(!Periph_MeasurementOk())
+  {
+    Error_Set(OPENBMS_ADS131M08_DATA_LOST);
+  }
+
+  // Protections are checked on every pass (10 ms); their timeouts use BD_GET_TICK
+  Protection_Check();
+
+  // Set FET state
+  run_fet = (!system_data.protection_trigger) && (hppc_fet | system_data.fet_request);
+  Periph_SetFET(run_fet);
+
+  // Set pre-FET state, only the host switches it
+  run_pre_fet = (!system_data.protection_trigger) && system_data.pre_fet_request;
+  Periph_SetPreFET(run_pre_fet);
+
+  // Update peripherals state
   Periph_Run();
-
-  // Run the SOC estimator in normal mode only. It rate-limits itself to
-  // FG_UPDATE_PERIOD_MS internally, and measures its own elapsed time, so a
-  // spell in config or learning mode is skipped rather than integrated over.
-  if((control_data.main_control & BD_MAIN_CTR_MODE_MASK) == BD_MAIN_CTR_MODE_NORMAL)
+  
+}
+void Ctrl_GetConfig(Config_Data_t *data)
+{
+  memcpy(data, &config_data, sizeof(Config_Data_t));
+}
+void Ctrl_GetSystem(System_Data_t *data)
+{
+  memcpy(data, &system_data, sizeof(System_Data_t));
+}
+void Ctrl_GetStats(Stats_Data_t *data)
+{
+  memcpy(data, &stats_data, sizeof(Stats_Data_t));
+}
+bool Ctrl_SetConfig(const Config_Data_t *data)
+{
+  // A NaN or inf calibration value would make the measurements NaN and the protections
+  // could never trip, so such a config is refused and the old one is kept
+  if(!Ctrl_CalibrationFinite(data))
   {
-    FuelGauge_Run();
+    return false;
   }
 
-  Time_Update();
+  // Called from the main loop, like Protection_Check, so nothing reads the config meanwhile
+  memcpy(&config_data, data, sizeof(Config_Data_t));
+
+  // The sensor calibration in the config is used by the peripheral code
+  Periph_SetCalibration(&config_data);
+  return true;
 }
-void Ctrl_GetData(Control_Data_t *data)
+bool Ctrl_ConfigValid(void)
 {
-  memcpy(data, &control_data, sizeof(Control_Data_t));
+  // The registers are written one by one, so the whole config is only checked before it is saved
+  return Ctrl_CellCountValid(config_data.cell_count);
+}
+bool Ctrl_SaveConfig(void)
+{
+  stored_image.version = CONFIG_EEPROM_VERSION;
+  memcpy(&stored_image.config, &config_data, sizeof(Config_Data_t));
+
+  if(!Periph_EepromWriteChecked(CONFIG_EEPROM_ADDRESS, (const uint8_t *)&stored_image, sizeof(Config_Stored_t)))
+  {
+    return false;
+  }
+
+  // The host has set the device up and the config is safely stored
+  if(system_data.ctrl_state == BD_CTRL_STATE_WAIT_CONFIG)
+  {
+    system_data.ctrl_state = BD_CTRL_STATE_NORMAL_RUN;
+  }
+
+  return true;
+}
+static bool Ctrl_LoadConfig(void)
+{
+  if(!Periph_EepromReadChecked(CONFIG_EEPROM_ADDRESS, (uint8_t *)&stored_image, sizeof(Config_Stored_t)))
+  {
+    return false;
+  }
+
+  if(stored_image.version != CONFIG_EEPROM_VERSION)
+  {
+    return false;
+  }
+
+  // An image with a bad cell count or calibration is treated like no config
+  if(!Ctrl_CellCountValid(stored_image.config.cell_count))
+  {
+    return false;
+  }
+
+  return Ctrl_SetConfig(&stored_image.config);
 }
 void Ctrl_SetMode(uint16_t mode)
 {
-  control_data.main_control = (control_data.main_control & ~BD_MAIN_CTR_MODE_MASK) | (mode & BD_MAIN_CTR_MODE_MASK);
+  system_data.main_control = mode;
 }
-void Periph_50msTimer(void)
+void Ctrl_ResetProtection(void)
 {
-  Protection_Check();
+  // Called from the main loop (Comm_Run), like Protection_Check, so no masking is needed
+  system_data.protection_trigger = false;
+  protection_reset               = true;
 }
+void Ctrl_SetFetRequest(bool state)
+{
+  system_data.fet_request = state;
+}
+void Ctrl_SetPreFetRequest(bool state)
+{
+  system_data.pre_fet_request = state;
+}
+void Ctrl_SetLastCommunication(void)
+{
+  // Called from the main loop (Comm_Run) for every frame with a good CRC
+  system_data.last_communication_timestamp = BD_GET_TICK();
+}
+#ifdef OPENBMS_SIMULATION
+uint32_t Ctrl_SimGetTick(void)
+{
+  return sim_tick_ms;
+}
+void Ctrl_SimSample(const float *cell_mv, float current_ma, uint16_t dt_ms)
+{
+  // One host sample is one pass of the control loop, dt_ms later than the previous one
+  sim_tick_ms += dt_ms;
+  Periph_SimSetData(cell_mv, current_ma);
+  Ctrl_Run();
+}
+#endif

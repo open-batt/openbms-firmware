@@ -60,6 +60,7 @@ DMA_HandleTypeDef hdma_usart1_rx;
 DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
+volatile bool     tick_10ms     = false;   // set by the TIM7 interrupt every 10 ms, cleared by the main loop
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,7 +76,7 @@ static void MX_USART1_UART_Init(void);
 static void MX_CRC_Init(void);
 static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
-
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -133,8 +134,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    Ctrl_Run();
-    Comm_Run();
+    if(tick_10ms)
+    {
+      tick_10ms = false;
+#ifndef OPENBMS_SIMULATION
+      // In the simulation build Ctrl_Run runs once per CC_SIM_SAMPLE instead
+      Ctrl_Run();
+#endif
+      Comm_Run();
+    }
+    else
+    {
+      __WFI();
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -484,7 +496,7 @@ static void MX_TIM7_Init(void)
   htim7.Instance = TIM7;
   htim7.Init.Prescaler = 7999;
   htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim7.Init.Period = 499;
+  htim7.Init.Period = 99;
   htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
   {
@@ -647,12 +659,19 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
+  // ADS131 DRDY stays off until the ADS is configured, ADS131M08_Init enables it
+  HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM7)
+    {
+        tick_10ms = true;
+    }
+}
 /* USER CODE END 4 */
 
 /**

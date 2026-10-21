@@ -18,17 +18,30 @@
 #include "openbms_comm.h"
 #include "openbms_periph.h"
 #include "openbms_ctrl.h"
+#include "openbms_error.h"
 #include "openbms_fuelgauge.h"
 
-#define APP_FLAG_FLASH_LAGE  19U
+#define APP_FLAG_FLASH_PAGE  19U
+
+#ifdef OPENBMS_SIMULATION
+// CC_SIM_SAMPLE payload: float cell_mv[7], float current_ma (+ charge, - discharge), uint16_t dt_ms
+#define SIM_SAMPLE_LENGTH    (BD_CELL_COUNT_MAX * sizeof(float) + sizeof(float) + sizeof(uint16_t))
+// Reply payload: uint16_t fet_status, uint8_t ctrl_state, uint16_t hppc_status,
+// uint16_t hppc_extract_status, uint8_t protection_trigger, uint64_t error_flags
+#define SIM_REPLY_LENGTH     (16U)
+#endif
 
 static UART_HandleTypeDef   *debug_uart             = &huart1;
 static UART_Command_t       uart_cmd                = {0};
 static Peripheral_Data_t    pd                      = {0};
-static Control_Data_t       cd                      = {0};
+static Calibration_Data_t   cal                     = {0};
+static Config_Data_t        cfg                     = {0};
+static System_Data_t        sys                     = {0};
+static Stats_Data_t         st                      = {0};
 static FuelGauge_Data_t     fg                      = {0};
+static uint8_t              model_cell              = 0;    // cell the fuel gauge model registers (0xA1 to 0xAC, 0xD4) act on
 
-static CommErrorType_t      Controls_Set(uint8_t address, uint8_t *cmd, uint8_t length);
+static CommErrorType_t      Controls_Set(uint8_t cmd, uint8_t *data, uint8_t length);
 static CommErrorType_t      Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data, uint8_t *length, bool write); 
 
 static void                 RemoveAppFlag(void);
@@ -36,433 +49,161 @@ static void                 ProcessCommand(void);
 static uint8_t              Checksum(uint8_t *data, uint16_t length);
 static void                 SendResponse(uint8_t *data, uint8_t length);
 static void                 SendError(CommErrorType_t err);
-
-/*
-static void Data_SetDefaults(void)
-{
-    
-    // -------------------------------------------------------------------------
-    // 0x00 — Configuration
-    // 0x01 — MainControl
-    // -------------------------------------------------------------------------
-    bd.configuration                              = 0x0002;
-    bd.main_control                               = 0x0000;
-
-    // -------------------------------------------------------------------------
-    // 0x02 — PackCapacity
-    // 0x03 — MaxPackVoltage
-    // 0x04 — MinPackVoltage
-    // 0x05 — ChargingTerminationCurrent
-    // -------------------------------------------------------------------------
-    bd.pack_capacity                              = 35000;
-    bd.voltage_pack_max                           = 29400;
-    bd.voltage_pack_min                           = 19600;
-    bd.charging_term_current                      = 0;
-
- 
-
-    // -------------------------------------------------------------------------
-    // 0x20 — UVP slow threshold      0x21 — UVP slow time
-    // 0x22 — UVP fast threshold      0x23 — UVP fast time
-    // 0x24 — OVP slow threshold      0x25 — OVP slow time
-    // 0x26 — OVP fast threshold      0x27 — OVP fast time
-    // -------------------------------------------------------------------------
-    bd.uvp_slow_threshold_mv                      = 2800;
-    bd.uvp_slow_time_ms                           = 5000;
-    bd.uvp_fast_threshold_mv                      = 2500;
-    bd.uvp_fast_time_ms                           = 100;
-    bd.ovp_slow_threshold_mv                      = 4200;
-    bd.ovp_slow_time_ms                           = 2000;
-    bd.ovp_fast_threshold_mv                      = 4250;
-    bd.ovp_fast_time_ms                           = 50;
-
-    // -------------------------------------------------------------------------
-    // 0x28 — Charge OCP threshold    0x29 — Charge OCP time
-    // 0x2A — Slow OCP threshold      0x2B — Slow OCP time
-    // 0x2C — Fast OCP threshold      0x2D — Fast OCP time
-    // -------------------------------------------------------------------------
-    bd.ocp_charge_threshold_ma                    = 5000;
-    bd.ocp_charge_time_ms                         = 1000;
-    bd.ocp_discharge_slow_threshold_ma            = 10000;
-    bd.ocp_discharge_slow_time_ms                 = 2000;
-    bd.ocp_discharge_fast_threshold_ma            = 20000;
-    bd.ocp_discharge_fast_time_ms                 = 50;
-
-    // -------------------------------------------------------------------------
-    // 0x2E — OTP threshold
-    // 0x2F — OTP time
-    // -------------------------------------------------------------------------
-    bd.otp_threshold_c                            = 60;
-    bd.otp_time_ms                                = 3000;
+static void                 SendReply(CommErrorType_t res, uint8_t cmd, uint8_t address, uint8_t length);
+#ifdef OPENBMS_SIMULATION
+static CommErrorType_t      Sim_Sample(const uint8_t *data, uint8_t length, uint8_t *reply, uint8_t *reply_length);
+#endif
 
 
-
-    // -------------------------------------------------------------------------
-    // 0x3A — LastCommunicationTimestamp
-    // 0x3B — UptimeCounter
-    // -------------------------------------------------------------------------
-    
-    bd.last_communication_timestamp               = 0;
-    bd.uptime_counter                             = 0;
-
-    // -------------------------------------------------------------------------
-    // 0x50 — FaultSnapshotVoltage
-    // 0x51 — FaultSnapshotCurrent
-    // 0x52 — FaultSnapshotTemperature
-    // 0x53 — FaultSnapshotSoC
-    // 0x54 — FaultCode
-    // 0x55 — FaultTimestamp
-    // -------------------------------------------------------------------------
-    memset(bd.fault_snapshot_voltage,     0, sizeof(bd.fault_snapshot_voltage));
-    bd.fault_snapshot_current             = 0;
-    bd.fault_snapshot_temperature         = 0;
-    bd.fault_snapshot_soc                 = 0;
-    memset(bd.fault_code,                 0, sizeof(bd.fault_code));
-    memset(bd.fault_timestamp,            0, sizeof(bd.fault_timestamp));
-
-    // -------------------------------------------------------------------------
-    // 0x60 — CellBalancingEnergy
-    // 0x61 — CellBalancingTime
-    // 0x62 — CellDeepestDischarge
-    // 0x63 — CellMaxTemperature
-    // -------------------------------------------------------------------------
-    memset(bd.cell_balancing_energy,      0, sizeof(bd.cell_balancing_energy));
-    memset(bd.cell_balancing_time,        0, sizeof(bd.cell_balancing_time));
-    memset(bd.cell_deepest_discharge,     0, sizeof(bd.cell_deepest_discharge));
-    memset(bd.cell_max_temperature,       0, sizeof(bd.cell_max_temperature));
-
-    // -------------------------------------------------------------------------
-    // 0x70 — FirmwareVersion
-    // 0x71 — HardwareVersion
-    // 0x72 — ManufacturerName
-    // 0x73 — DeviceName
-    // 0x74 — DeviceChemistry
-    // 0x75 — ManufacturerData
-    // -------------------------------------------------------------------------
-    strncpy(bd.firmware_version,                  "1.0.0",         32);
-    strncpy(bd.hardware_version,                  "RevA",          32);
-    strncpy(bd.manufacturer_name,                 "OpenBatt Team", 32);
-    strncpy(bd.device_name,                       "OpenBMS",       32);
-    strncpy(bd.device_chemistry,                  "Li-Ion",        32);
-    strncpy(bd.manufacturer_data,                 "Year 2026",     32);
-
-    // -------------------------------------------------------------------------
-    // 0xB0 — RelativeSoC
-    // 0xB1 — CellSoC
-    // 0xB2 — CellSoH
-    // 0xB3 — CellRemainingCapacity
-    // 0xB4 — CellSelfDischarge
-    // 0xB5 — CellQmax
-    // -------------------------------------------------------------------------
-    bd.relative_soc                               = 0;
-    memset(bd.cell_soc,                   0, sizeof(bd.cell_soc));
-    memset(bd.cell_soh,                   0, sizeof(bd.cell_soh));
-    memset(bd.cell_remaining_capacity,    0, sizeof(bd.cell_remaining_capacity));
-    memset(bd.cell_self_discharge,        0, sizeof(bd.cell_self_discharge));
-    memset(bd.cell_qmax,                  0, sizeof(bd.cell_qmax));
-
-    // -------------------------------------------------------------------------
-    // 0xB6 — SOC grid (0% to 95% in 5% steps)
-    // -------------------------------------------------------------------------
-    float soc_grid_vals[20] = {
-         0.0f,  5.0f, 10.0f, 15.0f, 20.0f,
-        25.0f, 30.0f, 35.0f, 40.0f, 45.0f,
-        50.0f, 55.0f, 60.0f, 65.0f, 70.0f,
-        75.0f, 80.0f, 85.0f, 90.0f, 95.0f
-    };
-    memcpy(bd.soc_grid, soc_grid_vals, sizeof(soc_grid_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xB7 — OCV discharge curve (V per cell)
-    // -------------------------------------------------------------------------
-    float ocv_dis_vals[20] = {
-        3.00f, 3.20f, 3.40f, 3.48f, 3.52f,
-        3.55f, 3.58f, 3.60f, 3.62f, 3.65f,
-        3.68f, 3.70f, 3.73f, 3.75f, 3.78f,
-        3.82f, 3.87f, 3.93f, 4.00f, 4.10f
-    };
-    memcpy(bd.ocv_dis, ocv_dis_vals, sizeof(ocv_dis_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xB8 — OCV charge curve (V per cell)
-    // -------------------------------------------------------------------------
-    float ocv_chg_vals[20] = {
-        3.03f, 3.23f, 3.43f, 3.51f, 3.55f,
-        3.58f, 3.61f, 3.63f, 3.65f, 3.68f,
-        3.71f, 3.73f, 3.76f, 3.78f, 3.81f,
-        3.85f, 3.90f, 3.96f, 4.03f, 4.13f
-    };
-    memcpy(bd.ocv_chg, ocv_chg_vals, sizeof(ocv_chg_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xB9 — R0 discharge (Ω)
-    // -------------------------------------------------------------------------
-    float r0_dis_vals[20] = {
-        0.030f, 0.025f, 0.022f, 0.020f, 0.018f,
-        0.016f, 0.015f, 0.014f, 0.014f, 0.013f,
-        0.013f, 0.013f, 0.014f, 0.014f, 0.015f,
-        0.015f, 0.016f, 0.017f, 0.018f, 0.020f
-    };
-    memcpy(bd.r0_dis, r0_dis_vals, sizeof(r0_dis_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xBA — R1 discharge (Ω)
-    // -------------------------------------------------------------------------
-    float r1_dis_vals[20] = {
-        0.012f, 0.010f, 0.009f, 0.008f, 0.008f,
-        0.007f, 0.007f, 0.006f, 0.006f, 0.006f,
-        0.006f, 0.006f, 0.006f, 0.007f, 0.007f,
-        0.007f, 0.008f, 0.008f, 0.009f, 0.010f
-    };
-    memcpy(bd.r1_dis, r1_dis_vals, sizeof(r1_dis_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xBB — tau1 discharge (s)
-    // -------------------------------------------------------------------------
-    float tau1_dis_vals[20] = {
-        45.0f, 42.0f, 40.0f, 38.0f, 37.0f,
-        36.0f, 35.0f, 35.0f, 34.0f, 34.0f,
-        34.0f, 35.0f, 35.0f, 36.0f, 37.0f,
-        38.0f, 40.0f, 42.0f, 44.0f, 46.0f
-    };
-    memcpy(bd.tau1_dis, tau1_dis_vals, sizeof(tau1_dis_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xBC — R2 discharge (Ω)
-    // -------------------------------------------------------------------------
-    float r2_dis_vals[20] = {
-        0.005f, 0.004f, 0.004f, 0.003f, 0.003f,
-        0.003f, 0.003f, 0.003f, 0.003f, 0.003f,
-        0.003f, 0.003f, 0.003f, 0.003f, 0.003f,
-        0.004f, 0.004f, 0.004f, 0.005f, 0.005f
-    };
-    memcpy(bd.r2_dis, r2_dis_vals, sizeof(r2_dis_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xBD — tau2 discharge (s)
-    // -------------------------------------------------------------------------
-    float tau2_dis_vals[20] = {
-        450.0f, 420.0f, 400.0f, 380.0f, 360.0f,
-        350.0f, 340.0f, 330.0f, 330.0f, 320.0f,
-        320.0f, 330.0f, 330.0f, 340.0f, 350.0f,
-        360.0f, 380.0f, 400.0f, 420.0f, 450.0f
-    };
-    memcpy(bd.tau2_dis, tau2_dis_vals, sizeof(tau2_dis_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xBE — R0 charge (Ω)
-    // -------------------------------------------------------------------------
-    float r0_chg_vals[20] = {
-        0.028f, 0.023f, 0.020f, 0.018f, 0.016f,
-        0.015f, 0.014f, 0.013f, 0.013f, 0.012f,
-        0.012f, 0.012f, 0.013f, 0.013f, 0.014f,
-        0.014f, 0.015f, 0.016f, 0.017f, 0.019f
-    };
-    memcpy(bd.r0_chg, r0_chg_vals, sizeof(r0_chg_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xBF — R1 charge (Ω)
-    // -------------------------------------------------------------------------
-    float r1_chg_vals[20] = {
-        0.011f, 0.009f, 0.008f, 0.007f, 0.007f,
-        0.006f, 0.006f, 0.006f, 0.005f, 0.005f,
-        0.005f, 0.006f, 0.006f, 0.006f, 0.007f,
-        0.007f, 0.007f, 0.008f, 0.008f, 0.009f
-    };
-    memcpy(bd.r1_chg, r1_chg_vals, sizeof(r1_chg_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xC0 — tau1 charge (s)
-    // -------------------------------------------------------------------------
-    float tau1_chg_vals[20] = {
-        40.0f, 38.0f, 36.0f, 35.0f, 34.0f,
-        33.0f, 32.0f, 32.0f, 31.0f, 31.0f,
-        31.0f, 32.0f, 32.0f, 33.0f, 34.0f,
-        35.0f, 37.0f, 39.0f, 41.0f, 43.0f
-    };
-    memcpy(bd.tau1_chg, tau1_chg_vals, sizeof(tau1_chg_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xC1 — R2 charge (Ω)
-    // -------------------------------------------------------------------------
-    float r2_chg_vals[20] = {
-        0.005f, 0.004f, 0.003f, 0.003f, 0.003f,
-        0.002f, 0.002f, 0.002f, 0.002f, 0.002f,
-        0.002f, 0.002f, 0.002f, 0.003f, 0.003f,
-        0.003f, 0.003f, 0.004f, 0.004f, 0.005f
-    };
-    memcpy(bd.r2_chg, r2_chg_vals, sizeof(r2_chg_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xC2 — tau2 charge (s)
-    // -------------------------------------------------------------------------
-    float tau2_chg_vals[20] = {
-        420.0f, 400.0f, 380.0f, 360.0f, 340.0f,
-        330.0f, 320.0f, 310.0f, 310.0f, 300.0f,
-        300.0f, 310.0f, 310.0f, 320.0f, 330.0f,
-        340.0f, 360.0f, 380.0f, 400.0f, 430.0f
-    };
-    memcpy(bd.tau2_chg, tau2_chg_vals, sizeof(tau2_chg_vals));
-
-    // -------------------------------------------------------------------------
-    // 0xC3 — Q_nom temperature setpoints
-    // 0xC4 — Q_nom capacity at each temperature
-    // -------------------------------------------------------------------------
-    bd.q_nom_temp_c[0]                            = -20.0f;
-    bd.q_nom_temp_c[1]                            = -10.0f;
-    bd.q_nom_temp_c[2]                            =   0.0f;
-    bd.q_nom_temp_c[3]                            =  25.0f;
-    bd.q_nom_temp_c[4]                            =  45.0f;
-
-    bd.q_nom_temp_ah[0]                           =   3.50f;
-    bd.q_nom_temp_ah[1]                           =   4.00f;
-    bd.q_nom_temp_ah[2]                           =   4.50f;
-    bd.q_nom_temp_ah[3]                           =   5.00f;
-    bd.q_nom_temp_ah[4]                           =   4.80f;
-
-    // -------------------------------------------------------------------------
-    // 0xC5 — Nominal capacity at 25°C
-    // 0xC6 — Coulombic efficiency
-    // -------------------------------------------------------------------------
-    bd.q_nom_ah                                   =   5.00f;
-    bd.coulombic_efficiency                       =   0.998f;
-
-    // -------------------------------------------------------------------------
-    // 0xC7 — R0 ref    0xC8 — R1 ref    0xC9 — tau1 ref
-    // 0xCA — R2 ref    0xCB — tau2 ref
-    // -------------------------------------------------------------------------
-    bd.r0_ref                                     =   0.014f;
-    bd.r1_ref                                     =   0.006f;
-    bd.tau1_ref                                   =  35.0f;
-    bd.r2_ref                                     =   0.003f;
-    bd.tau2_ref                                   = 330.0f;
-
-    // -------------------------------------------------------------------------
-    // 0xCC — Ea R0    0xCD — Ea R1    0xCE — Ea tau1
-    // 0xCF — Ea R2    0xD0 — Ea tau2
-    // -------------------------------------------------------------------------
-    bd.ea_r0                                      =  30000.0f;
-    bd.ea_r1                                      =  25000.0f;
-    bd.ea_tau1                                    =  20000.0f;
-    bd.ea_r2                                      =  20000.0f;
-    bd.ea_tau2                                    =  15000.0f;
-
-    // -------------------------------------------------------------------------
-    // 0xD1 — Kalman process noise SOC
-    // 0xD2 — Kalman process noise RC1
-    // 0xD3 — Kalman process noise RC2
-    // 0xD4 — Kalman measurement noise
-    // -------------------------------------------------------------------------
-    bd.kf_q_soc                                   =  1e-6f;
-    bd.kf_q_rc1                                   =  1e-4f;
-    bd.kf_q_rc2                                   =  1e-5f;
-    bd.kf_r_v                                     =  1e-4f;
-
-    // -------------------------------------------------------------------------
-    // 0xD5 — Per-cell SOC float
-    // 0xD6 — Per-cell V_RC1
-    // 0xD7 — Per-cell V_RC2
-    // -------------------------------------------------------------------------
-    for(uint8_t i = 0; i < 7; i++)
-    {
-        bd.cell_soc_f[i]                          =  0.0f;
-        bd.cell_vrc1[i]                           =  0.0f;
-        bd.cell_vrc2[i]                           =  0.0f;
-    }
-
-    // -------------------------------------------------------------------------
-    // 0xD8 — Per-cell covariance matrix upper triangle
-    // P layout: [P00, P01, P02, P11, P12, P22]
-    // -------------------------------------------------------------------------
-    for(uint8_t i = 0; i < 7; i++)
-    {
-        bd.cell_p[i][0]                           =  0.01f;   // P00 — 1% SoC uncertainty
-        bd.cell_p[i][1]                           =  0.0f;    // P01
-        bd.cell_p[i][2]                           =  0.0f;    // P02
-        bd.cell_p[i][3]                           =  0.001f;  // P11 — V_RC1 variance
-        bd.cell_p[i][4]                           =  0.0f;    // P12
-        bd.cell_p[i][5]                           =  0.001f;  // P22 — V_RC2 variance
-    }
-
-    // -------------------------------------------------------------------------
-    // 0xD9 — Per-cell capacity after aging
-    // 0xDA — Per-cell R0 growth factor
-    // -------------------------------------------------------------------------
-    for(uint8_t i = 0; i < 7; i++)
-    {
-        bd.cell_q_nom_ah[i]                       =  5.00f;
-        bd.cell_r0_scale[i]                       =  1.00f;
-    }
-
-    // -------------------------------------------------------------------------
-    // 0xDC — CycleCount
-    // -------------------------------------------------------------------------
-    bd.cycle_count                                =  0;
-
-    // -------------------------------------------------------------------------
-    // 0xDE — LearningStatus
-    // -------------------------------------------------------------------------
-    bd.learning_status                            =  0x0000;
-    
-}
-*/
-static CommErrorType_t Controls_Set(uint8_t address, uint8_t *cmd, uint8_t length)
+static CommErrorType_t Controls_Set(uint8_t cmd, uint8_t *data, uint8_t length)
 {
     CommErrorType_t res = CE_OK;
 
     // Load data
-    Ctrl_GetData(&cd);
+    Ctrl_GetSystem(&sys);
 
-    if(length != 1)
+    switch(cmd)
     {
-        res = CE_WRONG_CMD;
-    }
-    else 
-    {
-        switch(address)
+        case CC_PING:
         {
-            case 0x00:
+            // No argument, allowed in every state. The ACK is the answer.
+            if(length != 0)
             {
-                if(cmd[0] >= 0x03)
-                {
-                    res = CE_WRONG_CMD;
-                }
-                else 
-                {
-                    Ctrl_SetMode((uint16_t) cmd[0]);
-                }
+                res = CE_WRONG_CMD;
             }
-            break;
-
-            case 0x01: 
-            {
-                if(cmd[0] != 0x00 && cmd[0] != 0x01) 
-                {
-                    res = CE_WRONG_CMD;
-                }
-                else 
-                {
-                    // Allow FET control only in learning mode
-                    if(cd.main_control & BD_MAIN_CTR_MODE_MASK & BD_MAIN_CTR_MODE_LEARNING)
-                    {
-                        Periph_SetFET((bool) cmd[0]);
-                    }
-                    else 
-                    {
-                        res = CE_RO;
-                    }
-                }
-            }
-            break;
-
-            default: 
-            {
-                res = CE_NO_REG; 
-            }
-            break;
         }
-    }
+        break;
 
+        case CC_EEPROM_CONFIG:
+        {
+            // No argument. Allowed in every state: it is how a device that is
+            // waiting for its configuration gets out of that state.
+            if(length != 0)
+            {
+                res = CE_WRONG_CMD;
+            }
+            else if(!Ctrl_ConfigValid())
+            {
+                // Not set up yet, for example the cell count was never written
+                res = CE_WRONG_CMD;
+            }
+            else if(!Ctrl_SaveConfig())
+            {
+                res = CE_EEPROM;
+            }
+        }
+        break;
+
+        case CC_HPPC_START:
+        {
+            if(length != 0)
+            {
+                res = CE_WRONG_CMD;
+            }
+            else if(sys.ctrl_state != BD_CTRL_STATE_NORMAL_RUN)
+            {
+                res = CE_STATE;
+            }
+            else
+            {
+                Ctrl_SetMode(BD_MAIN_CTR_MODE_HPPC);
+            }
+        }
+        break;
+
+        case CC_NORMAL_RUN:
+        {
+            if(length != 0)
+            {
+                res = CE_WRONG_CMD;
+            }
+            else if(sys.ctrl_state != BD_CTRL_STATE_HPPC_RUN)
+            {
+                res = CE_STATE;
+            }
+            else
+            {
+                Ctrl_SetMode(BD_MAIN_CTR_MODE_NORMAL);
+            }
+        }
+        break;
+
+        case CC_SET_FET:
+        {
+            // One argument: 0 - FET off, 1 - FET on
+            if(length != 1 || (data[0] != 0x00 && data[0] != 0x01))
+            {
+                res = CE_WRONG_CMD;
+            }
+            else if(sys.ctrl_state != BD_CTRL_STATE_NORMAL_RUN)
+            {
+                // Not configured yet, or the HPPC sequencer owns the FET
+                res = CE_STATE;
+            }
+            else
+            {
+                // Ctrl_Run switches the FET, this only passes the host's request on
+                Ctrl_SetFetRequest((bool) data[0]);
+            }
+        }
+        break;
+
+        case CC_SET_PRE_FET:
+        {
+            // One argument: 0 - pre-FET off, 1 - pre-FET on
+            if(length != 1 || (data[0] != 0x00 && data[0] != 0x01))
+            {
+                res = CE_WRONG_CMD;
+            }
+            else if(sys.ctrl_state != BD_CTRL_STATE_NORMAL_RUN)
+            {
+                // Not configured yet, or an HPPC test is running
+                res = CE_STATE;
+            }
+            else
+            {
+                // Ctrl_Run switches the pre-FET, this only passes the host's request on
+                Ctrl_SetPreFetRequest((bool) data[0]);
+            }
+        }
+        break;
+
+        case CC_RESET_PROTECTION:
+        {
+            // No argument, allowed in every state. A fault that is still there trips again
+            // after its normal detection time.
+            if(length != 0)
+            {
+                res = CE_WRONG_CMD;
+            }
+            else
+            {
+                Ctrl_ResetProtection();
+            }
+        }
+        break;
+
+        case CC_CLEAR_ERRORS:
+        {
+            // No argument, allowed in every state. Clears every latched error flag;
+            // an error that is still there is set again when it is next seen.
+            if(length != 0)
+            {
+                res = CE_WRONG_CMD;
+            }
+            else
+            {
+                Error_ClearAll();
+            }
+        }
+        break;
+
+        default:
+        {
+            res = CE_WRONG_CMD;
+        }
+        break;
+    }
 
     return res;
 }
@@ -471,246 +212,180 @@ static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data
     void    *data_point    = NULL;
     bool     ro            = false;
     bool     is_fuel_gauge = false;
+    bool     is_config     = false;
+    uint8_t  frame_length  = *length;   // payload length the host sent, *length becomes the register size below
 
-    if(address <= 0x2F)
+    if(address <= 0x0F)
     {
-        // Load data
+        // Peripheral live readings — 0x00 to 0x0F
         Periph_GetData(&pd);
         switch (address)
         {
-            // -------------------------------------------------------
-            // 0x00 — CellVoltage[7] (read-only)
-            // 0x01 — CellVoltageFiltered[7] (read-only)
-            // 0x02 — PackVoltage (read-only)
-            // 0x03 — PackVoltageFiltered (read-only)
-            // 0x04 — PackCurrent (read-only)
-            // 0x05 — PackCurrentFiltered (read-only)
-            // 0x06 — TemperaturePackage (read-only)
-            // 0x07 — TemperatureSTM32 (read-only)
-            // 0x08 — MainVddVoltage (read-only)
-            // 0x09 — FETStatus (read-only)
-            // 0x0A — CurrentSensorOffset
-            // 0x0B — CurrentSensorGain
-            // 0x0C — VoltageOffset[7]
-            // 0x0D — VoltageGain[7]
-            // 0x0E — NTC_Beta
-            // 0x0F — NTC_R_Nominal
-            // 0x10 — NTC_R_Fixed
-            // 0x11 — NTC_T_Nominal
-            // 0x12 — TemperatureOffset
-            // -------------------------------------------------------
-            case 0x00: { data_point = (void *)pd.cell_voltage;                                *length = sizeof(pd.cell_voltage);                               ro = true; } break;
-            case 0x01: { data_point = (void *)pd.cell_voltage_filtered;                       *length = sizeof(pd.cell_voltage_filtered);                      ro = true; } break;
-            case 0x02: { data_point = (void *)&pd.pack_voltage;                               *length = sizeof(pd.pack_voltage);                               ro = true; } break;
-            case 0x03: { data_point = (void *)&pd.pack_voltage_filtered;                      *length = sizeof(pd.pack_voltage_filtered);                      ro = true; } break;
-            case 0x04: { data_point = (void *)&pd.pack_current;                               *length = sizeof(pd.pack_current);                               ro = true; } break;
-            case 0x05: { data_point = (void *)&pd.pack_current_filtered;                      *length = sizeof(pd.pack_current_filtered);                      ro = true; } break;
-            case 0x06: { data_point = (void *)&pd.temperature_package;                        *length = sizeof(pd.temperature_package);                        ro = true; } break;
-            case 0x07: { data_point = (void *)&pd.temperature_stm32;                          *length = sizeof(pd.temperature_stm32);                          ro = true; } break;
-            case 0x08: { data_point = (void *)&pd.main_vdd_voltage_mv;                        *length = sizeof(pd.main_vdd_voltage_mv);                        ro = true; } break;
-            case 0x09: { data_point = (void *)&pd.fet_status;                                 *length = sizeof(pd.fet_status);                                 ro = true; } break;
-            case 0x0A: { data_point = (void *)&pd.current_sensor_offset;                      *length = sizeof(pd.current_sensor_offset);                      } break;
-            case 0x0B: { data_point = (void *)&pd.current_sensor_gain;                        *length = sizeof(pd.current_sensor_gain);                        } break;
-            case 0x0C: { data_point = (void *)pd.voltage_offset;                              *length = sizeof(pd.voltage_offset);                             } break;
-            case 0x0D: { data_point = (void *)pd.voltage_gain;                                *length = sizeof(pd.voltage_gain);                               } break;
-            case 0x0E: { data_point = (void *)&pd.ntc_beta;                                   *length = sizeof(pd.ntc_beta);                                   } break;
-            case 0x0F: { data_point = (void *)&pd.ntc_r_nominal;                              *length = sizeof(pd.ntc_r_nominal);                              } break;
-            case 0x10: { data_point = (void *)&pd.ntc_r_fixed;                                *length = sizeof(pd.ntc_r_fixed);                                } break;
-            case 0x11: { data_point = (void *)&pd.ntc_t_nominal;                              *length = sizeof(pd.ntc_t_nominal);                              } break;
-            case 0x12: { data_point = (void *)&pd.temperature_offset;                         *length = sizeof(pd.temperature_offset);                         } break;
+            case 0x00: { data_point = (void *)pd.cell_voltage;                                   *length = sizeof(pd.cell_voltage);                             ro = true; } break;
+            case 0x01: { data_point = (void *)&pd.pack_voltage;                                  *length = sizeof(pd.pack_voltage);                             ro = true; } break;
+            case 0x02: { data_point = (void *)&pd.pack_current;                                  *length = sizeof(pd.pack_current);                             ro = true; } break;
+            case 0x03: { data_point = (void *)&pd.temperature_package;                           *length = sizeof(pd.temperature_package);                      ro = true; } break;
+            case 0x04: { data_point = (void *)&pd.temperature_stm32;                             *length = sizeof(pd.temperature_stm32);                        ro = true; } break;
+            case 0x05: { data_point = (void *)&pd.main_vdd_voltage_mv;                           *length = sizeof(pd.main_vdd_voltage_mv);                      ro = true; } break;
+            case 0x06: { data_point = (void *)&pd.fet_status;                                    *length = sizeof(pd.fet_status);                               ro = true; } break;
             default: break;
         }
     }
-    else if(address >= 0x30 && address <= 0x7F)
+    else if(address >= 0x10 && address <= 0x1F)
     {
-        // Load data
-        Ctrl_GetData(&cd);
+        // System state — 0x10 to 0x1F
+        Ctrl_GetSystem(&sys);
         switch (address)
         {
-            // -------------------------------------------------------
-            // 0x30 — Configuration
-            // 0x31 — MainControl
-            // 0x32 — PackCapacity
-            // 0x33 — MaxPackVoltage
-            // 0x34 — MinPackVoltage
-            // 0x35 — ChargingTerminationCurrent
-            // 0x36 — UVP slow threshold      
-            // 0x37 — UVP slow time
-            // 0x38 — UVP fast threshold      
-            // 0x39 — UVP fast time
-            // 0x3A — OVP slow threshold      
-            // 0x3B — OVP slow time
-            // 0x3C — OVP fast threshold      
-            // 0x3D — OVP fast time
-            // 0x3E — Charge OCP threshold    
-            // 0x3F — Charge OCP time
-            // 0x40 — Slow OCP threshold      
-            // 0x41 — Slow OCP time
-            // 0x42 — Fast OCP threshold      
-            // 0x43 — Fast OCP time
-            // 0x44 — OTP threshold
-            // 0x45 — OTP time
-            // 0x46 — FaultSnapshotVoltage[7] (read-only)
-            // 0x47 — FaultSnapshotCurrent (read-only)
-            // 0x48 — FaultSnapshotTemperature (read-only)
-            // 0x49 — FaultSnapshotSoC (read-only)
-            // 0x4A — FaultCode[8] (read-only)
-            // 0x4B — FaultTimestamp[8] (read-only)
-            // 0x4C — CellBalancingEnergy[7] (read-only)
-            // 0x4D — CellBalancingTime[7] (read-only)
-            // 0x4E — CellDeepestDischarge[7] (read-only)
-            // 0x4F — CellMaxTemperature[7] (read-only)
-            // 0x50 — LastCommunicationTimestamp (read-only)
-            // 0x51 — UptimeCounter (read-only)
-            // 0x52 — FirmwareVersion[32] (read-only)
-            // 0x53 — HardwareVersion[32] (read-only)
-            // 0x54 — ManufacturerName[32] (read-only)
-            // 0x55 — DeviceName[32] (read-only)
-            // 0x56 — DeviceChemistry[32] (read-only)
-            // 0x57 — ManufacturerData[32] (read-only)
-            // -------------------------------------------------------
-            case 0x30: { data_point = (void *)&cd.configuration;                              *length = sizeof(cd.configuration);                              } break;
-            case 0x31: { data_point = (void *)&cd.main_control;                               *length = sizeof(cd.main_control);                               } break;
-            case 0x32: { data_point = (void *)&cd.cell_capacity;                              *length = sizeof(cd.cell_capacity);                              } break;
-            case 0x33: { data_point = (void *)&cd.voltage_cell_max;                           *length = sizeof(cd.voltage_cell_max);                           } break;
-            case 0x34: { data_point = (void *)&cd.voltage_cell_min;                           *length = sizeof(cd.voltage_cell_min);                           } break;
-            case 0x35: { data_point = (void *)&cd.charging_term_current;                      *length = sizeof(cd.charging_term_current);                      } break;
-            case 0x36: { data_point = (void *)&cd.uvp_slow_threshold_mv;                      *length = sizeof(cd.uvp_slow_threshold_mv);                      } break;
-            case 0x37: { data_point = (void *)&cd.uvp_slow_time_ms;                           *length = sizeof(cd.uvp_slow_time_ms);                           } break;
-            case 0x38: { data_point = (void *)&cd.uvp_fast_threshold_mv;                      *length = sizeof(cd.uvp_fast_threshold_mv);                      } break;
-            case 0x39: { data_point = (void *)&cd.uvp_fast_time_ms;                           *length = sizeof(cd.uvp_fast_time_ms);                           } break;
-            case 0x3A: { data_point = (void *)&cd.ovp_slow_threshold_mv;                      *length = sizeof(cd.ovp_slow_threshold_mv);                      } break;
-            case 0x3B: { data_point = (void *)&cd.ovp_slow_time_ms;                           *length = sizeof(cd.ovp_slow_time_ms);                           } break;
-            case 0x3C: { data_point = (void *)&cd.ovp_fast_threshold_mv;                      *length = sizeof(cd.ovp_fast_threshold_mv);                      } break;
-            case 0x3D: { data_point = (void *)&cd.ovp_fast_time_ms;                           *length = sizeof(cd.ovp_fast_time_ms);                           } break;
-            case 0x3E: { data_point = (void *)&cd.ocp_charge_threshold_ma;                    *length = sizeof(cd.ocp_charge_threshold_ma);                    } break;
-            case 0x3F: { data_point = (void *)&cd.ocp_charge_time_ms;                         *length = sizeof(cd.ocp_charge_time_ms);                         } break;
-            case 0x40: { data_point = (void *)&cd.ocp_discharge_slow_threshold_ma;             *length = sizeof(cd.ocp_discharge_slow_threshold_ma);            } break;
-            case 0x41: { data_point = (void *)&cd.ocp_discharge_slow_time_ms;                 *length = sizeof(cd.ocp_discharge_slow_time_ms);                 } break;
-            case 0x42: { data_point = (void *)&cd.ocp_discharge_fast_threshold_ma;            *length = sizeof(cd.ocp_discharge_fast_threshold_ma);            } break;
-            case 0x43: { data_point = (void *)&cd.ocp_discharge_fast_time_ms;                 *length = sizeof(cd.ocp_discharge_fast_time_ms);                 } break;
-            case 0x44: { data_point = (void *)&cd.otp_threshold_c;                            *length = sizeof(cd.otp_threshold_c);                            } break;
-            case 0x45: { data_point = (void *)&cd.otp_time_ms;                                *length = sizeof(cd.otp_time_ms);                                } break;
-            case 0x46: { data_point = (void *)cd.fault_snapshot_voltage;                      *length = sizeof(cd.fault_snapshot_voltage);                     ro = true; } break;
-            case 0x47: { data_point = (void *)&cd.fault_snapshot_current;                     *length = sizeof(cd.fault_snapshot_current);                     ro = true; } break;
-            case 0x48: { data_point = (void *)&cd.fault_snapshot_temperature;                 *length = sizeof(cd.fault_snapshot_temperature);                 ro = true; } break;
-            case 0x49: { data_point = (void *)&cd.fault_snapshot_soc;                         *length = sizeof(cd.fault_snapshot_soc);                         ro = true; } break;
-            case 0x4A: { data_point = (void *)cd.fault_code;                                  *length = sizeof(cd.fault_code);                                 ro = true; } break;
-            case 0x4B: { data_point = (void *)cd.fault_timestamp;                             *length = sizeof(cd.fault_timestamp);                            ro = true; } break;
-            case 0x4C: { data_point = (void *)cd.cell_balancing_energy;                       *length = sizeof(cd.cell_balancing_energy);                      ro = true; } break;
-            case 0x4D: { data_point = (void *)cd.cell_balancing_time;                         *length = sizeof(cd.cell_balancing_time);                        ro = true; } break;
-            case 0x4E: { data_point = (void *)cd.cell_deepest_discharge;                      *length = sizeof(cd.cell_deepest_discharge);                     ro = true; } break;
-            case 0x4F: { data_point = (void *)cd.cell_max_temperature;                        *length = sizeof(cd.cell_max_temperature);                       ro = true; } break;
-            case 0x50: { data_point = (void *)&cd.last_communication_timestamp;               *length = sizeof(cd.last_communication_timestamp);               ro = true; } break;
-            case 0x51: { data_point = (void *)&cd.uptime_counter;                             *length = sizeof(cd.uptime_counter);                             ro = true; } break;
-            case 0x52: { data_point = (void *)cd.firmware_version;                            *length = sizeof(cd.firmware_version);                           ro = true; } break;
-            case 0x53: { data_point = (void *)cd.hardware_version;                            *length = sizeof(cd.hardware_version);                           ro = true; } break;
-            case 0x54: { data_point = (void *)cd.manufacturer_name;                           *length = sizeof(cd.manufacturer_name);                          ro = true; } break;
-            case 0x55: { data_point = (void *)cd.device_name;                                 *length = sizeof(cd.device_name);                                ro = true; } break;
-            case 0x56: { data_point = (void *)cd.device_chemistry;                            *length = sizeof(cd.device_chemistry);                           ro = true; } break;
-            case 0x57: { data_point = (void *)cd.manufacturer_data;                           *length = sizeof(cd.manufacturer_data);                          ro = true; } break;
+            case 0x10: { data_point = (void *)&sys.main_control;                                 *length = sizeof(sys.main_control);                            ro = true; } break;
+            case 0x11: { data_point = (void *)&sys.last_communication_timestamp;                 *length = sizeof(sys.last_communication_timestamp);            ro = true; } break;
+            case 0x12: { data_point = (void *)&sys.protection_trigger;                           *length = sizeof(sys.protection_trigger);                      ro = true; } break;
+            case 0x13: { data_point = (void *)&sys.ctrl_state;                                   *length = sizeof(sys.ctrl_state);                              ro = true; } break;
+            case 0x15: { data_point = (void *)&sys.error_flags;                                  *length = sizeof(sys.error_flags);                             ro = true; } break;
+            case 0x17: { data_point = (void *)&sys.session_uptime_ms;                            *length = sizeof(sys.session_uptime_ms);                       ro = true; } break;
+            case 0x18: { data_point = (void *)&sys.hppc_direction;                               *length = sizeof(sys.hppc_direction);                          ro = true; } break;
+            case 0x19: { data_point = (void *)&sys.hppc_status;                                  *length = sizeof(sys.hppc_status);                             ro = true; } break;
+            case 0x1A: { data_point = (void *)&sys.hppc_extract_status;                          *length = sizeof(sys.hppc_extract_status);                     ro = true; } break;
             default: break;
         }
     }
-    else if(address >= 0x80 && address <= 0xD9)
+    else if(address >= 0x20 && address <= 0x2F)
     {
-        // Load data
+        // Calibration — 0x20 to 0x2F, the offsets measured at boot (the gains etc. are config registers)
+        Periph_GetCalibration(&cal);
+        switch (address)
+        {
+            case 0x20: { data_point = (void *)&cal.current_sensor_offset;                        *length = sizeof(cal.current_sensor_offset);                  ro = true; } break;
+            case 0x22: { data_point = (void *)cal.voltage_offset;                                *length = sizeof(cal.voltage_offset);                         ro = true; } break;
+            default: break;
+        }
+    }
+    else if(address >= 0x30 && address <= 0x6F)
+    {
+        // Config — 0x30 to 0x5F, device info — 0x60 to 0x6F
+        Ctrl_GetConfig(&cfg);
+        is_config = true;
+        switch (address)
+        {
+            case 0x30: { data_point = (void *)&cfg.cell_count;                                   *length = sizeof(cfg.cell_count);                             } break;
+            case 0x31: { data_point = (void *)&cfg.use_i2c;                                      *length = sizeof(cfg.use_i2c);                                } break;
+            case 0x32: { data_point = (void *)&cfg.use_can;                                      *length = sizeof(cfg.use_can);                                } break;
+            case 0x33: { data_point = (void *)&cfg.use_uart;                                     *length = sizeof(cfg.use_uart);                               } break;
+            case 0x34: { data_point = (void *)&cfg.volt_protection;                              *length = sizeof(cfg.volt_protection);                        } break;
+            case 0x35: { data_point = (void *)&cfg.current_protection;                           *length = sizeof(cfg.current_protection);                     } break;
+            case 0x36: { data_point = (void *)&cfg.temp_protection;                              *length = sizeof(cfg.temp_protection);                        } break;
+            case 0x37: { data_point = (void *)&cfg.cell_capacity;                                *length = sizeof(cfg.cell_capacity);                          } break;
+            case 0x38: { data_point = (void *)&cfg.voltage_cell_max;                             *length = sizeof(cfg.voltage_cell_max);                       } break;
+            case 0x39: { data_point = (void *)&cfg.voltage_cell_min;                             *length = sizeof(cfg.voltage_cell_min);                       } break;
+            case 0x3A: { data_point = (void *)&cfg.charging_term_current;                        *length = sizeof(cfg.charging_term_current);                  } break;
+            case 0x3B: { data_point = (void *)&cfg.uvp_slow_threshold_mv;                        *length = sizeof(cfg.uvp_slow_threshold_mv);                  } break;
+            case 0x3C: { data_point = (void *)&cfg.uvp_slow_time_ms;                             *length = sizeof(cfg.uvp_slow_time_ms);                       } break;
+            case 0x3D: { data_point = (void *)&cfg.uvp_fast_threshold_mv;                        *length = sizeof(cfg.uvp_fast_threshold_mv);                  } break;
+            case 0x3E: { data_point = (void *)&cfg.uvp_fast_time_ms;                             *length = sizeof(cfg.uvp_fast_time_ms);                       } break;
+            case 0x3F: { data_point = (void *)&cfg.ovp_slow_threshold_mv;                        *length = sizeof(cfg.ovp_slow_threshold_mv);                  } break;
+            case 0x40: { data_point = (void *)&cfg.ovp_slow_time_ms;                             *length = sizeof(cfg.ovp_slow_time_ms);                       } break;
+            case 0x41: { data_point = (void *)&cfg.ovp_fast_threshold_mv;                        *length = sizeof(cfg.ovp_fast_threshold_mv);                  } break;
+            case 0x42: { data_point = (void *)&cfg.ovp_fast_time_ms;                             *length = sizeof(cfg.ovp_fast_time_ms);                       } break;
+            case 0x43: { data_point = (void *)&cfg.ocp_charge_threshold_ma;                      *length = sizeof(cfg.ocp_charge_threshold_ma);                } break;
+            case 0x44: { data_point = (void *)&cfg.ocp_charge_time_ms;                           *length = sizeof(cfg.ocp_charge_time_ms);                     } break;
+            case 0x45: { data_point = (void *)&cfg.ocp_discharge_slow_threshold_ma;              *length = sizeof(cfg.ocp_discharge_slow_threshold_ma);        } break;
+            case 0x46: { data_point = (void *)&cfg.ocp_discharge_slow_time_ms;                   *length = sizeof(cfg.ocp_discharge_slow_time_ms);             } break;
+            case 0x47: { data_point = (void *)&cfg.ocp_discharge_fast_threshold_ma;              *length = sizeof(cfg.ocp_discharge_fast_threshold_ma);        } break;
+            case 0x48: { data_point = (void *)&cfg.ocp_discharge_fast_time_ms;                   *length = sizeof(cfg.ocp_discharge_fast_time_ms);             } break;
+            case 0x49: { data_point = (void *)&cfg.otp_threshold_c;                              *length = sizeof(cfg.otp_threshold_c);                        } break;
+            case 0x4A: { data_point = (void *)&cfg.otp_time_ms;                                  *length = sizeof(cfg.otp_time_ms);                            } break;
+            case 0x4B: { data_point = (void *)&cfg.charge_stop_cell_mv;                          *length = sizeof(cfg.charge_stop_cell_mv);                    } break;
+            case 0x4C: { data_point = (void *)&cfg.charge_monitor_cell_mv;                       *length = sizeof(cfg.charge_monitor_cell_mv);                 } break;
+            case 0x4D: { data_point = (void *)&cfg.utp_threshold_c;                              *length = sizeof(cfg.utp_threshold_c);                        } break;
+            case 0x4E: { data_point = (void *)&cfg.utp_time_ms;                                  *length = sizeof(cfg.utp_time_ms);                            } break;
+            case 0x4F: { data_point = (void *)&cfg.otp_charge_threshold_c;                       *length = sizeof(cfg.otp_charge_threshold_c);                 } break;
+            case 0x50: { data_point = (void *)&cfg.ocv_v_lo_mv;                                  *length = sizeof(cfg.ocv_v_lo_mv);                            } break;
+            case 0x51: { data_point = (void *)&cfg.ocv_v_hi_mv;                                  *length = sizeof(cfg.ocv_v_hi_mv);                            } break;
+            case 0x52: { data_point = (void *)&cfg.current_sensor_gain;                          *length = sizeof(cfg.current_sensor_gain);                    } break;
+            case 0x53: { data_point = (void *)cfg.voltage_gain;                                  *length = sizeof(cfg.voltage_gain);                           } break;
+            case 0x54: { data_point = (void *)&cfg.ntc_beta;                                     *length = sizeof(cfg.ntc_beta);                               } break;
+            case 0x55: { data_point = (void *)&cfg.ntc_r_nominal;                                *length = sizeof(cfg.ntc_r_nominal);                          } break;
+            case 0x56: { data_point = (void *)&cfg.ntc_r_fixed;                                  *length = sizeof(cfg.ntc_r_fixed);                            } break;
+            case 0x57: { data_point = (void *)&cfg.ntc_t_nominal;                                *length = sizeof(cfg.ntc_t_nominal);                          } break;
+            case 0x58: { data_point = (void *)&cfg.temperature_offset;                           *length = sizeof(cfg.temperature_offset);                     } break;
+            case 0x59: { data_point = (void *)&cfg.shunt_resistance_mohm;                        *length = sizeof(cfg.shunt_resistance_mohm);                  } break;
+            case 0x5A: { data_point = (void *)&cfg.current_bias_ma;                              *length = sizeof(cfg.current_bias_ma);                        } break;
+            case 0x60: { data_point = (void *)cfg.firmware_version;                              *length = sizeof(cfg.firmware_version);                                  } break;
+            case 0x61: { data_point = (void *)cfg.hardware_version;                              *length = sizeof(cfg.hardware_version);                                  } break;
+            case 0x62: { data_point = (void *)cfg.manufacturer_name;                             *length = sizeof(cfg.manufacturer_name);                                 } break;
+            case 0x63: { data_point = (void *)cfg.device_name;                                   *length = sizeof(cfg.device_name);                                       } break;
+            case 0x64: { data_point = (void *)cfg.device_chemistry;                              *length = sizeof(cfg.device_chemistry);                                  } break;
+            case 0x65: { data_point = (void *)cfg.manufacturer_data;                             *length = sizeof(cfg.manufacturer_data);                                 } break;
+            default: break;
+        }
+    }
+    else if(address >= 0x70 && address <= 0x7F)
+    {
+        // Stats — 0x70 to 0x7F
+        Ctrl_GetStats(&st);
+        switch (address)
+        {
+            case 0x70: { data_point = (void *)st.fault_snapshot_voltage;                         *length = sizeof(st.fault_snapshot_voltage);                   ro = true; } break;
+            case 0x71: { data_point = (void *)&st.fault_snapshot_current;                        *length = sizeof(st.fault_snapshot_current);                   ro = true; } break;
+            case 0x72: { data_point = (void *)&st.fault_snapshot_temperature;                    *length = sizeof(st.fault_snapshot_temperature);               ro = true; } break;
+            case 0x73: { data_point = (void *)&st.fault_snapshot_soc;                            *length = sizeof(st.fault_snapshot_soc);                       ro = true; } break;
+            case 0x74: { data_point = (void *)st.fault_code;                                     *length = sizeof(st.fault_code);                               ro = true; } break;
+            case 0x75: { data_point = (void *)st.fault_timestamp;                                *length = sizeof(st.fault_timestamp);                          ro = true; } break;
+            case 0x76: { data_point = (void *)st.cell_balancing_energy;                          *length = sizeof(st.cell_balancing_energy);                    ro = true; } break;
+            case 0x77: { data_point = (void *)st.cell_balancing_time;                            *length = sizeof(st.cell_balancing_time);                      ro = true; } break;
+            case 0x78: { data_point = (void *)st.cell_deepest_discharge;                         *length = sizeof(st.cell_deepest_discharge);                   ro = true; } break;
+            case 0x79: { data_point = (void *)st.cell_max_temperature;                           *length = sizeof(st.cell_max_temperature);                     ro = true; } break;
+            default: break;
+        }
+    }
+    else if(address >= 0x90 && address <= 0xDF)
+    {
+        // Fuel gauge — outputs 0x90, model 0xA0, state 0xD0
         FuelGauge_GetData(&fg);
         is_fuel_gauge = true;
         switch (address)
         {
-            // -------------------------------------------------------
-            // 0x80 — RelativeSoC (read-only)
-            // 0x81 — CellSoC[7] (read-only)
-            // 0x82 — CellSoH[7] (read-only)
-            // 0x83 — CellRemainingCapacity[7] (read-only)
-            // 0x84 — CellSelfDischarge[7] (read-only)
-            // 0x85 — CellQmax[7] (read-only)
-            // 0x86 — SOC grid[20]
-            // 0x87 — OCV discharge[20]
-            // 0x88 — OCV charge[20]
-            // 0x89 — R0 discharge[20]
-            // 0x8A — R1 discharge[20]
-            // 0x8B — tau1 discharge[20]
-            // 0x8C — R2 discharge[20]
-            // 0x8D — tau2 discharge[20]
-            // 0x8E — R0 charge[20]
-            // 0x8F — R1 charge[20]
-            // 0x90 — tau1 charge[20]  
-            // 0x91 — R2 charge[20]
-            // 0x92 — tau2 charge[20]
-            // 0x93 — Q_nom temperature setpoints[5]
-            // 0x94 — Q_nom at each temperature[5]
-            // 0x95 — Nominal capacity at 25°C
-            // 0x96 — Coulombic efficiency
-            // 0x97 — R0 ref    
-            // 0x98 — R1 ref    
-            // 0x99 — tau1 ref
-            // 0x9A — R2 ref    
-            // 0x9B — tau2 ref
-            // 0x9C — Ea R0    
-            // 0x9D — Ea R1    
-            // 0x9E — Ea tau1
-            // 0x9F — Ea R2    
-            // 0xA0 — Ea tau2
-            // 0xA1 — KF process noise SOC    
-            // 0xA2 — KF process noise RC1
-            // 0xA3 — KF process noise RC2    
-            // 0xA4 — KF measurement noise
-            // 0xA5 — cell_soc_f[7] (read-only)
-            // 0xA6 — cell_vrc1[7] (read-only)
-            // 0xA7 — cell_vrc2[7] (read-only)
-            // 0xA8 — cell_p[7][6]
-            // 0xA9 — cell_q_nom_ah[7] (read-only)
-            // 0xAA — cell_r0_scale[7] (read-only)
-            // 0xAB — CycleCount (read-only)
-            // 0xAC — LearningStatus (read-only)
-            // -------------------------------------------------------
-            case 0x80: { data_point = (void *)&fg.relative_soc;                               *length = sizeof(fg.relative_soc);                               ro = true; } break;
-            case 0x81: { data_point = (void *)&fg.cell_soc[0];                                *length = sizeof(fg.cell_soc);                                   ro = true; } break;
-            case 0x82: { data_point = (void *)&fg.cell_soh[0];                                *length = sizeof(fg.cell_soh);                                   ro = true; } break;
-            case 0x83: { data_point = (void *)&fg.cell_remaining_capacity[0];                 *length = sizeof(fg.cell_remaining_capacity);                    ro = true; } break;
-            case 0x84: { data_point = (void *)&fg.cell_self_discharge[0];                     *length = sizeof(fg.cell_self_discharge);                        ro = true; } break;
-            case 0x85: { data_point = (void *)&fg.cell_qmax[0];                               *length = sizeof(fg.cell_qmax);                                  ro = true; } break;
-            case 0x86: { data_point = (void *)fg.soc_grid;                                    *length = sizeof(fg.soc_grid);                                   } break;
-            case 0x87: { data_point = (void *)fg.ocv_dis;                                     *length = sizeof(fg.ocv_dis);                                    } break;
-            case 0x88: { data_point = (void *)fg.ocv_chg;                                     *length = sizeof(fg.ocv_chg);                                    } break;
-            case 0x89: { data_point = (void *)fg.r0_dis;                                      *length = sizeof(fg.r0_dis);                                     } break;
-            case 0x8A: { data_point = (void *)fg.r1_dis;                                      *length = sizeof(fg.r1_dis);                                     } break;
-            case 0x8B: { data_point = (void *)fg.tau1_dis;                                    *length = sizeof(fg.tau1_dis);                                   } break;
-            case 0x8C: { data_point = (void *)fg.r2_dis;                                      *length = sizeof(fg.r2_dis);                                     } break;
-            case 0x8D: { data_point = (void *)fg.tau2_dis;                                    *length = sizeof(fg.tau2_dis);                                   } break;
-            case 0x8E: { data_point = (void *)fg.r0_chg;                                      *length = sizeof(fg.r0_chg);                                     } break;
-            case 0x8F: { data_point = (void *)fg.r1_chg;                                      *length = sizeof(fg.r1_chg);                                     } break;
-            case 0x90: { data_point = (void *)fg.tau1_chg;                                    *length = sizeof(fg.tau1_chg);                                   } break;
-            case 0x91: { data_point = (void *)fg.r2_chg;                                      *length = sizeof(fg.r2_chg);                                     } break;
-            case 0x92: { data_point = (void *)fg.tau2_chg;                                    *length = sizeof(fg.tau2_chg);                                   } break;
-            case 0x93: { data_point = (void *)fg.q_nom_temp_c;                                *length = sizeof(fg.q_nom_temp_c);                               } break;
-            case 0x94: { data_point = (void *)fg.q_nom_temp_ah;                               *length = sizeof(fg.q_nom_temp_ah);                              } break;
-            case 0x95: { data_point = (void *)&fg.q_nom_ah;                                   *length = sizeof(fg.q_nom_ah);                                   } break;
-            case 0x96: { data_point = (void *)&fg.coulombic_efficiency;                       *length = sizeof(fg.coulombic_efficiency);                       } break;
-            case 0x97: { data_point = (void *)&fg.r0_ref;                                     *length = sizeof(fg.r0_ref);                                     } break;
-            case 0x98: { data_point = (void *)&fg.r1_ref;                                     *length = sizeof(fg.r1_ref);                                     } break;
-            case 0x99: { data_point = (void *)&fg.tau1_ref;                                   *length = sizeof(fg.tau1_ref);                                   } break;
-            case 0x9A: { data_point = (void *)&fg.r2_ref;                                     *length = sizeof(fg.r2_ref);                                     } break;
-            case 0x9B: { data_point = (void *)&fg.tau2_ref;                                   *length = sizeof(fg.tau2_ref);                                   } break;
-            case 0x9C: { data_point = (void *)&fg.ea_r0;                                      *length = sizeof(fg.ea_r0);                                      } break;
-            case 0x9D: { data_point = (void *)&fg.ea_r1;                                      *length = sizeof(fg.ea_r1);                                      } break;
-            case 0x9E: { data_point = (void *)&fg.ea_tau1;                                    *length = sizeof(fg.ea_tau1);                                    } break;
-            case 0x9F: { data_point = (void *)&fg.ea_r2;                                      *length = sizeof(fg.ea_r2);                                      } break;
-            case 0xA0: { data_point = (void *)&fg.ea_tau2;                                    *length = sizeof(fg.ea_tau2);                                    } break;
-            case 0xA1: { data_point = (void *)&fg.kf_q_soc;                                   *length = sizeof(fg.kf_q_soc);                                   } break;
-            case 0xA2: { data_point = (void *)&fg.kf_q_rc1;                                   *length = sizeof(fg.kf_q_rc1);                                   } break;
-            case 0xA3: { data_point = (void *)&fg.kf_q_rc2;                                   *length = sizeof(fg.kf_q_rc2);                                   } break;
-            case 0xA4: { data_point = (void *)&fg.kf_r_v;                                     *length = sizeof(fg.kf_r_v);                                     } break;
-            case 0xA5: { data_point = (void *)fg.cell_soc_f;                                  *length = sizeof(fg.cell_soc_f);                                 ro = true; } break;
-            case 0xA6: { data_point = (void *)fg.cell_vrc1;                                   *length = sizeof(fg.cell_vrc1);                                  ro = true; } break;
-            case 0xA7: { data_point = (void *)fg.cell_vrc2;                                   *length = sizeof(fg.cell_vrc2);                                  ro = true; } break;
-            case 0xA8: { data_point = (void *)fg.cell_p;                                      *length = sizeof(fg.cell_p);                                     } break;
-            case 0xA9: { data_point = (void *)fg.cell_q_nom_ah;                               *length = sizeof(fg.cell_q_nom_ah);                              ro = true; } break;
-            case 0xAA: { data_point = (void *)fg.cell_r0_scale;                               *length = sizeof(fg.cell_r0_scale);                              ro = true; } break;
-            case 0xAB: { data_point = (void *)&fg.cycle_count;                                *length = sizeof(fg.cycle_count);                                ro = true; } break;
-            case 0xAC: { data_point = (void *)&fg.learning_status;                            *length = sizeof(fg.learning_status);                            ro = true; } break;
+            case 0x90: { data_point = (void *)&fg.relative_soc;                                  *length = sizeof(fg.relative_soc);                             ro = true; } break;
+            case 0x91: { data_point = (void *)&fg.absolute_soc;                                  *length = sizeof(fg.absolute_soc);                             ro = true; } break;
+            case 0x92: { data_point = (void *)fg.cell_soc;                                       *length = sizeof(fg.cell_soc);                                 ro = true; } break;
+            case 0x93: { data_point = (void *)fg.cell_soh;                                       *length = sizeof(fg.cell_soh);                                 ro = true; } break;
+            case 0x94: { data_point = (void *)fg.cell_remaining_capacity;                        *length = sizeof(fg.cell_remaining_capacity);                  ro = true; } break;
+            case 0x95: { data_point = (void *)fg.cell_self_discharge;                            *length = sizeof(fg.cell_self_discharge);                      ro = true; } break;
+            case 0x96: { data_point = (void *)&fg.learning_status;                               *length = sizeof(fg.learning_status);                          ro = true; } break;
+            case 0x9F: { data_point = (void *)&model_cell;                                       *length = sizeof(model_cell);                                  is_fuel_gauge = false; } break;
+            case 0xA0: { data_point = (void *)fg.soc_grid;                                       *length = sizeof(fg.soc_grid);                                } break;
+            case 0xA1: { data_point = (void *)fg.cell[model_cell].ocv_dis;                                        *length = sizeof(fg.cell[0].ocv_dis);                                 } break;
+            case 0xA2: { data_point = (void *)fg.cell[model_cell].ocv_chg;                                        *length = sizeof(fg.cell[0].ocv_chg);                                 } break;
+            case 0xA3: { data_point = (void *)fg.cell[model_cell].r0_dis;                                         *length = sizeof(fg.cell[0].r0_dis);                                  } break;
+            case 0xA4: { data_point = (void *)fg.cell[model_cell].r1_dis;                                         *length = sizeof(fg.cell[0].r1_dis);                                  } break;
+            case 0xA5: { data_point = (void *)fg.cell[model_cell].tau1_dis;                                       *length = sizeof(fg.cell[0].tau1_dis);                                } break;
+            case 0xA6: { data_point = (void *)fg.cell[model_cell].r2_dis;                                         *length = sizeof(fg.cell[0].r2_dis);                                  } break;
+            case 0xA7: { data_point = (void *)fg.cell[model_cell].tau2_dis;                                       *length = sizeof(fg.cell[0].tau2_dis);                                } break;
+            case 0xA8: { data_point = (void *)fg.cell[model_cell].r0_chg;                                         *length = sizeof(fg.cell[0].r0_chg);                                  } break;
+            case 0xA9: { data_point = (void *)fg.cell[model_cell].r1_chg;                                         *length = sizeof(fg.cell[0].r1_chg);                                  } break;
+            case 0xAA: { data_point = (void *)fg.cell[model_cell].tau1_chg;                                       *length = sizeof(fg.cell[0].tau1_chg);                                } break;
+            case 0xAB: { data_point = (void *)fg.cell[model_cell].r2_chg;                                         *length = sizeof(fg.cell[0].r2_chg);                                  } break;
+            case 0xAC: { data_point = (void *)fg.cell[model_cell].tau2_chg;                                       *length = sizeof(fg.cell[0].tau2_chg);                                } break;
+            case 0xAD: { data_point = (void *)fg.q_nom_temp_c;                                   *length = sizeof(fg.q_nom_temp_c);                            } break;
+            case 0xAE: { data_point = (void *)fg.q_nom_temp_ah;                                  *length = sizeof(fg.q_nom_temp_ah);                           } break;
+            case 0xAF: { data_point = (void *)&fg.q_nom_ah;                                      *length = sizeof(fg.q_nom_ah);                                } break;
+            case 0xB0: { data_point = (void *)&fg.coulombic_efficiency;                          *length = sizeof(fg.coulombic_efficiency);                    } break;
+            case 0xB6: { data_point = (void *)&fg.ea_r0;                                         *length = sizeof(fg.ea_r0);                                   } break;
+            case 0xB7: { data_point = (void *)&fg.ea_r1;                                         *length = sizeof(fg.ea_r1);                                   } break;
+            case 0xB8: { data_point = (void *)&fg.ea_tau1;                                       *length = sizeof(fg.ea_tau1);                                 } break;
+            case 0xB9: { data_point = (void *)&fg.ea_r2;                                         *length = sizeof(fg.ea_r2);                                   } break;
+            case 0xBA: { data_point = (void *)&fg.ea_tau2;                                       *length = sizeof(fg.ea_tau2);                                 } break;
+            case 0xBB: { data_point = (void *)&fg.kf_q_soc;                                      *length = sizeof(fg.kf_q_soc);                                } break;
+            case 0xBC: { data_point = (void *)&fg.kf_q_rc1;                                      *length = sizeof(fg.kf_q_rc1);                                } break;
+            case 0xBD: { data_point = (void *)&fg.kf_q_rc2;                                      *length = sizeof(fg.kf_q_rc2);                                } break;
+            case 0xBE: { data_point = (void *)&fg.kf_r_v;                                        *length = sizeof(fg.kf_r_v);                                  } break;
+            case 0xD0: { data_point = (void *)fg.cell_soc_f;                                     *length = sizeof(fg.cell_soc_f);                               ro = true; } break;
+            case 0xD1: { data_point = (void *)fg.cell_vrc1;                                      *length = sizeof(fg.cell_vrc1);                                ro = true; } break;
+            case 0xD2: { data_point = (void *)fg.cell_vrc2;                                      *length = sizeof(fg.cell_vrc2);                                ro = true; } break;
+            case 0xD3: { data_point = (void *)fg.cell_p;                                         *length = sizeof(fg.cell_p);                                   ro = true; } break;
+            case 0xD4: { data_point = (void *)&fg.cell[model_cell].capacity_ah;                                  *length = sizeof(fg.cell[0].capacity_ah);                                       } break;
+            case 0xD6: { data_point = (void *)fg.cell_qmax;                                      *length = sizeof(fg.cell_qmax);                                ro = true; } break;
+            case 0xD7: { data_point = (void *)&fg.cycle_count;                                   *length = sizeof(fg.cycle_count);                              ro = true; } break;
             default: break;
         }
     }
@@ -726,6 +401,30 @@ static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data
     }
     else if(write && !ro)
     {
+        // A write must carry exactly the register size, otherwise bytes past the payload would be copied
+        if(frame_length != *length)
+        {
+            return CE_WRONG_CMD;
+        }
+
+        // The cell count has to stay inside what the hardware measures
+        if(is_config && address == 0x30 && (raw_data[0] < BD_CELL_COUNT_MIN || raw_data[0] > BD_CELL_COUNT_MAX))
+        {
+            return CE_WRONG_CMD;
+        }
+
+        // The model registers act on one cell, picked with register 0x9F
+        if(address == 0x9F && raw_data[0] >= BD_CELL_COUNT_MAX)
+        {
+            return CE_WRONG_CMD;
+        }
+
+        // The on/off settings (0x31 to 0x36) are a single byte, 0 or 1
+        if(is_config && address >= 0x31 && address <= 0x36 && raw_data[0] > 1)
+        {
+            return CE_WRONG_CMD;
+        }
+
         memcpy(data_point, raw_data, *length);
 
         // The fuel gauge owns its registers, so a write has to be pushed back
@@ -735,7 +434,21 @@ static CommErrorType_t Data_ReadWriteRegister(uint8_t address, uint8_t *raw_data
         // in between.
         if(is_fuel_gauge)
         {
-            FuelGauge_SetData(&fg);
+            // A NaN or inf float is refused, the fuel gauge keeps its old values
+            if(!FuelGauge_SetData(&fg))
+            {
+                return CE_WRONG_CMD;
+            }
+        }
+
+        // Same for the config: hand the changed settings to the control module
+        if(is_config)
+        {
+            // A NaN or inf calibration float is refused, the control module keeps its old config
+            if(!Ctrl_SetConfig(&cfg))
+            {
+                return CE_WRONG_CMD;
+            }
         }
     }
     else
@@ -759,7 +472,7 @@ static void RemoveAppFlag(void)
 
     erase_init.TypeErase   = FLASH_TYPEERASE_PAGES;
     erase_init.Banks       = FLASH_BANK_1;
-    erase_init.Page        = APP_FLAG_FLASH_LAGE;
+    erase_init.Page        = APP_FLAG_FLASH_PAGE;
     erase_init.NbPages     = 1;
 
     status = HAL_FLASHEx_Erase(&erase_init, &page_error);
@@ -781,7 +494,6 @@ static void ProcessCommand()
     uint8_t             length;
     uint8_t             address;
     uint8_t             crc_calc, crc_rec;
-    bool                write = false;
     CommErrorType_t     res;
 
     // -------------------------------------------------------
@@ -791,7 +503,16 @@ static void ProcessCommand()
     if( cmd != CC_WRITE && 
         cmd != CC_READ && 
         cmd != CC_BOOTLOADER &&
-        cmd != CC_CMD)
+        cmd != CC_EEPROM_CONFIG &&
+        cmd != CC_HPPC_START &&
+        cmd != CC_NORMAL_RUN &&
+        cmd != CC_SET_FET &&
+        cmd != CC_SET_PRE_FET &&
+        cmd != CC_RESET_PROTECTION &&
+        cmd != CC_CLEAR_ERRORS &&
+        cmd != CC_SIM_SAMPLE &&
+        cmd != CC_REBOOT &&
+        cmd != CC_PING)
     {
         SendError(CE_WRONG_CMD);
         return;
@@ -828,79 +549,52 @@ static void ProcessCommand()
         return;
     }
 
-    if(cmd == CC_CMD)
+    // A good frame came from the host
+    Ctrl_SetLastCommunication();
+
+    // -------------------------------------------------------
+    // Execute
+    // -------------------------------------------------------
+    if(cmd == CC_WRITE)
     {
-        res = Controls_Set(address, &rx_buf[3], length);
-
-        if(res == CE_OK)
+        res = Data_ReadWriteRegister(address, &rx_buf[3], &length, true);
+    }
+    else if(cmd == CC_READ)
+    {
+        // The peripheral data is copied with interrupts masked inside Periph_GetData / Periph_GetCalibration
+        res = Data_ReadWriteRegister(address, &tx_buf[3], &length, false);
+    }
+    else if(cmd == CC_REBOOT)
+    {
+        // No argument. Allowed in every state.
+        if(length != 0)
         {
-            // ACK: [CC_ACK][code][crc]
-            tx_buf[0] = CC_ACK;
-            tx_buf[1] = 0;
-            tx_buf[2] = 0;
-            tx_buf[3] = Checksum(tx_buf, 3);
-            length = 0;
-
+            res = CE_WRONG_CMD;
         }
         else
         {
-            SendError( res);
-            return;
+            res = CE_OK;
         }
     }
-    else if(cmd == CC_WRITE || cmd == CC_READ)
+#ifdef OPENBMS_SIMULATION
+    else if(cmd == CC_SIM_SAMPLE)
     {
-        // -------------------------------------------------------
-        // Execute read or write
-        // -------------------------------------------------------
-        if     (cmd == 0x01) write = true;
-        else if(cmd == 0x02) write = false;
-
-        if(write)
-        {
-            res = Data_ReadWriteRegister(address, &rx_buf[3], &length, true);
-        }
-        else
-        {
-            // During read operation, disable interrupts from ADS to prevent data corruption
-            HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);    // ADS131 DRDY
-            HAL_NVIC_DisableIRQ(ADC1_IRQn);         // STM32 internal ADC
-            res = Data_ReadWriteRegister(address, &tx_buf[3], &length, false);
-            HAL_NVIC_EnableIRQ(EXTI15_10_IRQn); 
-            HAL_NVIC_EnableIRQ(ADC1_IRQn);
-
-        }
-
-        if(res != CE_OK)
-        {
-            SendError( res);
-            return;
-        }
-
-        // -------------------------------------------------------
-        // Respond
-        // -------------------------------------------------------
-        if(write)
-        {
-            // ACK: [CC_ACK][code][crc]
-            tx_buf[0] = CC_ACK;
-            tx_buf[1] = 0;
-            tx_buf[2] = 0;
-            tx_buf[3] = Checksum(tx_buf, 3);
-            length = 0;
-        }
-        else
-        {
-            // Read response: [CC_READ][address][length][data...][crc]
-            tx_buf[0] = CC_READ;
-            tx_buf[1] = address;
-            tx_buf[2] = length;
-            // Data is already store at this moment
-            tx_buf[length + 3] = Checksum(tx_buf, length + 3);
-        }
+        res = Sim_Sample(&rx_buf[3], length, &tx_buf[3], &length);
+    }
+#endif
+    else
+    {
+        res = Controls_Set(cmd, &rx_buf[3], length);
     }
 
-    SendResponse(tx_buf, length + 4);
+    SendReply(res, cmd, address, length);
+
+    // Reset only after the ACK has been handed to the UART
+    if(cmd == CC_REBOOT && res == CE_OK)
+    {
+        HAL_Delay(100);
+        NVIC_SystemReset();
+    }
 }
 static uint8_t Checksum(uint8_t *data, uint16_t length)
 {
@@ -913,16 +607,35 @@ static uint8_t Checksum(uint8_t *data, uint16_t length)
 }
 static void SendResponse(uint8_t *data, uint8_t length)
 {
-    // Wait for previous send to finish
-    while(uart_cmd.tx_wait);
+    uint32_t start = HAL_GetTick();
+
+    // Wait for previous send to finish. The longest reply takes about 8 ms at 230400 baud,
+    // so a send still running after UART_TX_TIMEOUT_MS is stuck: abort it instead of
+    // blocking the main loop for good.
+    while(uart_cmd.tx_wait)
+    {
+        if((HAL_GetTick() - start) > UART_TX_TIMEOUT_MS)
+        {
+            HAL_UART_AbortTransmit(&huart1);
+            uart_cmd.tx_wait = false;
+            Error_Set(OPENBMS_UART_TX_TIMEOUT);
+        }
+    }
 
     // Raise the flag and send new data
     uart_cmd.tx_wait = true;
-    HAL_UART_Transmit_DMA(&huart1, (uint8_t *)data, length);
+
+    // If the transfer could not be started there will be no TX complete
+    // interrupt to clear the flag, and the next send would wait for it forever
+    if(HAL_UART_Transmit_DMA(&huart1, (uint8_t *)data, length) != HAL_OK)
+    {
+        uart_cmd.tx_wait = false;
+    }
 }
 static void SendError(CommErrorType_t err)
 {
-    uint8_t buff[5];
+    // static: the DMA is still reading this buffer after the function has returned
+    static uint8_t buff[5];
 
     buff[0] = CC_ERROR;
     buff[1] = 0;    // Address
@@ -932,6 +645,90 @@ static void SendError(CommErrorType_t err)
 
     SendResponse(buff, sizeof(buff));
 }
+static void SendReply(CommErrorType_t res, uint8_t cmd, uint8_t address, uint8_t length)
+{
+    uint8_t *tx_buf = uart_cmd.tx_buffer;
+
+    if(res != CE_OK)
+    {
+        SendError(res);
+        return;
+    }
+
+    if(cmd == CC_READ || cmd == CC_SIM_SAMPLE)
+    {
+        // Reply with data: the payload is already in tx_buf[3...]
+        tx_buf[0] = cmd;
+        tx_buf[1] = address;
+        tx_buf[2] = length;
+        tx_buf[length + 3] = Checksum(tx_buf, length + 3);
+        SendResponse(tx_buf, length + 4);
+    }
+    else
+    {
+        tx_buf[0] = CC_ACK;
+        tx_buf[1] = 0;
+        tx_buf[2] = 0;
+        tx_buf[3] = Checksum(tx_buf, 3);
+        SendResponse(tx_buf, 4);
+    }
+}
+#ifdef OPENBMS_SIMULATION
+static CommErrorType_t Sim_Sample(const uint8_t *data, uint8_t length, uint8_t *reply, uint8_t *reply_length)
+{
+    float    cell_mv[BD_CELL_COUNT_MAX];
+    float    current_ma;
+    uint16_t dt_ms;
+    uint8_t  n = 0;
+
+    if(length != SIM_SAMPLE_LENGTH)
+    {
+        return CE_WRONG_CMD;
+    }
+
+    // Only a configured device runs the control loop
+    Ctrl_GetSystem(&sys);
+    if(sys.ctrl_state != BD_CTRL_STATE_NORMAL_RUN && sys.ctrl_state != BD_CTRL_STATE_HPPC_RUN)
+    {
+        return CE_STATE;
+    }
+
+    memcpy(cell_mv, &data[0], sizeof(cell_mv));
+    memcpy(&current_ma, &data[sizeof(cell_mv)], sizeof(current_ma));
+    memcpy(&dt_ms, &data[sizeof(cell_mv) + sizeof(current_ma)], sizeof(dt_ms));
+
+    // A NaN would stay in the fuel gauge and the extraction for good
+    if(!isfinite(current_ma))
+    {
+        return CE_WRONG_CMD;
+    }
+
+    for(uint8_t i = 0; i < BD_CELL_COUNT_MAX; i++)
+    {
+        if(!isfinite(cell_mv[i]))
+        {
+            return CE_WRONG_CMD;
+        }
+    }
+
+    // One sample, one pass of the control loop
+    Ctrl_SimSample(cell_mv, current_ma, dt_ms);
+
+    // The reply tells the host what the firmware did with it
+    Ctrl_GetSystem(&sys);
+    Periph_GetData(&pd);
+
+    memcpy(&reply[n], &pd.fet_status, sizeof(pd.fet_status));                     n += sizeof(pd.fet_status);
+    memcpy(&reply[n], &sys.ctrl_state, sizeof(sys.ctrl_state));                   n += sizeof(sys.ctrl_state);
+    memcpy(&reply[n], &sys.hppc_status, sizeof(sys.hppc_status));                 n += sizeof(sys.hppc_status);
+    memcpy(&reply[n], &sys.hppc_extract_status, sizeof(sys.hppc_extract_status)); n += sizeof(sys.hppc_extract_status);
+    memcpy(&reply[n], &sys.protection_trigger, sizeof(sys.protection_trigger));   n += sizeof(sys.protection_trigger);
+    memcpy(&reply[n], &sys.error_flags, sizeof(sys.error_flags));                 n += sizeof(sys.error_flags);
+
+    *reply_length = n;
+    return CE_OK;
+}
+#endif
 void Comm_Init(void)
 {
     // Start data receiving on UART
@@ -943,14 +740,21 @@ void Comm_Run(void)
   {
     ProcessCommand();
     uart_cmd.frame_ready = false;
-    uart_cmd.rx_length   = 0;
+  }
+
+  // Safety net: reception must always be running. If an error stopped it and the
+  // re-arm in the error callback failed, start it again here.
+  if(debug_uart->RxState == HAL_UART_STATE_READY)
+  {
+    HAL_UARTEx_ReceiveToIdle_DMA(debug_uart, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
   }
 }
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
+    UNUSED(size);
+
     if(huart->Instance == USART1)
     {
-        uart_cmd.rx_length       = size;
         uart_cmd.frame_ready     = true;
         HAL_UARTEx_ReceiveToIdle_DMA(debug_uart, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
     }
@@ -961,5 +765,26 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   {
     // transmission finished — buffer is now safe to reuse/refill
     uart_cmd.tx_wait = false;
+  }
+}
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if(huart->Instance == USART1)
+  {
+    // The HAL has already cleared the error flags and stopped the transfer that failed.
+    // Report it and restart what was stopped, so the link keeps working.
+    Error_Set(OPENBMS_UART_ERROR);
+
+    // A failed send gives no TX complete interrupt, so release the waiting sender here
+    if(huart->gState == HAL_UART_STATE_READY)
+    {
+      uart_cmd.tx_wait = false;
+    }
+
+    // Reception was aborted: drop the broken frame and listen again
+    if(huart->RxState == HAL_UART_STATE_READY)
+    {
+      HAL_UARTEx_ReceiveToIdle_DMA(debug_uart, uart_cmd.rx_buffer, UART_RX_BUFFER_SIZE);
+    }
   }
 }
