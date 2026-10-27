@@ -24,32 +24,29 @@
 #include <string.h>
 #include "openbms_periph.h"
 
-#define ADS_FULL_SCALE_GAIN_16                150.0f
-#define ADS_FULL_SCALE_GAIN_4                 600.0f
+#define PER_ADS_FULL_SCALE_GAIN_16                150.0f
+#define PER_ADS_FULL_SCALE_GAIN_4                 600.0f
 
 // The ADS131M08 delivers a sample every ~4 ms (252 Hz). Current and cell voltages
 // are smoothed here with a single-pole filter to a 50 Hz corner:
 //   coef = 1 - exp(-2 * pi * 50 / 252) = 0.713
-#define ADS_READ_FILT_COEF                    0.713f
+#define PER_ADS_READ_FILT_COEF                    0.713f
 
 // Sample frame checks: STATUS word in bytes 0-1 (byte 2 is padding), output CRC in bytes 27-28
-#define ADS_STATUS_RESET                      (1 << 10)     // STATUS bit 10: the device has reset
-#define ADS_STATUS_DRDY_ALL                   (0xFF)        // STATUS bits 7:0: new data on all 8 channels
-#define ADS_DATA_TIMEOUT_MS                   (100U)        // no good sample for this long: measurement lost (~25 samples)
-#define ADS_RESET_TIMEOUT_MS                  (10U)         // DRDY must go high this soon after the SYNC reset, else the ADS init fails
+#define PER_ADS_STATUS_RESET                      (1 << 10)     // STATUS bit 10: the device has reset
+#define PER_ADS_STATUS_DRDY_ALL                   (0xFF)        // STATUS bits 7:0: new data on all 8 channels
+#define PER_ADS_RESET_TIMEOUT_MS                  (10U)         // DRDY must go high this soon after the SYNC reset, else the ADS init fails
 
 // NTC divider on the internal ADC (12 bit): a reading this close to either end means the NTC is open or shorted
-#define NTC_ADC_MIN_COUNTS                    (20U)
-#define NTC_ADC_MAX_COUNTS                    (4075U)
-
-#define HW_CELL_VOLTAGE_RESISTANCE_FACTOR     29.3333333f
+#define PER_NTC_ADC_MIN_COUNTS                    (20U)
+#define PER_NTC_ADC_MAX_COUNTS                    (4075U)
 
 typedef struct
 {
     bool    gpio_meas_cell_voltage_enable;
     bool    gpio_meas_pack_voltage_enable;
     bool    gpio_pwr_on;
-    bool    gpio_cell_balancer_enable[7];
+    bool    gpio_cell_balancer_enable[SYS_CELL_COUNT_MAX];
 
     bool    gpio_main_drv_enable;
     bool    gpio_main_fet_enable;
@@ -61,6 +58,30 @@ typedef struct
     bool    gpio_r_vcc_power_good;
  
 } Periph_GPIO_t;
+
+// -----------------------------------------------------------------------------
+// Calibration_Data_t — what the peripheral code measures with, private to this file.
+// The gains, NTC, shunt and user offset values are a copy of the ones in Config_Data_t
+// (Periph_SetCalibration), the two ADC offsets are measured at every boot.
+// current_sensor_offset is the voltage across the shunt in mV, not a current.
+// -----------------------------------------------------------------------------
+typedef struct
+{
+    float       current_sensor_offset;                  // current sensor offset, measured, in mV across the shunt
+    float       current_sensor_gain;                    // current sensor gain calibration
+    float       voltage_offset[SYS_CELL_COUNT_MAX];                      // per-cell ADC offset, measured
+    float       voltage_gain[SYS_CELL_COUNT_MAX];                        // per-cell ADC gain calibration
+    float       ntc_beta;                               // NTC Beta value from datasheet (e.g. 3950.0)
+    float       ntc_r_nominal;                          // NTC nominal resistance at 25°C
+    float       ntc_r_fixed;                            // Fixed resistor value in Ohms (e.g. 10000.0)
+    float       ntc_t_nominal;                          // NTC nominal temperature in Kelvin (e.g. 298.15 = 25°C)
+    float       temperature_offset;                     // temperature sensor offset in °C
+    float       shunt_resistance_mohm;                  // current shunt resistance in mOhm
+    float       current_offset_ma;                      // user current offset added to every reading in mA
+    float       voltage_offset_mv[SYS_CELL_COUNT_MAX];                   // per-cell user voltage offset added to every reading in mV
+    uint8_t     cell_count;                             // cells in series, only these are summed into pack_voltage
+
+} Calibration_Data_t;
 
 ADC_HandleTypeDef           *internal_adc               = &hadc1;
 I2C_HandleTypeDef           *eeprom_i2c                 = &hi2c1;
@@ -82,14 +103,14 @@ static volatile uint32_t    ads_last_good_tick          = 0;     // HAL_GetTick(
 
 bool Periph_EepromRead(uint16_t address, uint8_t *data, uint16_t length)
 {
-  if((uint32_t)address + length > EEPROM_SIZE)
+  if((uint32_t)address + length > PER_EEPROM_SIZE)
   {
     Error_Set(OPENBMS_EEPROM_READ_FAIL);
     return false;
   }
 
-  if(HAL_I2C_Mem_Read(eeprom_i2c, EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
-                      data, length, EEPROM_I2C_READ_TIMEOUT * (1 + length / EEPROM_PAGE_SIZE)) != HAL_OK)
+  if(HAL_I2C_Mem_Read(eeprom_i2c, PER_EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
+                      data, length, PER_EEPROM_I2C_READ_TIMEOUT * (1 + length / PER_EEPROM_PAGE_SIZE)) != HAL_OK)
   {
     Error_Set(OPENBMS_EEPROM_READ_FAIL);
     return false;
@@ -99,9 +120,9 @@ bool Periph_EepromRead(uint16_t address, uint8_t *data, uint16_t length)
 }
 bool Periph_EepromWrite(uint16_t address, const uint8_t *data, uint16_t length)
 {
-  uint8_t  check[EEPROM_PAGE_SIZE];
+  uint8_t  check[PER_EEPROM_PAGE_SIZE];
 
-  if((uint32_t)address + length > EEPROM_SIZE)
+  if((uint32_t)address + length > PER_EEPROM_SIZE)
   {
     Error_Set(OPENBMS_EEPROM_WRITE_FAIL);
     return false;
@@ -111,14 +132,14 @@ bool Periph_EepromWrite(uint16_t address, const uint8_t *data, uint16_t length)
   // Pages that already hold the right data are skipped to save write cycles.
   while(length > 0)
   {
-    uint16_t chunk = EEPROM_PAGE_SIZE - (address % EEPROM_PAGE_SIZE);
+    uint16_t chunk = PER_EEPROM_PAGE_SIZE - (address % PER_EEPROM_PAGE_SIZE);
     if(chunk > length)
     {
       chunk = length;
     }
 
-    if(HAL_I2C_Mem_Read(eeprom_i2c, EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
-                        check, chunk, EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
+    if(HAL_I2C_Mem_Read(eeprom_i2c, PER_EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
+                        check, chunk, PER_EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
     {
       Error_Set(OPENBMS_EEPROM_READ_FAIL);
       return false;
@@ -126,24 +147,24 @@ bool Periph_EepromWrite(uint16_t address, const uint8_t *data, uint16_t length)
 
     if(memcmp(check, data, chunk) != 0)
     {
-      if(HAL_I2C_Mem_Write(eeprom_i2c, EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
-                           (uint8_t *)data, chunk, EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
+      if(HAL_I2C_Mem_Write(eeprom_i2c, PER_EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
+                           (uint8_t *)data, chunk, PER_EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
       {
         Error_Set(OPENBMS_EEPROM_WRITE_FAIL);
         return false;
       }
 
       // The EEPROM does not answer until its internal write cycle is done
-      if(HAL_I2C_IsDeviceReady(eeprom_i2c, EEPROM_I2C_ADDRESS,
-                               EEPROM_I2C_READY_TRIALS, EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
+      if(HAL_I2C_IsDeviceReady(eeprom_i2c, PER_EEPROM_I2C_ADDRESS,
+                               PER_EEPROM_I2C_READY_TRIALS, PER_EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
       {
         Error_Set(OPENBMS_EEPROM_WRITE_FAIL);
         return false;
       }
 
       // Read back and verify
-      if(HAL_I2C_Mem_Read(eeprom_i2c, EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
-                          check, chunk, EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
+      if(HAL_I2C_Mem_Read(eeprom_i2c, PER_EEPROM_I2C_ADDRESS, address, I2C_MEMADD_SIZE_16BIT,
+                          check, chunk, PER_EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
       {
         Error_Set(OPENBMS_EEPROM_READ_FAIL);
         return false;
@@ -163,7 +184,7 @@ bool Periph_EepromWrite(uint16_t address, const uint8_t *data, uint16_t length)
 
   return true;
 }
-static uint32_t EEPROM_Crc32(const uint8_t *data, uint32_t length)
+static uint32_t Periph_EepromCrc32(const uint8_t *data, uint32_t length)
 {
   uint32_t crc = 0xFFFFFFFFUL;
 
@@ -182,7 +203,7 @@ static uint32_t EEPROM_Crc32(const uint8_t *data, uint32_t length)
 // The CRC goes last, so a write that is cut short leaves a CRC that does not match.
 bool Periph_EepromWriteChecked(uint16_t address, const uint8_t *data, uint16_t length)
 {
-  uint32_t crc = EEPROM_Crc32(data, length);
+  uint32_t crc = Periph_EepromCrc32(data, length);
 
   if(!Periph_EepromWrite(address, data, length))
   {
@@ -203,7 +224,7 @@ bool Periph_EepromReadChecked(uint16_t address, uint8_t *data, uint16_t length)
     return false;
   }
 
-  if(EEPROM_Crc32(data, length) != crc_stored)
+  if(Periph_EepromCrc32(data, length) != crc_stored)
   {
     Error_Set(OPENBMS_EEPROM_CRC_FAIL);
     return false;
@@ -211,7 +232,7 @@ bool Periph_EepromReadChecked(uint16_t address, uint8_t *data, uint16_t length)
 
   return true;
 }
-static bool ADS131M08_Standby(void)
+static bool Periph_AdsStandby(void)
 {
   uint8_t tx_buff[30] = {0};
   uint8_t rx_buff[30] = {0};
@@ -224,7 +245,7 @@ static bool ADS131M08_Standby(void)
 
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
 
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, PER_ADS_SPI_TIMEOUT) != HAL_OK)
   {
     res = false;
   }
@@ -232,7 +253,7 @@ static bool ADS131M08_Standby(void)
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
   return res;
 }
-static bool ADS131M08_Wakeup(void)
+static bool Periph_AdsWakeup(void)
 {
   uint8_t tx_buff[30] = {0};
   uint8_t rx_buff[30] = {0};
@@ -245,7 +266,7 @@ static bool ADS131M08_Wakeup(void)
 
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
 
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, PER_ADS_SPI_TIMEOUT) != HAL_OK)
   {
     res = false;
   }
@@ -259,7 +280,7 @@ static bool ADS131M08_Wakeup(void)
 
   return res;
 }
-static bool ADS131M08_ReadReg(uint8_t reg, uint8_t* data)
+static bool Periph_AdsReadReg(uint8_t reg, uint8_t* data)
 {
   // According to datasheet, if word is set to 24 bits, then total SPI transacation has 30 bytes
   // First 3 bytes are command, followed by 24 bytes of response, followed by 3 bytes of CRC
@@ -274,7 +295,7 @@ static bool ADS131M08_ReadReg(uint8_t reg, uint8_t* data)
   // CS low
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
 
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, data, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, data, 30, PER_ADS_SPI_TIMEOUT) != HAL_OK)
   {
     res = false;
   }
@@ -284,7 +305,7 @@ static bool ADS131M08_ReadReg(uint8_t reg, uint8_t* data)
 
   return res;
 }
-static bool ADS131M08_ReadADCValues(uint8_t* data)
+static bool Periph_AdsReadAdcValues(uint8_t* data)
 {
   // TX: 3 bytes NULL command + 27 bytes zeros
   // RX: 3 bytes STATUS + 24 bytes channel data (CH0-CH7) + 3 bytes CRC
@@ -294,7 +315,7 @@ static bool ADS131M08_ReadADCValues(uint8_t* data)
   // CS low
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
 
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, data, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, data, 30, PER_ADS_SPI_TIMEOUT) != HAL_OK)
   {
     res = false;
   }
@@ -304,7 +325,7 @@ static bool ADS131M08_ReadADCValues(uint8_t* data)
 
   return res;
 }
-static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
+static bool Periph_AdsWriteReg(uint8_t reg, uint16_t value)
 {
   uint8_t tx_buff[30] = {0};
   uint8_t rx_buff[30] = {0};
@@ -323,7 +344,7 @@ static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
     // CS low
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
 
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
+  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, PER_ADS_SPI_TIMEOUT) != HAL_OK)
   {
     res = false;
   }
@@ -332,7 +353,7 @@ static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
   return res;
 }
-static void ADS131M08_Init(void)
+static void Periph_AdsInit(void)
 {
   uint8_t  rx_data[30] = {0};
   uint32_t start_tick;
@@ -347,7 +368,7 @@ static void ADS131M08_Init(void)
   start_tick = HAL_GetTick();
   while(HAL_GPIO_ReadPin(ADC_DRDY_GPIO_Port, ADC_DRDY_Pin) == GPIO_PIN_RESET)
   {
-    if((HAL_GetTick() - start_tick) >= ADS_RESET_TIMEOUT_MS)
+    if((HAL_GetTick() - start_tick) >= PER_ADS_RESET_TIMEOUT_MS)
     {
       Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
       return;
@@ -355,14 +376,14 @@ static void ADS131M08_Init(void)
   }
 
   // Standby the ADS131M08 to allow register configuration
-  if(!ADS131M08_Standby())
+  if(!Periph_AdsStandby())
   {
     Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
     return;
   }
 
   // Read ADC ID register (0x00) to verify communication
-  if(!ADS131M08_ReadReg(0x00, rx_data))
+  if(!Periph_AdsReadReg(0x00, rx_data))
   {
     Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
     return;
@@ -370,7 +391,7 @@ static void ADS131M08_Init(void)
 
   // To read out register, actually one more transaction is needed after writing the command, 
   // so read ID register again to get the value
-  if(!ADS131M08_ReadReg(0x00, rx_data))
+  if(!Periph_AdsReadReg(0x00, rx_data))
   {
     Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
     return;
@@ -385,28 +406,28 @@ static void ADS131M08_Init(void)
 
   // Clear RESET bit in MODE register
   // Default MODE = 0x0510, clear bit 10 → 0x0110
-  if(!ADS131M08_WriteReg(0x02, 0x0110))
+  if(!Periph_AdsWriteReg(0x02, 0x0110))
   {
       Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
       return;
   }
 
   // Initialize CLOCK register, all channels enabled, about 250 SPS
-  if(!ADS131M08_WriteReg(0x03, 0xFF1F))
+  if(!Periph_AdsWriteReg(0x03, 0xFF1F))
   {
     Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
     return;
   }
 
   // Initilize GAIN1 register, PGA3 = PGA2 = PGA1 = 4, PGA0 = 16
-  if(!ADS131M08_WriteReg(0x04, 0x2224))
+  if(!Periph_AdsWriteReg(0x04, 0x2224))
   {
     Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
     return;
   }
 
   // Initilize GAIN2 register, PGA7 = PGA6 = PGA5 = PGA4 = 4
-  if(!ADS131M08_WriteReg(0x05, 0x2222))
+  if(!Periph_AdsWriteReg(0x05, 0x2222))
   {
     Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
     return;
@@ -414,18 +435,18 @@ static void ADS131M08_Init(void)
 
   /*
   // Start internal offset calibration
-  ADS131M08_WriteReg(0x09, 0x0001);  // CH0_CFG MUX=01
-  ADS131M08_WriteReg(0x0E, 0x0001);  // CH1_CFG MUX=01
-  ADS131M08_WriteReg(0x13, 0x0001);  // CH2_CFG MUX=01
-  ADS131M08_WriteReg(0x18, 0x0001);  // CH3_CFG MUX=01
-  ADS131M08_WriteReg(0x1D, 0x0001);  // CH4_CFG MUX=01
-  ADS131M08_WriteReg(0x22, 0x0001);  // CH5_CFG MUX=01
-  ADS131M08_WriteReg(0x27, 0x0001);  // CH6_CFG MUX=01
-  ADS131M08_WriteReg(0x2C, 0x0001);  // CH7_CFG MUX=01
+  Periph_AdsWriteReg(0x09, 0x0001);  // CH0_CFG MUX=01
+  Periph_AdsWriteReg(0x0E, 0x0001);  // CH1_CFG MUX=01
+  Periph_AdsWriteReg(0x13, 0x0001);  // CH2_CFG MUX=01
+  Periph_AdsWriteReg(0x18, 0x0001);  // CH3_CFG MUX=01
+  Periph_AdsWriteReg(0x1D, 0x0001);  // CH4_CFG MUX=01
+  Periph_AdsWriteReg(0x22, 0x0001);  // CH5_CFG MUX=01
+  Periph_AdsWriteReg(0x27, 0x0001);  // CH6_CFG MUX=01
+  Periph_AdsWriteReg(0x2C, 0x0001);  // CH7_CFG MUX=01
   */
 
   // Wake the ADS131M08 up, the configuration is done and it starts converting
-  if(!ADS131M08_Wakeup())
+  if(!Periph_AdsWakeup())
   {
     Error_Set(OPENBMS_ADS131M08_INIT_FAIL);
     return;
@@ -447,14 +468,14 @@ static void ADS131M08_Init(void)
 
   /*
   // Stop internal offset calibration
-  ADS131M08_WriteReg(0x09, 0x0000);  // CH0_CFG MUX=01
-  ADS131M08_WriteReg(0x0E, 0x0000);  // CH1_CFG MUX=01
-  ADS131M08_WriteReg(0x13, 0x0000);  // CH2_CFG MUX=01
-  ADS131M08_WriteReg(0x18, 0x0000);  // CH3_CFG MUX=01
-  ADS131M08_WriteReg(0x1D, 0x0000);  // CH4_CFG MUX=01
-  ADS131M08_WriteReg(0x22, 0x0000);  // CH5_CFG MUX=01
-  ADS131M08_WriteReg(0x27, 0x0000);  // CH6_CFG MUX=01
-  ADS131M08_WriteReg(0x2C, 0x0000);  // CH7_CFG MUX=01
+  Periph_AdsWriteReg(0x09, 0x0000);  // CH0_CFG MUX=01
+  Periph_AdsWriteReg(0x0E, 0x0000);  // CH1_CFG MUX=01
+  Periph_AdsWriteReg(0x13, 0x0000);  // CH2_CFG MUX=01
+  Periph_AdsWriteReg(0x18, 0x0000);  // CH3_CFG MUX=01
+  Periph_AdsWriteReg(0x1D, 0x0000);  // CH4_CFG MUX=01
+  Periph_AdsWriteReg(0x22, 0x0000);  // CH5_CFG MUX=01
+  Periph_AdsWriteReg(0x27, 0x0000);  // CH6_CFG MUX=01
+  Periph_AdsWriteReg(0x2C, 0x0000);  // CH7_CFG MUX=01
   */
 
   // Wait a bit to settle down, 3-4 samples
@@ -464,8 +485,20 @@ static void ADS131M08_Init(void)
   ads_start_measurements = true;
   
 }
+// ADS131M08 sample: 24-bit two's complement, most significant byte first, to int32.
+// Built unsigned and then sign-extended, so no signed value is shifted.
+static int32_t Periph_AdsToInt24(const uint8_t *p)
+{
+  int32_t value = (int32_t)(((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2]);
+
+  if(value & 0x800000)
+  {
+    value -= 0x1000000;
+  }
+  return value;
+}
 // CRC-16-CCITT (polynomial 0x1021, start value 0xFFFF), as the ADS131M08 sends it in MODE.CRC_TYPE = 0
-static uint16_t ADS131M08_Crc16(const uint8_t *data, uint8_t length)
+static uint16_t Periph_AdsCrc16(const uint8_t *data, uint8_t length)
 {
   uint16_t crc = 0xFFFF;
 
@@ -489,8 +522,8 @@ static uint16_t ADS131M08_Crc16(const uint8_t *data, uint8_t length)
 }
 // Checks one sample frame: SPI transfer, output CRC and STATUS. A bad frame is reported and
 // the caller drops it, so the smoothed values keep their last good value. A good frame
-// refreshes the time Periph_MeasurementOk looks at.
-static bool ADS131M08_FrameOk(bool spi_ok, const uint8_t *rx_data)
+// refreshes the time the data timeout in Periph_Run looks at.
+static bool Periph_AdsFrameOk(bool spi_ok, const uint8_t *rx_data)
 {
   uint16_t status;
   uint16_t crc_rx;
@@ -506,18 +539,18 @@ static bool ADS131M08_FrameOk(bool spi_ok, const uint8_t *rx_data)
     crc_rx = ((uint16_t)rx_data[27] << 8) | rx_data[28];
     status = ((uint16_t)rx_data[0] << 8) | rx_data[1];
 
-    if(ADS131M08_Crc16(rx_data, 27) != crc_rx)
+    if(Periph_AdsCrc16(rx_data, 27) != crc_rx)
     {
       Error_Set(OPENBMS_ADS131M08_CRC_FAIL);
       ok = false;
     }
-    else if(status & ADS_STATUS_RESET)
+    else if(status & PER_ADS_STATUS_RESET)
     {
       // The settings (gain, rate) are back to defaults, so the values are scaled wrong
       Error_Set(OPENBMS_ADS131M08_RESET);
       ok = false;
     }
-    else if((status & ADS_STATUS_DRDY_ALL) != ADS_STATUS_DRDY_ALL)
+    else if((status & PER_ADS_STATUS_DRDY_ALL) != PER_ADS_STATUS_DRDY_ALL)
     {
       // Not every channel has a new sample
       ok = false;
@@ -531,7 +564,7 @@ static bool ADS131M08_FrameOk(bool spi_ok, const uint8_t *rx_data)
 
   return ok;
 }
-static void ADS131M08_Read(void)
+static void Periph_AdsRead(void)
 {
   uint8_t rx_data[30] = {0};
   int32_t raw_value;
@@ -539,7 +572,7 @@ static void ADS131M08_Read(void)
   float current;
   bool    spi_ok;
 
-  spi_ok = ADS131M08_ReadADCValues(rx_data);
+  spi_ok = Periph_AdsReadAdcValues(rx_data);
 
   // Before the init has finished the samples are not used, and not checked either
   if(!ads_start_measurements && !ads_calibration_start)
@@ -548,7 +581,7 @@ static void ADS131M08_Read(void)
   }
 
   // A bad frame is dropped: the smoothed values and the offset sums keep their last good value
-  if(!ADS131M08_FrameOk(spi_ok, rx_data))
+  if(!Periph_AdsFrameOk(spi_ok, rx_data))
   {
     return;
   }
@@ -561,9 +594,8 @@ static void ADS131M08_Read(void)
   if(ads_start_measurements)
   {
     // Extract CH0 value, get battery current by dividing voltage by shunt resistance
-    raw_value = ((int32_t)rx_data[3] << 24) | (rx_data[4] << 16) | (rx_data[5] << 8);
-    raw_value >>= 8;
-    voltage_mv = (float)raw_value * (ADS_FULL_SCALE_GAIN_16 / 16777216.0f);
+    raw_value = Periph_AdsToInt24(&rx_data[3]);
+    voltage_mv = (float)raw_value * (PER_ADS_FULL_SCALE_GAIN_16 / 16777216.0f);
     // The shunt value comes from the config. Until it is loaded it is 0, and a division by 0
     // would leave the smoothed value at inf / NaN for good.
     if(calibration_data.shunt_resistance_mohm > 0.0f)
@@ -573,10 +605,10 @@ static void ADS131M08_Read(void)
       current *= 1000.0f;  // Convert to mA
       current *= -1;       // Change the sign
 
-      current -= calibration_data.current_bias_ma;
+      current += calibration_data.current_offset_ma;
 
       // Smooth the new sample into the current value
-      periph_data.pack_current += ADS_READ_FILT_COEF * (current - periph_data.pack_current);
+      periph_data.pack_current += PER_ADS_READ_FILT_COEF * (current - periph_data.pack_current);
     }
   }
 
@@ -587,19 +619,23 @@ static void ADS131M08_Read(void)
     periph_data.pack_voltage = 0;
 
     // Measure all cell voltages
-    for(uint8_t i = 0; i < 7; i++)
+    for(uint8_t i = 0; i < SYS_CELL_COUNT_MAX; i++)
     {
-      raw_value = ((int32_t)rx_data[i*3+6] << 24) | (rx_data[i*3+7] << 16) | (rx_data[i*3+8] << 8);
-      raw_value >>= 8;
-      voltage_mv = (float)raw_value * (ADS_FULL_SCALE_GAIN_4 / 16777216.0f);
-      voltage_mv *= HW_CELL_VOLTAGE_RESISTANCE_FACTOR;
+      raw_value = Periph_AdsToInt24(&rx_data[i*3+6]);
+      voltage_mv = (float)raw_value * (PER_ADS_FULL_SCALE_GAIN_4 / 16777216.0f);
+      voltage_mv *= PER_CELL_VOLTAGE_RESISTANCE_FACTOR;
       voltage_mv -= calibration_data.voltage_offset[i];
       voltage_mv *= calibration_data.voltage_gain[i];
+      voltage_mv += calibration_data.voltage_offset_mv[i];
 
       // Smooth the new sample into the cell voltage
-      periph_data.cell_voltage[i] += ADS_READ_FILT_COEF * (voltage_mv - periph_data.cell_voltage[i]);
+      periph_data.cell_voltage[i] += PER_ADS_READ_FILT_COEF * (voltage_mv - periph_data.cell_voltage[i]);
 
-      periph_data.pack_voltage += periph_data.cell_voltage[i];
+      // Channels above cell_count have no cell, their offset and noise stay out of the pack voltage
+      if(i < calibration_data.cell_count)
+      {
+        periph_data.pack_voltage += periph_data.cell_voltage[i];
+      }
     }
   }
   /*
@@ -620,8 +656,7 @@ static void ADS131M08_Read(void)
     // Record offset values
     for(uint8_t i = 0; i <= 7; i++)
     {
-      raw_value = ((int32_t)rx_data[i*3+3] << 24) | (rx_data[i*3+4] << 16) | (rx_data[i*3+5] << 8);
-      raw_value >>= 8;
+      raw_value = Periph_AdsToInt24(&rx_data[i*3+3]);
       
       ads_cal_val_sum[i] += raw_value;
     }
@@ -637,12 +672,12 @@ static void ADS131M08_Read(void)
 
         if(i == 0) 
         {
-          calibration_data.current_sensor_offset = (float) ads_cal_val_sum[i] * (ADS_FULL_SCALE_GAIN_16 / 16777216.0f);
+          calibration_data.current_sensor_offset = (float) ads_cal_val_sum[i] * (PER_ADS_FULL_SCALE_GAIN_16 / 16777216.0f);
         }
         else 
         {
-          calibration_data.voltage_offset[i-1] = (float) ads_cal_val_sum[i] * (ADS_FULL_SCALE_GAIN_4 / 16777216.0f);
-          calibration_data.voltage_offset[i-1] *= HW_CELL_VOLTAGE_RESISTANCE_FACTOR;
+          calibration_data.voltage_offset[i-1] = (float) ads_cal_val_sum[i] * (PER_ADS_FULL_SCALE_GAIN_4 / 16777216.0f);
+          calibration_data.voltage_offset[i-1] *= PER_CELL_VOLTAGE_RESISTANCE_FACTOR;
         }
       }
 
@@ -651,7 +686,7 @@ static void ADS131M08_Read(void)
     }
   }
 }
-static float NTC_GetTemperature(float r_ntc)
+static float Periph_NtcGetTemperature(float r_ntc)
 {
     if(r_ntc <= 0.0f)
     {
@@ -663,18 +698,20 @@ static float NTC_GetTemperature(float r_ntc)
     // Offset subtracted, like the voltage and current offsets
     return (temp_k - 273.15f - calibration_data.temperature_offset);
 }
-static void STM32_ADC_Init(void)
+static void Periph_Stm32AdcInit(void)
 {
   HAL_ADCEx_Calibration_Start(internal_adc, ADC_SINGLE_ENDED);
   HAL_ADC_Start_DMA(internal_adc, (uint32_t*)stm32_adc_dma_buf, 3);
 }
-static void STM32_ADC_Read(void)
+static void Periph_Stm32AdcRead(void)
 {
   // A broken NTC latches OPENBMS_NTC_FAULT and the temperature is not read any more.
   // Clearing the errors starts the reading again (and sets the error again if it is still broken).
+  // In the simulation build the temperature comes from the host (Periph_SimSetData).
+#ifndef OPENBMS_SIMULATION
   if(!Error_IsSet(OPENBMS_NTC_FAULT))
   {
-    if(stm32_adc_dma_buf[0] < NTC_ADC_MIN_COUNTS || stm32_adc_dma_buf[0] > NTC_ADC_MAX_COUNTS)
+    if(stm32_adc_dma_buf[0] < PER_NTC_ADC_MIN_COUNTS || stm32_adc_dma_buf[0] > PER_NTC_ADC_MAX_COUNTS)
     {
       Error_Set(OPENBMS_NTC_FAULT);
     }
@@ -684,9 +721,10 @@ static void STM32_ADC_Read(void)
       float r_ntc = calibration_data.ntc_r_fixed / ((4095.0f / (float)stm32_adc_dma_buf[0]) - 1);
 
       // Get temperature now
-      periph_data.temperature_package = NTC_GetTemperature(r_ntc);
+      periph_data.temperature_package = Periph_NtcGetTemperature(r_ntc);
     }
   }
+#endif
 
   // ST factory calibrated VREFINT value measured at 3.0V, 30°C
   // Stored in flash at fixed address
@@ -707,11 +745,11 @@ static void STM32_ADC_Read(void)
                           * (adc_corrected - (float)ts_cal1) + 30.0f;
   
 }
-static void Timer_Init(void)
+static void Periph_TimerInit(void)
 {
   HAL_TIM_Base_Start_IT(periodic_timer);
 }
-static void GPIO_Ctrl(void)
+static void Periph_GpioCtrl(void)
 {
   // Set main FET and driver state
   HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) periph_gpio.gpio_main_drv_enable);
@@ -753,7 +791,7 @@ static void GPIO_Ctrl(void)
   // Hardware pin states go into the error flags like any other error
   if(periph_gpio.gpio_r_fet_driver_fault)       Error_Set(OPENBMS_HW_DRV_FAULT);
   if(periph_gpio.gpio_r_fet_driver_gate_fault)  Error_Set(OPENBMS_HW_DRV_GATE_FAULT);
-  if(periph_gpio.gpio_r_wake_up)                Error_Set(OPENBMS_HW_WAKE_UP);
+  //if(periph_gpio.gpio_r_wake_up)              
   if(!periph_gpio.gpio_r_vcc_power_good)        Error_Set(OPENBMS_HW_PWR_FAIL);
 }
 static void Periph_SetDefaultData(void)
@@ -772,13 +810,23 @@ void Periph_Init(void)
   // Keep FET driver enabled (FET is still off)
   periph_gpio.gpio_main_drv_enable = true;
 
-  STM32_ADC_Init();
-  ADS131M08_Init();
-  Timer_Init();
+  Periph_Stm32AdcInit();
+  Periph_AdsInit();
+  Periph_TimerInit();
 }
 void Periph_Run(void)
 {
-    GPIO_Ctrl();
+    Periph_GpioCtrl();
+
+    // Data timeout: no good ADS sample for PER_ADS_DATA_TIMEOUT_MS (bad frames in a row, or the
+    // DRDY interrupt does not fire at all). Only reported, the FET is not switched by it.
+    // One 32-bit read, so no masking. In the simulation build the measurements come from the host.
+#ifndef OPENBMS_SIMULATION
+    if((HAL_GetTick() - ads_last_good_tick) >= PER_ADS_DATA_TIMEOUT_MS)
+    {
+        Error_Set(OPENBMS_ADS131M08_DATA_LOST);
+    }
+#endif
 }
 void Periph_SetFET(bool state)
 {  
@@ -789,8 +837,8 @@ void Periph_SetFET(bool state)
     periph_gpio.gpio_main_fet_enable = state;
 #endif
 
-    if(state) periph_data.fet_status |= BD_FET_MAIN;
-    else      periph_data.fet_status &= ~BD_FET_MAIN;
+    if(state) periph_data.fet_status |= PER_FET_MAIN;
+    else      periph_data.fet_status &= ~PER_FET_MAIN;
     
 }
 void Periph_SetPreFET(bool state)
@@ -802,8 +850,23 @@ void Periph_SetPreFET(bool state)
     periph_gpio.gpio_pre_fet_enable = state;
 #endif
 
-    if(state) periph_data.fet_status |= BD_FET_PRE;
-    else      periph_data.fet_status &= ~BD_FET_PRE;
+    if(state) periph_data.fet_status |= PER_FET_PRE;
+    else      periph_data.fet_status &= ~PER_FET_PRE;
+}
+void Periph_SetBalance(uint8_t mask)
+{
+  for(uint8_t i = 0; i < SYS_CELL_COUNT_MAX; i++)
+  {
+#ifdef OPENBMS_SIMULATION
+    // The real balancer FETs stay off. fet_status still shows the request.
+    periph_gpio.gpio_cell_balancer_enable[i] = false;
+#else
+    periph_gpio.gpio_cell_balancer_enable[i] = ((mask & (1U << i)) != 0);
+#endif
+  }
+
+  periph_data.fet_status &= (uint16_t)~(0x7FU << PER_FET_BAL_SHIFT);
+  periph_data.fet_status |= (uint16_t)((mask & 0x7FU) << PER_FET_BAL_SHIFT);
 }
 void Periph_GetData(Peripheral_Data_t *pd)
 {
@@ -815,31 +878,24 @@ void Periph_GetData(Peripheral_Data_t *pd)
   memcpy(pd, &periph_data, sizeof(Peripheral_Data_t));
   __set_PRIMASK(primask);
 }
-bool Periph_MeasurementOk(void)
-{
-  // False when the ADS has not delivered a good sample for ADS_DATA_TIMEOUT_MS: bad frames
-  // in a row, or the DRDY interrupt does not fire at all. One 32-bit read, so no masking.
 #ifdef OPENBMS_SIMULATION
-  // The measurements come from the host
-  return true;
-#else
-  return (HAL_GetTick() - ads_last_good_tick) < ADS_DATA_TIMEOUT_MS;
-#endif
-}
-#ifdef OPENBMS_SIMULATION
-void Periph_SimSetData(const float *cell_mv, float current_ma)
+void Periph_SimSetData(const float *cell_mv, float current_ma, float temperature_c)
 {
   // Called from the main loop; the internal ADC interrupt also writes periph_data, so masked
   uint32_t primask = __get_PRIMASK();
 
   __disable_irq();
-  periph_data.pack_current = current_ma;
+  periph_data.pack_current        = current_ma;
+  periph_data.temperature_package = temperature_c;
   periph_data.pack_voltage = 0;
 
-  for(uint8_t i = 0; i < BD_CELL_COUNT_MAX; i++)
+  for(uint8_t i = 0; i < SYS_CELL_COUNT_MAX; i++)
   {
     periph_data.cell_voltage[i]  = cell_mv[i];
-    periph_data.pack_voltage    += cell_mv[i];
+    if(i < calibration_data.cell_count)
+    {
+      periph_data.pack_voltage  += cell_mv[i];
+    }
   }
   __set_PRIMASK(primask);
 }
@@ -860,30 +916,29 @@ void Periph_SetCalibration(const Config_Data_t *cfg)
   calibration_data.ntc_t_nominal          = cfg->ntc_t_nominal;
   calibration_data.temperature_offset     = cfg->temperature_offset;
   calibration_data.shunt_resistance_mohm  = cfg->shunt_resistance_mohm;
-  calibration_data.current_bias_ma        = cfg->current_bias_ma;
-  __set_PRIMASK(primask);
-}
-void Periph_GetCalibration(Calibration_Data_t *cal)
-{
-  // The ADS131 and internal ADC interrupts write the measured offsets, so the copy is
-  // done with all interrupts masked
-  uint32_t primask = __get_PRIMASK();
-
-  __disable_irq();
-  memcpy(cal, &calibration_data, sizeof(Calibration_Data_t));
+  calibration_data.current_offset_ma      = cfg->current_offset_ma;
+  memcpy(calibration_data.voltage_offset_mv, cfg->voltage_offset_mv, sizeof(calibration_data.voltage_offset_mv));
+  if(cfg->cell_count > SYS_CELL_COUNT_MAX)
+  {
+    calibration_data.cell_count = SYS_CELL_COUNT_MAX;
+  }
+  else
+  {
+    calibration_data.cell_count = cfg->cell_count;
+  }
   __set_PRIMASK(primask);
 }
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == ADC_DRDY_Pin)
   {
-    ADS131M08_Read();
+    Periph_AdsRead();
   }
 }
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if(hadc->Instance == ADC1)
   {
-    STM32_ADC_Read();
+    Periph_Stm32AdcRead();
   }
 }

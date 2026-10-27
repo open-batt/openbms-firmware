@@ -3,3 +3,6 @@ mx.scratch
 !.settings
 /.tmp.driveupload
 /python_scripts/results
+/python_scripts/simulation/results
+/python_scripts/__pycache__
+/python_scripts/simulation/__pycache__

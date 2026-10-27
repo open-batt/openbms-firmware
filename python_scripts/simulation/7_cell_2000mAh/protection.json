@@ -1,0 +1,183 @@
+{
+  "description": "Protection simulations of 7_cell_2000mAh, run by protection_simulate.py. Every test runs from a reboot; expect is the protection that must trip, in the segment marked expect_trip, and nothing may trip before it. Thresholds and times are those of config.json.",
+  "dt_ms": 10,
+  "temperature_c": 25.0,
+  "cell_min_mv": 2000,
+  "cell_max_mv": 4500,
+  "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 1},
+  "tests": {
+    "ovp_slow": {
+      "description": "Cell over-voltage slow (config 4230 mV / 2 s) on a full cell: 0.5 A (~4216 mV) no trip, 1.5 A for 1 s no trip, 1.5 A (~4250 mV) trips after 2 s",
+      "expect": "OVP_SLOW",
+      "branch": "chg",
+      "start_soc_pct": 100.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, full cell"},
+        {"type": "constant", "current_ma": 500, "duration_s": 10, "note": "about 4216 mV, below the limit: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "constant", "current_ma": 1500, "duration_s": 1, "note": "about 4250 mV for 1 s, shorter than 2 s: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "constant", "current_ma": 1500, "duration_s": 10, "note": "about 4250 mV: OVP_SLOW after 2 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "ovp_fast": {
+      "description": "Cell over-voltage fast (config 4280 mV / 200 ms) on a full cell: 3 A (~4300 mV) for 150 ms no trip, 3 A trips after 200 ms",
+      "expect": "OVP_FAST",
+      "branch": "chg",
+      "start_soc_pct": 100.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, full cell"},
+        {"type": "constant", "current_ma": 3000, "duration_s": 0.15, "note": "about 4300 mV for 150 ms, shorter than 200 ms: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "constant", "current_ma": 3000, "duration_s": 1, "note": "about 4300 mV: OVP_FAST after 200 ms", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "uvp_slow": {
+      "description": "Cell under-voltage slow (config 2700 mV / 5 s) on an almost empty cell: 15 A from 10 % SOC: the weakest cell falls below 2700 mV after about 17 s, UVP_SLOW about 5 s later (about 22 s)",
+      "expect": "UVP_SLOW",
+      "branch": "dis",
+      "start_soc_pct": 10.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on"},
+        {"type": "constant", "current_ma": -15000, "duration_s": 40, "note": "weakest cell below 2700 mV at about 17 s: UVP_SLOW at about 22 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "uvp_fast": {
+      "description": "Cell under-voltage fast (config 2500 mV / 500 ms) on an empty cell: 24 A from 3 % SOC: the weakest cell drops below 2500 mV at once, UVP_FAST 500 ms later (before UVP_SLOW at 5 s and OCP_DISCHARGE_SLOW at 10 s)",
+      "expect": "UVP_FAST",
+      "branch": "dis",
+      "start_soc_pct": 3.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on"},
+        {"type": "constant", "current_ma": -24000, "duration_s": 5, "note": "weakest cell below 2500 mV at once: UVP_FAST after about 500 ms", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "ocp_charge": {
+      "description": "Charge OCP (config 6 A / 2 s): 5 A no trip, 7 A trips after 2 s",
+      "expect": "OCP_CHARGE",
+      "branch": "chg",
+      "start_soc_pct": 50.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, no load"},
+        {"type": "constant", "current_ma": 5000, "duration_s": 10, "note": "below the limit: no trip"},
+        {"type": "rest", "duration_s": 2},
+        {"type": "constant", "current_ma": 7000, "duration_s": 5, "note": "over the limit: trips after 2 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "ocp_discharge_slow": {
+      "description": "Discharge slow OCP (config 16 A / 10 s): 14 A no trip, 22 A for 5 s no trip, 20 A trips after 10 s",
+      "expect": "OCP_DISCHARGE_SLOW",
+      "branch": "dis",
+      "start_soc_pct": 90.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, no load"},
+        {"type": "constant", "current_ma": -14000, "duration_s": 20, "note": "below the limit: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "constant", "current_ma": -22000, "duration_s": 5, "note": "over the limit, shorter than 10 s: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "constant", "current_ma": -20000, "duration_s": 15, "note": "over the limit: trips after 10 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "ocp_discharge_fast": {
+      "description": "Discharge fast OCP (config 25 A / 200 ms): 30 A for 150 ms no trip, 30 A trips after 200 ms",
+      "expect": "OCP_DISCHARGE_FAST",
+      "branch": "dis",
+      "start_soc_pct": 90.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, no load"},
+        {"type": "constant", "current_ma": -30000, "duration_s": 0.15, "note": "spike shorter than 200 ms: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "constant", "current_ma": -30000, "duration_s": 2, "note": "over the limit: trips after 200 ms", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "otp": {
+      "description": "Over-temperature (config 55 C / 5 s): 54 C no trip, 60 C for 3 s no trip, 60 C trips after 5 s",
+      "expect": "OTP",
+      "branch": "dis",
+      "start_soc_pct": 50.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, 25 C"},
+        {"type": "rest", "duration_s": 10, "temperature_c": 54, "note": "just below the limit: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "rest", "duration_s": 3, "temperature_c": 60, "note": "over the limit for 3 s, shorter than 5 s: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "rest", "duration_s": 10, "temperature_c": 60, "note": "over the limit: OTP after 5 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "back to 25 C, FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "utp": {
+      "description": "Under-temperature (config -20 C / 5 s): -19 C no trip, -25 C for 3 s no trip, -25 C trips after 5 s",
+      "expect": "UTP",
+      "branch": "dis",
+      "start_soc_pct": 50.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, 25 C"},
+        {"type": "rest", "duration_s": 10, "temperature_c": -19, "note": "just above the limit: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "rest", "duration_s": 3, "temperature_c": -25, "note": "under the limit for 3 s, shorter than 5 s: no trip"},
+        {"type": "rest", "duration_s": 5},
+        {"type": "rest", "duration_s": 10, "temperature_c": -25, "note": "under the limit: UTP after 5 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "back to 25 C, FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "otp_charge": {
+      "description": "Charge over-temperature (config 45 C, otp_time_ms 5 s): 50 C at rest no trip, charging at 44 C no trip, charging at 50 C for 3 s no trip, charging at 50 C trips after 5 s",
+      "expect": "OTP_CHARGE",
+      "branch": "chg",
+      "start_soc_pct": 50.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, 25 C"},
+        {"type": "rest", "duration_s": 10, "temperature_c": 50, "note": "50 C but not charging: no trip (below OTP 55 C)"},
+        {"type": "constant", "duration_s": 10, "current_ma": 1000, "temperature_c": 44, "note": "charging just below the limit: no trip"},
+        {"type": "constant", "duration_s": 3, "current_ma": 1000, "temperature_c": 50, "note": "charging over the limit for 3 s: no trip"},
+        {"type": "rest", "duration_s": 5, "temperature_c": 50, "note": "charging stopped, detection starts again"},
+        {"type": "constant", "duration_s": 10, "current_ma": 1000, "temperature_c": 50, "note": "charging over the limit: OTP_CHARGE after 5 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "back to 25 C, FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    },
+    "utp_charge": {
+      "description": "Charge under-temperature (config 0 C, utp_time_ms 5 s): -5 C at rest no trip, charging at 1 C no trip, charging at -5 C for 3 s no trip, charging at -5 C trips after 5 s",
+      "expect": "UTP_CHARGE",
+      "branch": "chg",
+      "start_soc_pct": 50.0,
+      "profile": [
+        {"type": "rest", "duration_s": 2, "note": "FET on, 25 C"},
+        {"type": "rest", "duration_s": 10, "temperature_c": -5, "note": "-5 C but not charging: no trip (above UTP -20 C)"},
+        {"type": "constant", "duration_s": 10, "current_ma": 1000, "temperature_c": 1, "note": "charging just above the limit: no trip"},
+        {"type": "constant", "duration_s": 3, "current_ma": 1000, "temperature_c": -5, "note": "charging under the limit for 3 s: no trip"},
+        {"type": "rest", "duration_s": 5, "temperature_c": -5, "note": "charging stopped, detection starts again"},
+        {"type": "constant", "duration_s": 10, "current_ma": 1000, "temperature_c": -5, "note": "charging under the limit: UTP_CHARGE after 5 s", "expect_trip": true},
+        {"type": "rest", "duration_s": 5, "note": "back to 25 C, FET held off"},
+        {"type": "reset_protection"},
+        {"type": "rest", "duration_s": 2, "note": "FET back on"}
+      ]
+    }
+  }
+}

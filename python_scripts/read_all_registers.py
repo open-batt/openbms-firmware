@@ -17,6 +17,16 @@ Run:
 """
 
 import sys
+import importlib.util
+import subprocess
+
+# Third-party modules this script needs (import name: pip package). Missing ones are installed on the first run.
+REQUIRED_MODULES = {"serial": "pyserial"}
+for _module, _package in REQUIRED_MODULES.items():
+    if importlib.util.find_spec(_module) is None:
+        print(f"Installing {_package} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _package])
+
 import serial
 import time
 import struct
@@ -39,7 +49,7 @@ CMD_ACK   = 0x03
 CMD_ERROR = 0x04
 CMD_PING  = 0x0A
 
-CELL_COUNT       = 7       # cells in the pack (BD_CELL_COUNT_MAX)
+CELL_COUNT       = 7       # cells in the pack (SYS_CELL_COUNT_MAX)
 REG_MODEL_CELL   = 0x9F    # picks the cell the per-cell model registers (0xA1 - 0xAC, 0xD4) act on
 
 ERROR_NAMES = {
@@ -107,22 +117,13 @@ PERIPH_REGISTERS = [
 SYSTEM_REGISTERS = [
     Reg(0x10, "MainControl",                           "flags",     'H', 1  ),
     Reg(0x11, "LastCommunicationTimestamp",            "ms",        'I', 1  ),
-    Reg(0x12, "ProtectionTrigger",                     "flags",     'B', 1  ),
+    Reg(0x12, "ProtectionTrigger",                     "flags",     'H', 1  ),
     Reg(0x13, "ControlState",                          "state",     'B', 1  ),
     Reg(0x15, "ErrorFlags",                            "flags",     'Q', 1  ),
     Reg(0x17, "SessionUptime",                         "ms",        'I', 1  ),
     Reg(0x18, "HppcDirection",                         "",          'B', 1  ),
     Reg(0x19, "HppcStatus",                            "flags",     'H', 1  ),
     Reg(0x1A, "HppcExtractStatus",                     "flags",     'H', 1  ),
-]
-
-# ---------------------------------------------------------------
-# Calibration offsets, measured at every boot (Calibration_Data_t)  — 0x20 - 0x2F
-# The gains, NTC, shunt and bias values are config registers 0x52 - 0x5A.
-# ---------------------------------------------------------------
-CALIBRATION_REGISTERS = [
-    Reg(0x20, "CurrentSensorOffset",                   "mV",        'f', 1  ),
-    Reg(0x22, "VoltageOffset",                         "mV",        'f', 7  ),
 ]
 
 # ---------------------------------------------------------------
@@ -156,11 +157,11 @@ CONFIG_REGISTERS = [
     Reg(0x48, "OCP_DischargeFastTime",                 "ms",        'H', 1  ),
     Reg(0x49, "OTP_Threshold",                         "C",         'H', 1  ),
     Reg(0x4A, "OTP_Time",                              "ms",        'H', 1  ),
-    Reg(0x4B, "ChargeStopCellVoltage",                 "mV",        'H', 1  ),
     Reg(0x4C, "ChargeMonitorCellVoltage",              "mV",        'H', 1  ),
     Reg(0x4D, "UTP_Threshold",                         "C",         'h', 1  ),
     Reg(0x4E, "UTP_Time",                              "ms",        'H', 1  ),
     Reg(0x4F, "OTP_ChargeThreshold",                   "C",         'h', 1  ),
+    Reg(0x5C, "UTP_ChargeThreshold",                   "C",         'h', 1  ),
     Reg(0x50, "OCV_VoltageLow",                        "mV",        'H', 1  ),
     Reg(0x51, "OCV_VoltageHigh",                       "mV",        'H', 1  ),
     Reg(0x52, "CurrentSensorGain",                     "",          'f', 1  ),
@@ -171,7 +172,8 @@ CONFIG_REGISTERS = [
     Reg(0x57, "NTC_T_Nominal",                         "K",         'f', 1  ),
     Reg(0x58, "TemperatureOffset",                     "C",         'f', 1  ),
     Reg(0x59, "ShuntResistance",                       "mOhm",      'f', 1  ),
-    Reg(0x5A, "CurrentBias",                           "mA",        'f', 1  ),
+    Reg(0x5A, "CurrentOffsetUser",                     "mA",        'f', 1  ),
+    Reg(0x5B, "VoltageOffsetUser",                     "mV",        'f', 7  ),
 ]
 
 # ---------------------------------------------------------------
@@ -192,14 +194,10 @@ DEVICE_INFO_REGISTERS = [
 STATS_REGISTERS = [
     Reg(0x70, "FaultSnapshotVoltage",                  "mV",        'H', 7  ),
     Reg(0x71, "FaultSnapshotCurrent",                  "mA",        'h', 1  ),
-    Reg(0x72, "FaultSnapshotTemperature",              "C",         'B', 1  ),
+    Reg(0x72, "FaultSnapshotTemperature",              "C",         'b', 1  ),
     Reg(0x73, "FaultSnapshotSoC",                      "%",         'B', 1  ),
-    Reg(0x74, "FaultCode",                             "",          'B', 8  ),
-    Reg(0x75, "FaultTimestamp",                        "Unix",      'I', 8  ),
-    Reg(0x76, "CellBalancingEnergy",                   "mWh",       'H', 7  ),
-    Reg(0x77, "CellBalancingTime",                     "min",       'H', 7  ),
-    Reg(0x78, "CellDeepestDischarge",                  "%",         'B', 7  ),
-    Reg(0x79, "CellMaxTemperature",                    "C",         'B', 7  ),
+    Reg(0x74, "FaultCode",                             "",          'H', 1  ),
+    Reg(0x75, "FaultTimestamp",                        "ms",        'I', 1  ),
 ]
 
 # ---------------------------------------------------------------
@@ -207,11 +205,9 @@ STATS_REGISTERS = [
 # ---------------------------------------------------------------
 FUEL_OUT_REGISTERS = [
     Reg(0x90, "RelativeSoC",                           "%",         'B', 1  ),
-    Reg(0x91, "AbsoluteSoC",                           "%",         'B', 1  ),
     Reg(0x92, "CellSoC",                               "%",         'B', 7  ),
     Reg(0x93, "CellSoH",                               "%",         'B', 7  ),
     Reg(0x94, "CellRemainingCapacity",                 "mAh",       'H', 7  ),
-    Reg(0x95, "CellSelfDischarge",                     "mAh/month", 'H', 7  ),
     Reg(0x96, "LearningStatus",                        "flags",     'H', 1  ),
 ]
 
@@ -221,10 +217,12 @@ FUEL_OUT_REGISTERS = [
 # Shared by all cells (0xA0, 0xAD - 0xBE)
 FUEL_MODEL_REGISTERS = [
     Reg(0xA0, "SOC_Grid",                              "%",         'f', 20 ),
-    Reg(0xAD, "Q_Nom_TempSetpoints",                   "C",         'f', 5  ),
-    Reg(0xAE, "Q_Nom_TempCapacity",                    "Ah",        'f', 5  ),
+    Reg(0xAD, "Q_TempSetpoints",                       "C",         'f', 5  ),
+    Reg(0xAE, "Q_TempFactor",                          "",          'f', 5  ),
     Reg(0xAF, "Q_Nom",                                 "Ah",        'f', 1  ),
     Reg(0xB0, "CoulombicEfficiency",                   "",          'f', 1  ),
+    Reg(0xB1, "ModelTemperatureDischarge",             "C",         'f', 1  ),
+    Reg(0xB2, "ModelTemperatureCharge",                "C",         'f', 1  ),
     Reg(0xB6, "Ea_R0",                                 "J/mol",     'f', 1  ),
     Reg(0xB7, "Ea_R1",                                 "J/mol",     'f', 1  ),
     Reg(0xB8, "Ea_Tau1",                               "J/mol",     'f', 1  ),
@@ -262,7 +260,6 @@ FUEL_STATE_REGISTERS = [
     Reg(0xD1, "Cell_VRC1",                             "V",         'f', 7  ),
     Reg(0xD2, "Cell_VRC2",                             "V",         'f', 7  ),
     Reg(0xD3, "Cell_Covariance",                       "",          'f', 42 ),
-    Reg(0xD6, "CellQmax",                              "mAh",       'H', 7  ),
     Reg(0xD7, "CycleCount",                            "cycles",    'H', 1  ),
 ]
 
@@ -527,7 +524,6 @@ def main():
     all_groups = [
         ("Peripheral live readings (Peripheral_Data_t)  (0x00 - 0x0F)", PERIPH_REGISTERS, None),
         ("System state (System_Data_t)  (0x10 - 0x1F)", SYSTEM_REGISTERS, None),
-        ("Calibration offsets, measured at boot  (0x20 - 0x2F)", CALIBRATION_REGISTERS, None),
         ("Config (Config_Data_t)  (0x30 - 0x5F)", CONFIG_REGISTERS, None),
         ("Device info (Config_Data_t)  (0x60 - 0x6F)", DEVICE_INFO_REGISTERS, None),
         ("Stats (Stats_Data_t)  (0x70 - 0x7F)", STATS_REGISTERS, None),

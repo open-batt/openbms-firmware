@@ -1,0 +1,97 @@
+{
+  "description": "Balancing tests of 7_cell_2000mAh, run by balance_simulate.py. Every test runs from a reboot; expect holds its pass conditions. config.json: balance_start_mv 3900, balance_delta_mv 20, balance_max_temp_c 45, balance_resistance_ohm 50.",
+  "dt_ms": 100,
+  "temperature_c": 25.0,
+  "read_every_s": 10.0,
+  "cell_min_mv": 3000,
+  "cell_max_mv": 4200,
+  "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 1},
+  "tests": {
+    "one_cell_high": {
+      "description": "Cell 4 starts 5 % SOC above the others. CC/CV charge to 4200 mV: cell 4 must bleed (no other cell) once the top cell passes 3900 mV, the charger holds it at the limit while the others catch up, and the SOC spread must end below 1 %. The fuel gauge must subtract the bleed (error stays small).",
+      "branch": "chg",
+      "start_soc_pct": 70.0,
+      "cell_soc_offset_pct": [0, 0, 0, 5, 0, 0, 0],
+      "expect": {"cells": [4], "min_balance_s": 600, "max_final_soc_spread_pct": 1.0, "max_error_pct": 3.0},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "cccv", "current_ma": 1000, "cell_voltage_mv": 4200, "end_current_ma": 20, "duration_s": 14400},
+        {"type": "rest", "duration_s": 300}
+      ]
+    },
+    "two_cells_high": {
+      "description": "Cells 2 and 6 start 4 % and 2 % high. CC/CV charge: only cells 2 and 6 may bleed, the spread must end below 1 %.",
+      "branch": "chg",
+      "start_soc_pct": 70.0,
+      "cell_soc_offset_pct": [0, 4, 0, 0, 0, 2, 0],
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 2},
+      "expect": {"cells": [2, 6], "min_balance_s": 600, "max_final_soc_spread_pct": 1.0, "max_error_pct": 3.0},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "cccv", "current_ma": 1000, "cell_voltage_mv": 4200, "end_current_ma": 20, "duration_s": 14400},
+        {"type": "rest", "duration_s": 300}
+      ]
+    },
+    "balanced_pack": {
+      "description": "All cells at the same SOC, CC/CV charge to full: no cell may bleed (voltage noise 1 mV against balance_delta_mv 20).",
+      "branch": "chg",
+      "start_soc_pct": 70.0,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 3},
+      "expect": {"cells": []},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "cccv", "current_ma": 1000, "cell_voltage_mv": 4200, "end_current_ma": 50, "duration_s": 14400}
+      ]
+    },
+    "below_start": {
+      "description": "Cell 4 starts 5 % high at 20 % SOC. 20 min charge at 1 A stays below balance_start_mv (3900 mV): no cell may bleed.",
+      "branch": "chg",
+      "start_soc_pct": 20.0,
+      "cell_soc_offset_pct": [0, 0, 0, 5, 0, 0, 0],
+      "expect": {"cells": []},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "constant", "current_ma": 1000, "duration_s": 1200}
+      ]
+    },
+    "discharge_and_rest": {
+      "description": "Cell 4 starts 5 % high at 93 % SOC, above balance_start_mv. Rest, 1 A discharge, rest: balancing runs only while charging, so no cell may bleed.",
+      "branch": "dis",
+      "start_soc_pct": 93.0,
+      "cell_soc_offset_pct": [0, 0, 0, 5, 0, 0, 0],
+      "expect": {"cells": []},
+      "profile": [
+        {"type": "rest", "duration_s": 600},
+        {"type": "constant", "current_ma": -1000, "duration_s": 1200},
+        {"type": "rest", "duration_s": 600}
+      ]
+    },
+    "hot_and_trip": {
+      "description": "Cell 4 starts 5 % high at 85 % SOC. Charge at 1 A: cell 4 bleeds. Then the pack heats to 50 C while charging: the bleed must stop at balance_max_temp_c (45 C) and OTP_CHARGE trips; nothing may bleed while it is tripped, also after the pack cools down again.",
+      "branch": "chg",
+      "start_soc_pct": 85.0,
+      "cell_soc_offset_pct": [0, 0, 0, 5, 0, 0, 0],
+      "expect": {"cells": [4], "min_balance_s": 60, "trip": true},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "constant", "current_ma": 1000, "duration_s": 300, "note": "cell 4 bleeds"},
+        {"type": "constant", "current_ma": 1000, "duration_s": 60, "temperature_c": 50.0, "note": "too hot: bleed off, OTP_CHARGE trips"},
+        {"type": "constant", "current_ma": 1000, "duration_s": 300, "note": "cool again, still tripped: no bleed"}
+      ]
+    },
+    "balance_capacity": {
+      "description": "Capacity learning while balancing: cell 4 starts 5 % high at 50 % SOC. A 40 min rest gives the first learning point, a CC/CV charge to full makes cell 4 bleed for about an hour, a 40 min rest at the top gives the second point. The bleed never passes the shunt, so it must be taken off cell 4's counted charge: every cell's learned capacity must stay within 0.5 % of the real one.",
+      "branch": "chg",
+      "start_soc_pct": 50.0,
+      "cell_soc_offset_pct": [0, 0, 0, 5, 0, 0, 0],
+      "read_every_s": 60.0,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 4},
+      "expect": {"cells": [4], "min_balance_s": 600, "min_capacity_updates": 1, "max_capacity_error_pct": 0.5},
+      "profile": [
+        {"type": "rest", "duration_s": 2400, "note": "rest: learning point"},
+        {"type": "cccv", "current_ma": 1000, "cell_voltage_mv": 4200, "end_current_ma": 20, "duration_s": 14400, "note": "charge, cell 4 bleeds"},
+        {"type": "rest", "duration_s": 2400, "note": "rest: learning point"}
+      ]
+    }
+  }
+}

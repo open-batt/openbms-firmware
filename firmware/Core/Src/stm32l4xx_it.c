@@ -58,7 +58,7 @@
 extern DMA_HandleTypeDef hdma_adc1;
 extern ADC_HandleTypeDef hadc1;
 extern CAN_HandleTypeDef hcan1;
-extern SMBUS_HandleTypeDef hsmbus2;
+extern I2C_HandleTypeDef hi2c2;
 extern TIM_HandleTypeDef htim7;
 extern DMA_HandleTypeDef hdma_usart1_rx;
 extern DMA_HandleTypeDef hdma_usart1_tx;
@@ -311,7 +311,7 @@ void I2C2_EV_IRQHandler(void)
   /* USER CODE BEGIN I2C2_EV_IRQn 0 */
 
   /* USER CODE END I2C2_EV_IRQn 0 */
-  HAL_SMBUS_EV_IRQHandler(&hsmbus2);
+  HAL_I2C_EV_IRQHandler(&hi2c2);
   /* USER CODE BEGIN I2C2_EV_IRQn 1 */
 
   /* USER CODE END I2C2_EV_IRQn 1 */
@@ -325,7 +325,7 @@ void I2C2_ER_IRQHandler(void)
   /* USER CODE BEGIN I2C2_ER_IRQn 0 */
 
   /* USER CODE END I2C2_ER_IRQn 0 */
-  HAL_SMBUS_ER_IRQHandler(&hsmbus2);
+  HAL_I2C_ER_IRQHandler(&hi2c2);
   /* USER CODE BEGIN I2C2_ER_IRQn 1 */
 
   /* USER CODE END I2C2_ER_IRQn 1 */

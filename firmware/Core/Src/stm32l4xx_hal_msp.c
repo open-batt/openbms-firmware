@@ -352,22 +352,8 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
     /* USER CODE BEGIN I2C1_MspInit 1 */
 
     /* USER CODE END I2C1_MspInit 1 */
-
   }
-
-}
-
-/**
-  * @brief SMBUS MSP Initialization
-  * This function configures the hardware resources used in this example
-  * @param hsmbus: SMBUS handle pointer
-  * @retval None
-  */
-void HAL_SMBUS_MspInit(SMBUS_HandleTypeDef* hsmbus)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
-  if(hsmbus->Instance==I2C2)
+  else if(hi2c->Instance==I2C2)
   {
     /* USER CODE BEGIN I2C2_MspInit 0 */
 
@@ -404,7 +390,6 @@ void HAL_SMBUS_MspInit(SMBUS_HandleTypeDef* hsmbus)
     /* USER CODE BEGIN I2C2_MspInit 1 */
 
     /* USER CODE END I2C2_MspInit 1 */
-
   }
 
 }
@@ -437,18 +422,7 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* hi2c)
 
     /* USER CODE END I2C1_MspDeInit 1 */
   }
-
-}
-
-/**
-  * @brief SMBUS MSP De-Initialization
-  * This function freeze the hardware resources used in this example
-  * @param hsmbus: SMBUS handle pointer
-  * @retval None
-  */
-void HAL_SMBUS_MspDeInit(SMBUS_HandleTypeDef* hsmbus)
-{
-  if(hsmbus->Instance==I2C2)
+  else if(hi2c->Instance==I2C2)
   {
     /* USER CODE BEGIN I2C2_MspDeInit 0 */
 

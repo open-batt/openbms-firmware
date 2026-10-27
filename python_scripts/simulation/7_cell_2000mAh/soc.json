@@ -1,0 +1,130 @@
+{
+  "description": "SOC tests of 7_cell_2000mAh, run by soc_simulate.py: estimation, rest and full-charge corrections, capacity learning and the temperature model. Every test runs from a reboot; expect holds its pass conditions.",
+  "dt_ms": 100,
+  "temperature_c": 25.0,
+  "read_every_s": 10.0,
+  "cell_min_mv": 3000,
+  "cell_max_mv": 4200,
+  "repeat": 1,
+  "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 1},
+  "tests": {
+    "discharge": {
+      "description": "SOC estimation while discharging: rest, constant, resistor, pulse, sine and random load, rest, then a long constant discharge. The internal SOC must follow the true SOC.",
+      "branch": "dis",
+      "start_soc_pct": 100.0,
+      "dt_ms": 50,
+      "expect": {"max_error_pct": 3.0, "max_mean_flow_error_pct": 1.0},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "constant", "current_ma": -2000, "duration_s": 600},
+        {"type": "rest", "duration_s": 300},
+        {"type": "resistor", "load_ohm": 14.0, "duration_s": 600},
+        {"type": "pulse", "high_ma": -4000, "low_ma": 0, "period_s": 20, "duty": 0.5, "duration_s": 600},
+        {"type": "sine", "offset_ma": -2000, "amplitude_ma": 1500, "period_s": 60, "duration_s": 600},
+        {"type": "random", "min_ma": -4000, "max_ma": 0, "hold_s": 5, "duration_s": 600},
+        {"type": "rest", "duration_s": 300},
+        {"type": "constant", "current_ma": -2000, "duration_s": 3600}
+      ]
+    },
+    "charge": {
+      "description": "SOC estimation while charging: CC/CV from 5 % to full, then rest. The internal SOC must follow the true SOC.",
+      "branch": "chg",
+      "start_soc_pct": 5.0,
+      "dt_ms": 50,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 2},
+      "expect": {"max_error_pct": 2.0, "max_mean_flow_error_pct": 1.0, "final_shown_pct": 100},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "cccv", "current_ma": 2000, "cell_voltage_mv": 4200, "end_current_ma": 100, "duration_s": 14400},
+        {"type": "rest", "duration_s": 600}
+      ]
+    },
+    "high_current_discharge": {
+      "description": "High current discharge: 15 A (7.5 C, just below the 16 A slow discharge OCP) from 100 % until the weakest cell reaches 2800 mV under load (above UVP 2700 mV, so no protection trips). At 15 A the voltage drop on the cell resistance ends this at about 40 % SOC, so the discharge goes on at 8 A down to 2800 mV, which leaves about 4 %, then a 40 min rest. (Lower currents are not used: the model's OCV is flat below 0 %, so the simulated cells would run below 0 %.) The internal SOC must follow the true SOC all the way down.",
+      "branch": "dis",
+      "start_soc_pct": 100.0,
+      "dt_ms": 50,
+      "read_every_s": 5,
+      "cell_min_mv": 2800,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 5},
+      "expect": {"max_error_pct": 2.0, "max_mean_flow_error_pct": 1.0, "max_final_error_pct": 1.0},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "constant", "current_ma": -15000, "duration_s": 1800, "note": "15 A down to 2800 mV"},
+        {"type": "constant", "current_ma": -8000, "duration_s": 1800, "note": "8 A down to 2800 mV, about 4 % left"},
+        {"type": "rest", "duration_s": 2400, "note": "rest after the discharge"}
+      ]
+    },
+    "rest_correction": {
+      "description": "Rest correction: the board starts 10 % too high. After a short discharge a 40 min rest lets the OCV correct the internal SOC (shown SOC holds), then a discharge down to about 4 % spreads the gap: the shown SOC meets the true SOC on the way down.",
+      "branch": "dis",
+      "start_soc_pct": 70.0,
+      "soc_offset_pct": -10.0,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 3},
+      "expect": {"min_rest_corrections": 1, "max_final_error_pct": 1.0},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "constant", "current_ma": -1000, "duration_s": 600, "note": "discharge, board still 10 % off"},
+        {"type": "rest", "duration_s": 2400, "note": "rest: internal SOC corrected from the OCV"},
+        {"type": "constant", "current_ma": -1000, "duration_s": 3300, "note": "discharge to about 4 %, shown SOC catches up"}
+      ]
+    },
+    "full_charge": {
+      "description": "Full charge: the cell voltages reach the board 50 mV low, so its SOC runs low all through the charge. CC/CV ends at 50 mA, below charging_term_current (100 mA), so the full-charge detection fires: expect the shown SOC of all cells to jump from about 98 to 100 % near the end of charge and stay there in the rest after it.",
+      "branch": "chg",
+      "start_soc_pct": 60.0,
+      "voltage_offset_mv": -50.0,
+      "dt_ms": 50,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 2},
+      "expect": {"min_full_charges": 1, "final_shown_pct": 100},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "cccv", "current_ma": 2000, "cell_voltage_mv": 4200, "end_current_ma": 50, "duration_s": 14400, "note": "charge to full"},
+        {"type": "rest", "duration_s": 600, "note": "shown SOC must stay at 100 %"}
+      ]
+    },
+    "capacity_learning": {
+      "description": "Capacity learning: the cells are 5 % smaller than the board's capacity_ah. Six cycles between about 90 and 30 % SOC with 40 min rests give the learning points; expect the capacity to move toward the real value at every update, q_nom_ah and SOH to follow, and about one cycle counted per 1.8 Ah discharged.",
+      "branch": "dis",
+      "start_soc_pct": 90.0,
+      "capacity_scale": 0.95,
+      "read_every_s": 60.0,
+      "repeat": 6,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 4},
+      "expect": {"min_capacity_updates": 5, "max_final_capacity_error_pct": 1.0},
+      "profile": [
+        {"type": "rest", "duration_s": 2400, "note": "rest: learning point"},
+        {"type": "constant", "current_ma": -1000, "duration_s": 4000, "note": "discharge about 60 %"},
+        {"type": "rest", "duration_s": 2400, "note": "rest: learning point"},
+        {"type": "constant", "current_ma": 1000, "duration_s": 4000, "note": "charge about 60 %"}
+      ]
+    },
+    "temperature": {
+      "description": "Temperature model: the whole test runs at 0 degC, the model tables are from 25 degC. The simulated cells have about 3 x the resistance of the tables. With the board's temperature model on, the internal SOC follows the true SOC during the 2 A discharge; remaining capacity (0x94) is the shown SOC x capacity x 0.9 (q_temp_factor at 0 degC). Compare with soc_temperature_off.",
+      "branch": "dis",
+      "start_soc_pct": 90.0,
+      "temperature_c": 0.0,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 4},
+      "expect": {"max_mean_flow_error_pct": 1.0, "max_final_error_pct": 1.0, "remaining_factor": [0.85, 0.95]},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "constant", "current_ma": -2000, "duration_s": 1800, "note": "2 A discharge at 0 degC"},
+        {"type": "rest", "duration_s": 120, "note": "short rest, remaining capacity read at 0 degC"}
+      ]
+    },
+    "temperature_off": {
+      "description": "Same as soc_temperature, but the board's temperature model is off (ea_* = 0): the board uses the 25 degC tables at 0 degC, so its internal SOC drifts away from the true SOC during the discharge. ",
+      "branch": "dis",
+      "start_soc_pct": 90.0,
+      "board_temperature_model": false,
+      "temperature_c": 0.0,
+      "noise": {"voltage_mv": 1.0, "current_ma": 5.0, "seed": 4},
+      "expect": {"min_mean_flow_error_pct": 1.5},
+      "profile": [
+        {"type": "rest", "duration_s": 60},
+        {"type": "constant", "current_ma": -2000, "duration_s": 1800, "note": "2 A discharge at 0 degC"},
+        {"type": "rest", "duration_s": 120, "note": "short rest, remaining capacity read at 0 degC"}
+      ]
+    }
+  }
+}

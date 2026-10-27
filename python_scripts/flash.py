@@ -3,7 +3,10 @@
 flash.py -- program the OpenBMS firmware over UART through the bootloader.
 
 Usage:
-    python flash.py [COM_PORT] <HEX_FILE>
+    python flash.py [COM_PORT] [HEX_FILE]
+
+Without HEX_FILE the tool uses the .hex file in firmware/build/Debug (the newest one
+if there are several). With HEX_FILE it uses exactly that file.
 
 Without COM_PORT the tool pings every serial port on the computer and uses the
 one where an OpenBMS (running the firmware, or sitting in the bootloader)
@@ -15,6 +18,18 @@ WAIT_CONFIG; write the config again with config_tool.py in that case.
 """
 
 import sys
+import importlib.util
+import subprocess
+
+# Third-party modules this script needs (import name: pip package). Missing ones are installed on the first run.
+REQUIRED_MODULES = {"serial": "pyserial"}
+for _module, _package in REQUIRED_MODULES.items():
+    if importlib.util.find_spec(_module) is None:
+        print(f"Installing {_package} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _package])
+
+import os
+import glob
 import serial
 from serial.tools import list_ports
 import time
@@ -32,6 +47,7 @@ TIMEOUT_PROGRAM     = 2.0    # seconds — per line
 TIMEOUT_CRC         = 5.0    # seconds
 TIMEOUT_FLAG        = 2.0    # seconds
 TIMEOUT_BOOT_WAIT   = 10.0   # seconds — max wait for bootloader after firmware resets
+BUILD_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "firmware", "build", "Debug")
 MAX_RETRIES         = 2
 PING_RETRIES        = 3
 BOOT_RETRY_DELAY    = 0.2    # seconds — wait between pings after firmware reset
@@ -234,6 +250,13 @@ def find_board():
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
+def find_hex_file():
+    """The .hex file in BUILD_DIR, the newest one if there are several, or None."""
+    files = glob.glob(os.path.join(BUILD_DIR, "*.hex"))
+    if not files:
+        return None
+    return max(files, key=os.path.getmtime)
+
 def main():
     hex_file = None
     port     = None
@@ -247,11 +270,18 @@ def main():
             hex_file = None
             break
 
-    if hex_file is None:
-        print("Usage: python flash.py [COM_PORT] <HEX_FILE>")
-        print("Example: python flash.py firmware.hex           (finds the port itself)")
+    if len(sys.argv) > 3:
+        print("Usage: python flash.py [COM_PORT] [HEX_FILE]")
+        print("Example: python flash.py                        (finds the port and the hex file itself)")
         print("         python flash.py COM3 firmware.hex")
         sys.exit(1)
+
+    if hex_file is None:
+        hex_file = find_hex_file()
+        if hex_file is None:
+            print(f"ERR: no .hex file in {os.path.normpath(BUILD_DIR)}, build the firmware or pass the file")
+            sys.exit(1)
+        print(f"Using {os.path.normpath(hex_file)}")
 
     # -------------------------------------------------------
     # Parse hex file

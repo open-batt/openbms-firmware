@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "openbms_ctrl.h"
 #include "openbms_comm.h"
+#include "openbms_error.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,7 +50,9 @@ CAN_HandleTypeDef hcan1;
 CRC_HandleTypeDef hcrc;
 
 I2C_HandleTypeDef hi2c1;
-SMBUS_HandleTypeDef hsmbus2;
+I2C_HandleTypeDef hi2c2;
+
+IWDG_HandleTypeDef hiwdg;
 
 SPI_HandleTypeDef hspi1;
 
@@ -70,11 +73,12 @@ static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_I2C2_SMBUS_Init(void);
+static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_CRC_Init(void);
 static void MX_TIM7_Init(void);
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 /* USER CODE END PFP */
@@ -120,20 +124,35 @@ int main(void)
   MX_ADC1_Init();
   MX_CAN1_Init();
   MX_I2C1_Init();
-  MX_I2C2_SMBUS_Init();
+  MX_I2C2_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_CRC_Init();
   MX_TIM7_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
+  // The watchdog stops while the debugger halts the core, so a breakpoint does not reset the board
+  __HAL_DBGMCU_FREEZE_IWDG();
+
   Comm_Init();
   Ctrl_Init();
+
+  // Tell the host when the last reset came from the watchdog. The reset flags stay set
+  // until they are cleared, so they are cleared here for the next reset.
+  if(__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST))
+  {
+    Error_Set(OPENBMS_WATCHDOG_RESET);
+  }
+  __HAL_RCC_CLEAR_RESET_FLAGS();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // The watchdog resets the board when the main loop stops for about 1 s (IWDG prescaler 16, reload 1999)
+    HAL_IWDG_Refresh(&hiwdg);
+
     if(tick_10ms)
     {
       tick_10ms = false;
@@ -173,8 +192,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 1;
@@ -403,7 +423,7 @@ static void MX_I2C1_Init(void)
   * @param None
   * @retval None
   */
-static void MX_I2C2_SMBUS_Init(void)
+static void MX_I2C2_Init(void)
 {
 
   /* USER CODE BEGIN I2C2_Init 0 */
@@ -413,26 +433,65 @@ static void MX_I2C2_SMBUS_Init(void)
   /* USER CODE BEGIN I2C2_Init 1 */
 
   /* USER CODE END I2C2_Init 1 */
-  hsmbus2.Instance = I2C2;
-  hsmbus2.Init.Timing = 0x10D19CE4;
-  hsmbus2.Init.AnalogFilter = SMBUS_ANALOGFILTER_ENABLE;
-  hsmbus2.Init.OwnAddress1 = 22;
-  hsmbus2.Init.AddressingMode = SMBUS_ADDRESSINGMODE_7BIT;
-  hsmbus2.Init.DualAddressMode = SMBUS_DUALADDRESS_DISABLE;
-  hsmbus2.Init.OwnAddress2 = 0;
-  hsmbus2.Init.OwnAddress2Masks = SMBUS_OA2_NOMASK;
-  hsmbus2.Init.GeneralCallMode = SMBUS_GENERALCALL_DISABLE;
-  hsmbus2.Init.NoStretchMode = SMBUS_NOSTRETCH_DISABLE;
-  hsmbus2.Init.PacketErrorCheckMode = SMBUS_PEC_ENABLE;
-  hsmbus2.Init.PeripheralMode = SMBUS_PERIPHERAL_MODE_SMBUS_SLAVE;
-  hsmbus2.Init.SMBusTimeout = 0x83D093E7;
-  if (HAL_SMBUS_Init(&hsmbus2) != HAL_OK)
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.Timing = 0x10D19CE4;
+  hi2c2.Init.OwnAddress1 = 22;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN I2C2_Init 2 */
 
   /* USER CODE END I2C2_Init 2 */
+
+}
+
+/**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_16;
+  hiwdg.Init.Window = 4095;
+  hiwdg.Init.Reload = 1999;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
 
 }
 
@@ -659,7 +718,7 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  // ADS131 DRDY stays off until the ADS is configured, ADS131M08_Init enables it
+  // ADS131 DRDY stays off until the ADS is configured, Periph_AdsInit enables it
   HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }

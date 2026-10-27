@@ -21,12 +21,11 @@ typedef enum
     OPENBMS_ADS131M08_ID_FAIL,
     OPENBMS_ADS131M08_CRC_FAIL,     // a sample frame failed its output CRC and was dropped
     OPENBMS_ADS131M08_RESET,        // the ADS reset by itself (STATUS RESET bit), its settings are back to defaults
-    OPENBMS_ADS131M08_DATA_LOST,    // no good sample for ADS_DATA_TIMEOUT_MS, the measurements are stale
+    OPENBMS_ADS131M08_DATA_LOST,    // no good sample for PER_ADS_DATA_TIMEOUT_MS, the measurements are stale
 
-    // Hardware pins, set by GPIO_Ctrl through Error_Set when the pin state is seen
+    // Hardware pins, set by Periph_GpioCtrl through Error_Set when the pin state is seen
     OPENBMS_HW_DRV_FAULT,           // FET driver fault
     OPENBMS_HW_DRV_GATE_FAULT,      // FET driver gate fault
-    OPENBMS_HW_WAKE_UP,             // wake-up pin active
     OPENBMS_HW_PWR_FAIL,            // VCC power NOT good
 
     // Host communication
@@ -35,6 +34,13 @@ typedef enum
 
     // Sensors
     OPENBMS_NTC_FAULT,              // NTC open or shorted: no package temperature, OTP is skipped until the errors are cleared
+
+    // Host communication, added at the end so the bit numbers above stay the same
+    OPENBMS_I2C_ERROR,              // I2C slave bus error or stuck transfer - the I2C was restarted
+    OPENBMS_CAN_ERROR,              // CAN bus-off or another CAN error, or the CAN stopped - the CAN was restarted
+
+    // System
+    OPENBMS_WATCHDOG_RESET,         // the last reset was done by the independent watchdog (IWDG): the main loop hung
 
 } OpenBMS_Error_t;
 

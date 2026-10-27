@@ -19,16 +19,11 @@
 #include "openbms_hppc_extract.h"
 #include "openbms_ctrl.h"
 #include "openbms_periph.h"
+#include "openbms_error.h"
 #include <math.h>
+#include <string.h>
 
-// HPPC sequencer constants, the same values as battery_cycler.py
-#define HPPC_REST_MS                    450000UL    // HPPC_REST_S
-#define HPPC_DETECT_MS                  500UL       // FET on this long to see which way the current flows
-#define HPPC_DETECT_MIN_MA              50.0f       // less than this and nothing is connected
-#define HPPC_CURRENT_MIN_C              0.5f        // ramp current range in C of cell_capacity
-#define HPPC_CURRENT_MAX_C              2.0f
-#define HPPC_CURRENT_FAULT_MS           2000UL      // out of range this long stops the test, covers the charger or load start
-#define HPPC_MAX_DT_MS                  1000UL      // longest time step counted in one pass (e.g. after a debugger halt)
+// The HPPC test settings (rest time, current range, ...) are in config.h
 
 // SOC checkpoints in %, discharge order. A charge run walks the list backwards.
 static const uint8_t hppc_points[HPPC_POINT_COUNT] =
@@ -39,16 +34,17 @@ static const uint8_t hppc_points[HPPC_POINT_COUNT] =
 
 typedef struct
 {
-  uint8_t  state;          // BD_HPPC_STATE_*
-  uint8_t  direction;      // BD_HPPC_DIR_*
+  uint8_t  state;          // HPPC_STATE_*
+  uint8_t  direction;      // HPPC_DIR_*
   bool     fet;            // main FET state the sequencer wants, applied by Ctrl_Run
-  uint16_t status;         // low byte BD_HPPC_STATE_*, high byte BD_HPPC_STOP_*
+  uint16_t status;         // low byte HPPC_STATE_*, high byte HPPC_STOP_*
   uint8_t  checkpoint;     // index of the current checkpoint in walking order
   uint32_t state_tick;     // time the current state was entered in ms
   float    coulomb_mah;    // charge moved in the current ramp
   float    target_mah;     // charge the current ramp has to move
   bool     open_ramp;      // last ramp: no target, runs until a stop condition
   uint32_t current_bad_ms; // how long the ramp current has been out of range
+  uint32_t temp_bad_ms;    // how long the pack temperature has been outside the window
   uint32_t last_tick;      // time of the previous pass, the charge is counted with the real time step
 } Hppc_t;
 
@@ -66,16 +62,17 @@ static Config_Data_t    cfg                 = {0};   // settings of the running 
 // The test ends when a stop condition is met in a ramp (cell voltage limit, or
 // for charging the termination current), when the probe sees no current, or
 // when the host switches back to normal run. Every end switches the FET off,
-// writes hppc_status and returns main_control to normal.
+// writes hppc_status and returns main_control to normal. The device then stays in
+// HPPC run with the FET off until a reboot; no new test can be started before that.
 //
 // The sequencer never touches the FET itself. It keeps the state it wants and
 // Ctrl_Run takes it from the fet argument of Hppc_Run() / Hppc_Stop() and switches the FET.
 // The parameter extraction (openbms_hppc_extract.c) runs from Hppc_Run() and Hppc_Stop(), so it only
-// works while the device is in HPPC run, and HPPC run is left only after its last work is done.
+// works while the device is in HPPC run. The device stays there until a reboot, so that work always finishes.
 // -----------------------------------------------------------------------------
 static uint8_t Hppc_Point(uint8_t n)
 {
-  if(hppc.direction == BD_HPPC_DIR_CHARGE)
+  if(hppc.direction == HPPC_DIR_CHARGE)
   {
     return hppc_points[HPPC_POINT_COUNT - 1 - n];
   }
@@ -87,7 +84,7 @@ static uint8_t Hppc_Point(uint8_t n)
 static void Hppc_SetState(uint8_t state)
 {
   hppc.state      = state;
-  hppc.state_tick = BD_GET_TICK();
+  hppc.state_tick = SYS_GET_TICK();
   hppc.status     = state;
 }
 static void Hppc_Finish(uint8_t state, uint8_t reason)
@@ -96,10 +93,10 @@ static void Hppc_Finish(uint8_t state, uint8_t reason)
 
   hppc.state  = state;
   hppc.status = (uint16_t)(((uint16_t)reason << 8) | state);
-  Ctrl_SetMode(BD_MAIN_CTR_MODE_NORMAL);
+  Ctrl_SetMode(CTRL_MODE_NORMAL);
 
   // A test that ends by its own stop condition gets its tables built, any other end drops the collected data
-  if(state == BD_HPPC_STATE_DONE)
+  if(state == HPPC_STATE_DONE)
   {
     HppcX_Done();
   }
@@ -108,15 +105,28 @@ static void Hppc_Finish(uint8_t state, uint8_t reason)
     HppcX_Abort();
   }
 }
+static bool Hppc_TemperatureOk(const Peripheral_Data_t *pd)
+{
+  // A broken NTC gives no temperature at all, the test cannot tell where it is
+  if(Error_IsSet(OPENBMS_NTC_FAULT))
+  {
+    return false;
+  }
+  if(pd->temperature_package < HPPC_TEMP_MIN_C || pd->temperature_package > HPPC_TEMP_MAX_C)
+  {
+    return false;
+  }
+  return true;
+}
 static bool Hppc_IsRunning(void)
 {
-  return (hppc.state == BD_HPPC_STATE_DETECT ||
-          hppc.state == BD_HPPC_STATE_REST   ||
-          hppc.state == BD_HPPC_STATE_RAMP);
+  return (hppc.state == HPPC_STATE_DETECT ||
+          hppc.state == HPPC_STATE_REST   ||
+          hppc.state == HPPC_STATE_RAMP);
 }
-bool Hppc_Stop(bool *fet)
+void Hppc_Stop(bool *fet)
 {
-  // Called while HPPC mode is being left. The FET goes off whatever the test was doing.
+  // Called on every pass once the test has ended. The FET goes off whatever the test was doing.
   hppc.fet = false;
 
   // A test that was still running is reported as aborted by the host. One that
@@ -124,16 +134,16 @@ bool Hppc_Stop(bool *fet)
   if(Hppc_IsRunning())
   {
     HppcX_Abort();
-    hppc.state  = BD_HPPC_STATE_ABORTED;
-    hppc.status = (uint16_t)(((uint16_t)BD_HPPC_STOP_HOST << 8) | BD_HPPC_STATE_ABORTED);
+    hppc.state  = HPPC_STATE_ABORTED;
+    hppc.status = (uint16_t)(((uint16_t)HPPC_STOP_HOST << 8) | HPPC_STATE_ABORTED);
   }
 
-  // A test that ended by itself may still have fits and tables to finish: HPPC run is not left before that
+  // A test that ended by itself may still have fits and tables to finish
   HppcX_Run();
-  if((HppcX_GetStatus() & BD_HPPC_X_BUSY) != 0)
+  if((HppcX_GetStatus() & HX_STATUS_BUSY) != 0)
   {
     *fet = hppc.fet;
-    return false;
+    return;
   }
 
   // Reset the sequencer so the next start begins from scratch
@@ -143,13 +153,12 @@ bool Hppc_Stop(bool *fet)
   hppc.open_ramp   = false;
 
   *fet = hppc.fet;
-  return true;
 }
 static void Hppc_StartRest(void)
 {
   hppc.fet = false;
   HppcX_RestStarted();
-  Hppc_SetState(BD_HPPC_STATE_REST);
+  Hppc_SetState(HPPC_STATE_REST);
 }
 static void Hppc_StartRamp(void)
 {
@@ -158,12 +167,12 @@ static void Hppc_StartRamp(void)
 
   hppc.fet = true;
   HppcX_RampStarted();
-  Hppc_SetState(BD_HPPC_STATE_RAMP);
+  Hppc_SetState(HPPC_STATE_RAMP);
 }
 static void Hppc_Step(void)
 {
   Peripheral_Data_t pd;
-  uint32_t          now = BD_GET_TICK();
+  uint32_t          now = SYS_GET_TICK();
   uint32_t          dt_ms;
   uint8_t           cell_count;
   uint8_t           reason;
@@ -171,7 +180,7 @@ static void Hppc_Step(void)
   bool              above_monitor;
   bool              current_fault;
   float             current_ma;
-  float             current_abs_ma;
+  float             dir_current_ma;
   float             step_pct;
 
   bool running = Hppc_IsRunning();
@@ -179,30 +188,39 @@ static void Hppc_Step(void)
   // Not running: a new test starts here
   if(!running)
   {
-    hppc.direction   = BD_HPPC_DIR_UNKNOWN;
-    hppc.status      = BD_HPPC_STATE_IDLE;
+    hppc.direction   = HPPC_DIR_UNKNOWN;
+    hppc.status      = HPPC_STATE_IDLE;
     hppc.checkpoint  = 0;
     hppc.coulomb_mah = 0.0f;
     hppc.target_mah  = 0.0f;
     hppc.open_ramp   = false;
+    hppc.temp_bad_ms = 0;
 
     // Clear what the last test left in the extraction, so its status is not shown for this one
     HppcX_Reset();
 
-    // The settings are read once, so they cannot change in the middle of a test
-    Ctrl_GetConfig(&cfg);
+    // The settings are copied once, so they cannot change in the middle of a test
+    memcpy(&cfg, Ctrl_GetConfig(), sizeof(cfg));
 
     // Without a valid OCV window the parameter extraction cannot run, so the test is not started
-    if(cfg.cell_capacity == 0 || cfg.cell_count < BD_CELL_COUNT_MIN || cfg.cell_count > BD_CELL_COUNT_MAX || cfg.ocv_v_hi_mv <= cfg.ocv_v_lo_mv)
+    if(cfg.cell_capacity == 0 || cfg.cell_count < SYS_CELL_COUNT_MIN || cfg.cell_count > SYS_CELL_COUNT_MAX || cfg.ocv_v_hi_mv <= cfg.ocv_v_lo_mv)
     {
-      Hppc_Finish(BD_HPPC_STATE_ABORTED, BD_HPPC_STOP_NO_CONFIG);
+      Hppc_Finish(HPPC_STATE_ABORTED, HPPC_STOP_NO_CONFIG);
+      return;
+    }
+
+    // Tables measured far from room temperature are not wanted, the test is not started
+    Periph_GetData(&pd);
+    if(!Hppc_TemperatureOk(&pd))
+    {
+      Hppc_Finish(HPPC_STATE_ABORTED, HPPC_STOP_TEMPERATURE);
       return;
     }
 
     // Known FET state before anything else, then probe the direction
     hppc.fet       = true;
     hppc.last_tick = now;
-    Hppc_SetState(BD_HPPC_STATE_DETECT);
+    Hppc_SetState(HPPC_STATE_DETECT);
     return;
   }
 
@@ -218,25 +236,41 @@ static void Hppc_Step(void)
   Periph_GetData(&pd);
   current_ma = pd.pack_current;     // mA, positive while charging
 
+  // Temperature window: a broken NTC stops the test at once, a temperature outside the window
+  // only after HPPC_TEMP_OUT_MS, so a short excursion does not throw the test away
+  if(Hppc_TemperatureOk(&pd))
+  {
+    hppc.temp_bad_ms = 0;
+  }
+  else
+  {
+    hppc.temp_bad_ms += dt_ms;
+  }
+  if(Error_IsSet(OPENBMS_NTC_FAULT) || hppc.temp_bad_ms >= HPPC_TEMP_OUT_MS)
+  {
+    Hppc_Finish(HPPC_STATE_ABORTED, HPPC_STOP_TEMPERATURE);
+    return;
+  }
+
   switch(hppc.state)
   {
-    case BD_HPPC_STATE_DETECT:
+    case HPPC_STATE_DETECT:
     {
       if((now - hppc.state_tick) >= HPPC_DETECT_MS)
       {
         if(fabsf(current_ma) < HPPC_DETECT_MIN_MA)
         {
-          Hppc_Finish(BD_HPPC_STATE_ABORTED, BD_HPPC_STOP_NO_CURRENT);
+          Hppc_Finish(HPPC_STATE_ABORTED, HPPC_STOP_NO_CURRENT);
         }
         else
         {
           if(current_ma > 0.0f)
           {
-            hppc.direction = BD_HPPC_DIR_CHARGE;
+            hppc.direction = HPPC_DIR_CHARGE;
           }
           else
           {
-            hppc.direction = BD_HPPC_DIR_DISCHARGE;
+            hppc.direction = HPPC_DIR_DISCHARGE;
           }
 
           // The direction is known: the parameter extraction starts, then the first rest at the first checkpoint
@@ -247,9 +281,9 @@ static void Hppc_Step(void)
     }
     break;
 
-    case BD_HPPC_STATE_REST:
+    case HPPC_STATE_REST:
     {
-      HppcX_Tick(pd.cell_voltage, current_ma, dt_ms);
+      HppcX_Tick(pd.cell_voltage, current_ma, pd.temperature_package, dt_ms);
 
       if((now - hppc.state_tick) >= HPPC_REST_MS)
       {
@@ -277,22 +311,34 @@ static void Hppc_Step(void)
     }
     break;
 
-    case BD_HPPC_STATE_RAMP:
+    case HPPC_STATE_RAMP:
     {
-      HppcX_Tick(pd.cell_voltage, current_ma, dt_ms);
+      HppcX_Tick(pd.cell_voltage, current_ma, pd.temperature_package, dt_ms);
 
-      hppc.coulomb_mah += fabsf(current_ma) * (float)dt_ms / 3600000.0f;
+      charging = (hppc.direction == HPPC_DIR_CHARGE);
+
+      // Current along the test direction: positive when it moves the SOC the way the test goes.
+      // A current that changed sign counts against the ramp and is caught by the range check below.
+      if(charging)
+      {
+        dir_current_ma = current_ma;
+      }
+      else
+      {
+        dir_current_ma = -current_ma;
+      }
+
+      hppc.coulomb_mah += dir_current_ma * (float)dt_ms / 3600000.0f;
 
       // Stop conditions, checked on every step of every ramp
       cell_count = cfg.cell_count;
-      if(cell_count > BD_CELL_COUNT_MAX)
+      if(cell_count > SYS_CELL_COUNT_MAX)
       {
-        cell_count = BD_CELL_COUNT_MAX;
+        cell_count = SYS_CELL_COUNT_MAX;
       }
 
-      charging      = (hppc.direction == BD_HPPC_DIR_CHARGE);
       above_monitor = false;
-      reason        = BD_HPPC_STOP_NONE;
+      reason        = HPPC_STOP_NONE;
 
       for(uint8_t i = 0; i < cell_count; i++)
       {
@@ -300,9 +346,9 @@ static void Hppc_Step(void)
 
         if(charging)
         {
-          if(cell_mv >= (float)cfg.charge_stop_cell_mv)
+          if(cell_mv >= (float)cfg.voltage_cell_max)
           {
-            reason = BD_HPPC_STOP_CELL_MAX;
+            reason = HPPC_STOP_CELL_MAX;
             break;
           }
           if(cell_mv >= (float)cfg.charge_monitor_cell_mv)
@@ -314,29 +360,29 @@ static void Hppc_Step(void)
         {
           if(cell_mv <= (float)cfg.voltage_cell_min)
           {
-            reason = BD_HPPC_STOP_CELL_MIN;
+            reason = HPPC_STOP_CELL_MIN;
             break;
           }
         }
       }
 
       // Termination current: only looked at once a cell is above the monitor voltage
-      if(reason == BD_HPPC_STOP_NONE && charging && above_monitor &&
+      if(reason == HPPC_STOP_NONE && charging && above_monitor &&
          fabsf(current_ma) <= (float)cfg.charging_term_current)
       {
-        reason = BD_HPPC_STOP_TERM_CURRENT;
+        reason = HPPC_STOP_TERM_CURRENT;
       }
 
       // The ramp current has to stay within HPPC_CURRENT_MIN_C to HPPC_CURRENT_MAX_C of the capacity,
       // otherwise the charger or load is gone or wrong and the ramp may never end. The minimum is not
       // checked once a charge is above the monitor voltage, there the current falls to the termination current.
-      current_abs_ma = fabsf(current_ma);
+      // A current in the wrong direction is below the minimum.
       current_fault  = false;
-      if(current_abs_ma > (float)cfg.cell_capacity * HPPC_CURRENT_MAX_C)
+      if(dir_current_ma > (float)cfg.cell_capacity * HPPC_CURRENT_MAX_C)
       {
         current_fault = true;
       }
-      if(current_abs_ma < (float)cfg.cell_capacity * HPPC_CURRENT_MIN_C && !(charging && above_monitor))
+      if(dir_current_ma < (float)cfg.cell_capacity * HPPC_CURRENT_MIN_C && !(charging && above_monitor))
       {
         current_fault = true;
       }
@@ -350,13 +396,13 @@ static void Hppc_Step(void)
         hppc.current_bad_ms = 0;
       }
 
-      if(reason != BD_HPPC_STOP_NONE)
+      if(reason != HPPC_STOP_NONE)
       {
-        Hppc_Finish(BD_HPPC_STATE_DONE, reason);
+        Hppc_Finish(HPPC_STATE_DONE, reason);
       }
       else if(hppc.current_bad_ms >= HPPC_CURRENT_FAULT_MS)
       {
-        Hppc_Finish(BD_HPPC_STATE_ABORTED, BD_HPPC_STOP_CURRENT_RANGE);
+        Hppc_Finish(HPPC_STATE_ABORTED, HPPC_STOP_CURRENT_RANGE);
       }
       else if(!hppc.open_ramp && hppc.coulomb_mah >= hppc.target_mah)
       {
@@ -382,7 +428,7 @@ void Hppc_Run(bool *fet)
 void Hppc_Abort(uint8_t reason, bool *fet)
 {
   // Same ending as a test that stops by itself, the stop reason is given by the caller
-  Hppc_Finish(BD_HPPC_STATE_ABORTED, reason);
+  Hppc_Finish(HPPC_STATE_ABORTED, reason);
 
   *fet = hppc.fet;
 }

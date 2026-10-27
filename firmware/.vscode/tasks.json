@@ -1,0 +1,20 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Clean Rebuild",
+            "type": "cmake",
+            "command": "cleanRebuild",
+            "preset": "Debug",
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Clean",
+            "type": "cmake",
+            "command": "clean",
+            "preset": "Debug",
+            "problemMatcher": []
+        }
+    ]
+}

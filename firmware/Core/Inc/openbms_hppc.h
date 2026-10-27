@@ -14,31 +14,32 @@ extern "C" {
 // HPPC direction and status (System bank, read-only)
 // hppc_status: low byte = state, high byte = stop reason
 // -------------------------------------------------------
-#define BD_HPPC_DIR_UNKNOWN                 (0)             // not detected yet
-#define BD_HPPC_DIR_CHARGE                  (1)
-#define BD_HPPC_DIR_DISCHARGE               (2)
+#define HPPC_DIR_UNKNOWN                 (0)             // not detected yet
+#define HPPC_DIR_CHARGE                  (1)
+#define HPPC_DIR_DISCHARGE               (2)
 
-#define BD_HPPC_STATE_IDLE                  (0)
-#define BD_HPPC_STATE_DETECT                (1)             // probing the current direction
-#define BD_HPPC_STATE_REST                  (2)
-#define BD_HPPC_STATE_RAMP                  (3)
-#define BD_HPPC_STATE_DONE                  (4)
-#define BD_HPPC_STATE_ABORTED               (5)
+#define HPPC_STATE_IDLE                  (0)
+#define HPPC_STATE_DETECT                (1)             // probing the current direction
+#define HPPC_STATE_REST                  (2)
+#define HPPC_STATE_RAMP                  (3)
+#define HPPC_STATE_DONE                  (4)
+#define HPPC_STATE_ABORTED               (5)
 
-#define BD_HPPC_STOP_NONE                   (0)             // still running, or not started
-#define BD_HPPC_STOP_CELL_MAX               (1)             // charging: a cell reached charge_stop_cell_mv
-#define BD_HPPC_STOP_CELL_MIN               (2)             // discharging: a cell reached voltage_cell_min
-#define BD_HPPC_STOP_TERM_CURRENT           (3)             // charging: current fell to charging_term_current
-#define BD_HPPC_STOP_NO_CURRENT             (4)             // direction probe saw no current: no charger or load
-#define BD_HPPC_STOP_NO_CONFIG              (5)             // cell_capacity or cell_count not set, or ocv_v_hi_mv not above ocv_v_lo_mv
-#define BD_HPPC_STOP_HOST                   (6)             // the host switched back to normal run
-#define BD_HPPC_STOP_PROTECTION             (7)             // a protection tripped, the FET is forced off
-#define BD_HPPC_STOP_CURRENT_RANGE          (8)             // ramp current out of 0.5C to 2C: charger or load lost or wrong
+#define HPPC_STOP_NONE                   (0)             // still running, or not started
+#define HPPC_STOP_CELL_MAX               (1)             // charging: a cell reached voltage_cell_max
+#define HPPC_STOP_CELL_MIN               (2)             // discharging: a cell reached voltage_cell_min
+#define HPPC_STOP_TERM_CURRENT           (3)             // charging: current fell to charging_term_current
+#define HPPC_STOP_NO_CURRENT             (4)             // direction probe saw no current: no charger or load
+#define HPPC_STOP_NO_CONFIG              (5)             // cell_capacity or cell_count not set, or ocv_v_hi_mv not above ocv_v_lo_mv
+#define HPPC_STOP_HOST                   (6)             // the host switched back to normal run
+#define HPPC_STOP_PROTECTION             (7)             // a protection tripped, the FET is forced off
+#define HPPC_STOP_CURRENT_RANGE          (8)             // ramp current out of 0.5C to 2C: charger or load lost or wrong
+#define HPPC_STOP_TEMPERATURE            (9)             // NTC fault, or pack temperature outside HPPC_TEMP_MIN_C to HPPC_TEMP_MAX_C (at the start, or for HPPC_TEMP_OUT_MS)
 
 void Hppc_Run(bool *fet);                                         // one pass while the device is in HPPC run, fet = FET state wanted
-bool Hppc_Stop(bool *fet);                                        // HPPC run is being left: fet = FET state wanted (off). true when it can be left, false while the parameter extraction is still finishing
-void Hppc_Abort(uint8_t reason, bool *fet);                       // test aborted from outside (BD_HPPC_STOP_*), back to normal run, fet = off
-void Hppc_GetStatus(uint8_t *direction, uint16_t *status, uint16_t *extract);   // BD_HPPC_DIR_*, the hppc_status value and the BD_HPPC_X_* bits
+void Hppc_Stop(bool *fet);                                        // the test has ended (or the host stops it): fet = off, a running test is aborted, the parameter extraction finishes
+void Hppc_Abort(uint8_t reason, bool *fet);                       // test aborted from outside (HPPC_STOP_*), fet = off, the device stays in HPPC run until reboot
+void Hppc_GetStatus(uint8_t *direction, uint16_t *status, uint16_t *extract);   // HPPC_DIR_*, the hppc_status value and the HX_STATUS_* bits
 
 #ifdef __cplusplus
 }

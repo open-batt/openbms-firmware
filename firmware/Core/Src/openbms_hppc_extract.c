@@ -27,7 +27,7 @@
 // Every ramp (pulse) followed by its rest is one cycle. For every cycle and
 // every cell:
 //   - OCV before the pulse and at the end of the rest (average of the last ticks)
-//   - R0 from the voltage step a few ticks into the pulse (dV / dI)
+//   - R0 from the voltage step a few ticks into the pulse (dV / dI), both sides averaged over HX_R0_AVG_TICKS
 //   - the charge moved (pulse and rest) for the capacity axis
 //   - R1, R2, tau1, tau2 from a 2-RC fit of the rest relaxation
 // When the test ends by its own stop condition the cycles are turned into the
@@ -38,7 +38,7 @@
 //
 // The fit and the table building run in small slices of the main loop, a few
 // evaluations per tick, so the 10 ms loop is never held up. The fit of a rest
-// has to be ready before the next rest starts, otherwise BD_HPPC_X_OVERRUN is set and
+// has to be ready before the next rest starts, otherwise HX_STATUS_OVERRUN is set and
 // that cycle is left out.
 // -----------------------------------------------------------------------------
 
@@ -56,17 +56,17 @@
 #define HX_TAU2_HI              400.0f
 
 // Board side choices
-#ifndef HX_R0_TICKS
-#define HX_R0_TICKS             2U              // ticks into the pulse where the R0 step is read (20-30 ms after the FET went on)
-#endif
+#define HX_R0_MS                20UL            // time into the pulse where the R0 step is read (first tick at or after it)
+#define HX_R0_AVG_TICKS         3U              // ticks averaged on each side of the R0 step (end of rest, from HX_R0_MS into the pulse)
+#define HX_R0_MIN_DI_C          0.1f            // a current step below 0.1C gives no R0 (dV / dI would be mostly noise)
 #define HX_START_AVG_TICKS      15U             // OCV before the pulse: average of the last ticks of the rest
 #define HX_STOP_AVG_TICKS       20U             // OCV at the end of the rest
 #define HX_RING                 20U             // ring of the newest voltages, at least the longer average
 #define HX_MAX_CYCLES           HPPC_POINT_COUNT    // one per checkpoint
 #define HX_MIN_CYCLES           4U              // fewer than this and no curve can be built
 #define HX_REST_SAMPLES_MAX     450U            // rest samples at 1 Hz, up to 450 s
-#define HX_SAMPLE_TICKS         (1000UL / BD_LOOP_PERIOD_MS)
-#define HX_GRID_POINTS          20U
+#define HX_SAMPLE_MS            1000UL          // rest sample period, 1 Hz
+#define HX_GRID_POINTS          SYS_SOC_GRID_POINTS
 #define HX_FIT_GRID_N           14U             // coarse search grid of tau1, tau2
 #define HX_FIT_EVALS_PER_TICK   4U              // objective evaluations per main loop pass, about 0.15 ms each
 #define HX_TAU_RATIO_MIN        1.2f            // tau2 has to stay above tau1 by this factor
@@ -105,7 +105,8 @@ static uint16_t  hx_rest_len;           // samples the last rest really delivere
 static uint16_t  hx_status;
 
 static uint8_t   hx_cycle;              // index of the ramp running or of the next one, equals finished cycles in between
-static uint32_t  hx_n;                  // ticks in the current phase
+static uint32_t  hx_n;                  // ms since the first tick of the current phase
+static uint16_t  hx_rest_next;          // index of the next rest sample to store
 static bool      hx_rest_store;         // the running rest follows a ramp and is recorded
 static bool      hx_rest_skip;          // ... but the fit of the last rest was not ready
 static bool      hx_have_prev;
@@ -113,29 +114,33 @@ static float     hx_prev_i;             // previous tick current for the trapezo
 static float     hx_cc_ah;              // charge of the running cycle (ramp + rest)
 static float     hx_i_sum;
 static uint32_t  hx_i_cnt;
-static float     hx_pre_v[BD_CELL_COUNT_MAX];   // last tick before the pulse, mV
+static float     hx_pre_v[SYS_CELL_COUNT_MAX];   // average of the last rest ticks before the pulse, mV
 static float     hx_pre_i;                      // mA
-static float     hx_r0_v[BD_CELL_COUNT_MAX];    // R0 tick of the pulse, mV
-static float     hx_r0_i;
-static bool      hx_r0_taken;
+static float     hx_pre_i_ring[HX_R0_AVG_TICKS]; // currents of the last rest ticks, mA
+static uint8_t   hx_pre_i_pos;
+static uint8_t   hx_pre_i_fill;
+static float     hx_r0_v[SYS_CELL_COUNT_MAX];    // sum of the R0 ticks of the pulse, mV
+static float     hx_r0_i;                       // sum of their currents, mA
+static uint8_t   hx_r0_cnt;                     // R0 ticks summed, up to HX_R0_AVG_TICKS
+static float     hx_r0_min_di_ma;               // smallest current step that gives an R0
 
-static float     hx_ring[BD_CELL_COUNT_MAX][HX_RING];
+static float     hx_ring[SYS_CELL_COUNT_MAX][HX_RING];
 static uint8_t   hx_ring_pos;
 static uint8_t   hx_ring_fill;
 
 // Per cycle results
 static float     hx_cc[HX_MAX_CYCLES];                              // Ah, signed
 static float     hx_avg_i[HX_MAX_CYCLES];                           // A, mean current of the pulse
-static float     hx_ocv_start[BD_CELL_COUNT_MAX][HX_MAX_CYCLES];    // V
-static float     hx_ocv_stop[BD_CELL_COUNT_MAX][HX_MAX_CYCLES];
-static float     hx_r0[BD_CELL_COUNT_MAX][HX_MAX_CYCLES];           // Ω
-static float     hx_r1[BD_CELL_COUNT_MAX][HX_MAX_CYCLES];
-static float     hx_r2[BD_CELL_COUNT_MAX][HX_MAX_CYCLES];
-static float     hx_tau1[BD_CELL_COUNT_MAX][HX_MAX_CYCLES];         // s
-static float     hx_tau2[BD_CELL_COUNT_MAX][HX_MAX_CYCLES];
+static float     hx_ocv_start[SYS_CELL_COUNT_MAX][HX_MAX_CYCLES];    // V
+static float     hx_ocv_stop[SYS_CELL_COUNT_MAX][HX_MAX_CYCLES];
+static float     hx_r0[SYS_CELL_COUNT_MAX][HX_MAX_CYCLES];           // Ω
+static float     hx_r1[SYS_CELL_COUNT_MAX][HX_MAX_CYCLES];
+static float     hx_r2[SYS_CELL_COUNT_MAX][HX_MAX_CYCLES];
+static float     hx_tau1[SYS_CELL_COUNT_MAX][HX_MAX_CYCLES];         // s
+static float     hx_tau2[SYS_CELL_COUNT_MAX][HX_MAX_CYCLES];
 
-static uint16_t  hx_rest[BD_CELL_COUNT_MAX][HX_REST_SAMPLES_MAX];   // rest voltage at 1 Hz in 0.1 mV
-static float     hx_rest_final[BD_CELL_COUNT_MAX];                  // V
+static uint16_t  hx_rest[SYS_CELL_COUNT_MAX][HX_REST_SAMPLES_MAX];   // rest voltage at 1 Hz in 0.1 mV
+static float     hx_rest_final[SYS_CELL_COUNT_MAX];                  // V
 
 // Background work
 static HxFit_t  hx_fit;
@@ -147,15 +152,18 @@ static bool     hx_final_pending;
 static uint8_t  hx_final_cell;
 static uint8_t  hx_final_cycles;
 static bool     hx_final_written;
+static float    hx_final_q_min;        // smallest cell capacity written, the pack capacity
+static double   hx_temp_sum;           // temperature * ms over the test, for the model temperature
+static uint32_t hx_temp_ms;            // time with a valid temperature
 
 // -----------------------------------------------------------------------------
 // Small helpers
 // -----------------------------------------------------------------------------
-static float Hx_Nan(void)
+static float HppcX_Nan(void)
 {
   return nanf("");
 }
-static float Hx_Clamp(float x, float lo, float hi)
+static float HppcX_Clamp(float x, float lo, float hi)
 {
   if(x < lo)
   {
@@ -167,7 +175,7 @@ static float Hx_Clamp(float x, float lo, float hi)
   }
   return x;
 }
-static float Hx_RingAverage(uint8_t cell, uint8_t count)
+static float HppcX_RingAverage(uint8_t cell, uint8_t count)
 {
   float   sum = 0.0f;
   uint8_t n   = count;
@@ -202,7 +210,7 @@ static float Hx_RingAverage(uint8_t cell, uint8_t count)
 // the bounds of the amplitudes, but it is not fitted: in the 20 Hz logs it is
 // one row in thousands, at 1 Hz it would weigh 20 times more.
 // -----------------------------------------------------------------------------
-static float HxFit_Eval(float tau1, float tau2, float *a1_out, float *a2_out)
+static float HppcX_FitEval(float tau1, float tau2, float *a1_out, float *a2_out)
 {
   const HxFit_t *f = &hx_fit;
 
@@ -268,7 +276,7 @@ static float HxFit_Eval(float tau1, float tau2, float *a1_out, float *a2_out)
         {
           c1 = f->hi[0];
         }
-        c2 = Hx_Clamp((t2 - s12 * c1) / s22, f->lo[1], f->hi[1]);
+        c2 = HppcX_Clamp((t2 - s12 * c1) / s22, f->lo[1], f->hi[1]);
       }
       else
       {
@@ -280,7 +288,7 @@ static float HxFit_Eval(float tau1, float tau2, float *a1_out, float *a2_out)
         {
           c2 = f->hi[1];
         }
-        c1 = Hx_Clamp((t1 - s12 * c2) / s11, f->lo[0], f->hi[0]);
+        c1 = HppcX_Clamp((t1 - s12 * c2) / s11, f->lo[0], f->hi[0]);
       }
 
       float sse = f->yy - 2.0f * (c1 * t1 + c2 * t2) + c1 * c1 * s11 + 2.0f * c1 * c2 * s12 + c2 * c2 * s22;
@@ -298,7 +306,7 @@ static float HxFit_Eval(float tau1, float tau2, float *a1_out, float *a2_out)
   return best_sse;
 }
 
-static bool HxFit_Valid(float u1, float u2)
+static bool HppcX_FitValid(float u1, float u2)
 {
   if(u1 < logf(HX_TAU1_LO) || u1 > logf(HX_TAU1_HI))
   {
@@ -315,7 +323,7 @@ static bool HxFit_Valid(float u1, float u2)
   return true;
 }
 
-static bool HxFit_Start(uint8_t cell)
+static bool HppcX_FitStart(uint8_t cell)
 {
   HxFit_t *f = &hx_fit;
 
@@ -371,7 +379,7 @@ static bool HxFit_Start(uint8_t cell)
 
 // One slice of the search. Returns true when the search is finished, the best
 // point is then in hx_fit.
-static bool HxFit_Step(uint8_t budget)
+static bool HppcX_FitStep(uint8_t budget)
 {
   static const int8_t dir1[8] = { 1, -1, 0,  0, 1,  1, -1, -1 };
   static const int8_t dir2[8] = { 0,  0, 1, -1, 1, -1,  1, -1 };
@@ -387,11 +395,11 @@ static bool HxFit_Step(uint8_t budget)
       float u1 = logf(HX_TAU1_LO) + (float)f->gi * f->d1;
       float u2 = logf(HX_TAU2_LO) + (float)f->gj * f->d2;
 
-      if(HxFit_Valid(u1, u2))
+      if(HppcX_FitValid(u1, u2))
       {
         float a1;
         float a2;
-        float sse = HxFit_Eval(expf(u1), expf(u2), &a1, &a2);
+        float sse = HppcX_FitEval(expf(u1), expf(u2), &a1, &a2);
 
         if(sse < f->sse)
         {
@@ -426,11 +434,11 @@ static bool HxFit_Step(uint8_t budget)
       float u1 = f->u1 + (float)dir1[f->nb] * f->s1;
       float u2 = f->u2 + (float)dir2[f->nb] * f->s2;
 
-      if(HxFit_Valid(u1, u2))
+      if(HppcX_FitValid(u1, u2))
       {
         float a1;
         float a2;
-        float sse = HxFit_Eval(expf(u1), expf(u2), &a1, &a2);
+        float sse = HppcX_FitEval(expf(u1), expf(u2), &a1, &a2);
 
         if(sse < f->nb_sse)
         {
@@ -472,7 +480,7 @@ static bool HxFit_Step(uint8_t budget)
 }
 
 // The search of one cell is done: store r1, r2, tau1, tau2 of the cycle
-static void HxFit_Store(uint8_t cell, uint8_t cycle, bool found)
+static void HppcX_FitStore(uint8_t cell, uint8_t cycle, bool found)
 {
   HxFit_t *f = &hx_fit;
 
@@ -483,7 +491,7 @@ static void HxFit_Store(uint8_t cell, uint8_t cycle, bool found)
     float tau1 = expf(f->u1);
     float tau2 = expf(f->u2);
 
-    (void)HxFit_Eval(tau1, tau2, &a1, &a2);
+    (void)HppcX_FitEval(tau1, tau2, &a1, &a2);
 
     float mse = f->sse / (float)(f->m - 1U);
     float rmse = 0.0f;
@@ -493,7 +501,7 @@ static void HxFit_Store(uint8_t cell, uint8_t cycle, bool found)
     }
     if(rmse > HX_MAX_FIT_RMSE_V)
     {
-      hx_status |= BD_HPPC_X_FIT_WARN;
+      hx_status |= HX_STATUS_FIT_WARN;
     }
 
     // R = amplitude / current, as v0 * ratio / avg_current
@@ -504,16 +512,16 @@ static void HxFit_Store(uint8_t cell, uint8_t cycle, bool found)
   }
   else
   {
-    hx_r1[cell][cycle]   = Hx_Nan();
-    hx_r2[cell][cycle]   = Hx_Nan();
-    hx_tau1[cell][cycle] = Hx_Nan();
-    hx_tau2[cell][cycle] = Hx_Nan();
-    hx_status |= BD_HPPC_X_FIT_WARN;
+    hx_r1[cell][cycle]   = HppcX_Nan();
+    hx_r2[cell][cycle]   = HppcX_Nan();
+    hx_tau1[cell][cycle] = HppcX_Nan();
+    hx_tau2[cell][cycle] = HppcX_Nan();
+    hx_status |= HX_STATUS_FIT_WARN;
   }
 }
 
 // Fit job: one cell after the other, a few evaluations per call
-static void Hx_FitRun(void)
+static void HppcX_FitRun(void)
 {
   if(!hx_fit_busy)
   {
@@ -522,9 +530,9 @@ static void Hx_FitRun(void)
 
   if(!hx_fit_started)
   {
-    if(!HxFit_Start(hx_fit_cell))
+    if(!HppcX_FitStart(hx_fit_cell))
     {
-      HxFit_Store(hx_fit_cell, hx_fit_cycle, false);
+      HppcX_FitStore(hx_fit_cell, hx_fit_cycle, false);
       hx_fit_cell++;
     }
     else
@@ -534,9 +542,9 @@ static void Hx_FitRun(void)
   }
   else
   {
-    if(HxFit_Step(HX_FIT_EVALS_PER_TICK))
+    if(HppcX_FitStep(HX_FIT_EVALS_PER_TICK))
     {
-      HxFit_Store(hx_fit_cell, hx_fit_cycle, true);
+      HppcX_FitStore(hx_fit_cell, hx_fit_cycle, true);
       hx_fit_started = false;
       hx_fit_cell++;
     }
@@ -554,7 +562,7 @@ static void Hx_FitRun(void)
 // -----------------------------------------------------------------------------
 
 // Derivatives of the shape preserving cubic through (x, y), as scipy PchipInterpolator
-static float Hx_PchipEdge(float h0, float h1, float m0, float m1)
+static float HppcX_PchipEdge(float h0, float h1, float m0, float m1)
 {
   float d = ((2.0f * h0 + h1) * m0 - h0 * m1) / (h0 + h1);
 
@@ -568,7 +576,7 @@ static float Hx_PchipEdge(float h0, float h1, float m0, float m1)
   }
   return d;
 }
-static void Hx_PchipSlopes(const float *x, const float *y, uint8_t n, float *d)
+static void HppcX_PchipSlopes(const float *x, const float *y, uint8_t n, float *d)
 {
   // Static to keep them off the 1 KB stack, the function is only called from the main loop
   static float h[HX_MAX_CYCLES + 1U];
@@ -594,10 +602,10 @@ static void Hx_PchipSlopes(const float *x, const float *y, uint8_t n, float *d)
     }
   }
 
-  d[0]      = Hx_PchipEdge(h[0], h[1], m[0], m[1]);
-  d[n - 1U] = Hx_PchipEdge(h[n - 2U], h[n - 3U], m[n - 2U], m[n - 3U]);
+  d[0]      = HppcX_PchipEdge(h[0], h[1], m[0], m[1]);
+  d[n - 1U] = HppcX_PchipEdge(h[n - 2U], h[n - 3U], m[n - 2U], m[n - 3U]);
 }
-static float Hx_PchipEval(const float *x, const float *y, const float *d, uint8_t n, float z)
+static float HppcX_PchipEval(const float *x, const float *y, const float *d, uint8_t n, float z)
 {
   uint8_t i = 0;
 
@@ -618,7 +626,7 @@ static float Hx_PchipEval(const float *x, const float *y, const float *d, uint8_
 }
 
 // np.interp: x ascending, the ends are held
-static float Hx_Interp(float xq, const float *x, const float *y, uint8_t n)
+static float HppcX_Interp(float xq, const float *x, const float *y, uint8_t n)
 {
   if(xq <= x[0])
   {
@@ -639,7 +647,7 @@ static float Hx_Interp(float xq, const float *x, const float *y, uint8_t n)
 
 // A failed value (NaN) takes its neighbours: linear inside, held at the ends.
 // Returns false when fewer than two values are good.
-static bool Hx_FillGaps(float *v, uint8_t n)
+static bool HppcX_FillGaps(float *v, uint8_t n)
 {
   uint8_t good = 0;
 
@@ -690,7 +698,7 @@ static bool Hx_FillGaps(float *v, uint8_t n)
 }
 
 // Gaussian weighted moving average over 7 points (FWHM of 3 points), as gaussian_smooth()
-static void Hx_Smooth(float *v, uint8_t n)
+static void HppcX_Smooth(float *v, uint8_t n)
 {
   // Static to keep them off the 1 KB stack, the function is only called from the main loop
   static float out[HX_MAX_CYCLES];
@@ -736,7 +744,7 @@ static void Hx_Smooth(float *v, uint8_t n)
 }
 
 // The tables of one cell. Returns false when the cycles cannot be turned into a curve.
-static bool Hx_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float *q_tot_out)
+static bool HppcX_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float *q_tot_out)
 {
   // static: the stack of the board is only 1 KB
   static float ocv_raw[HX_MAX_CYCLES + 1U];
@@ -751,10 +759,9 @@ static bool Hx_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float 
   static float r2[HX_MAX_CYCLES];
   static float tau1[HX_MAX_CYCLES];
   static float tau2[HX_MAX_CYCLES];
-  static float grid[HX_GRID_POINTS];
 
   uint8_t np = (uint8_t)(n + 1U);
-  bool    charge = (hx_direction == BD_HPPC_DIR_CHARGE);
+  bool    charge = (hx_direction == HPPC_DIR_CHARGE);
 
   // Measured OCV points and the charge between them, in test order
   cap_raw[0] = 0.0f;
@@ -813,18 +820,18 @@ static bool Hx_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float 
 
   if((ocv[0] - v_lo) > HX_LARGE_GAP_V)
   {
-    hx_status |= BD_HPPC_X_GAP_LO;
+    hx_status |= HX_STATUS_GAP_LO;
   }
   if((v_hi - ocv[np - 1U]) > HX_LARGE_GAP_V)
   {
-    hx_status |= BD_HPPC_X_GAP_HI;
+    hx_status |= HX_STATUS_GAP_HI;
   }
 
   for(uint8_t k = 0; k < np; k++)
   {
     z[k] = (HX_Q_LO_PAD_AH + cap[k]) / q_tot;
   }
-  Hx_PchipSlopes(z, ocv, np, dz);
+  HppcX_PchipSlopes(z, ocv, np, dz);
 
   float za = z[0];
   float zb = z[np - 1U];
@@ -854,23 +861,23 @@ static bool Hx_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float 
     tau2[m] = hx_tau2[cell][k];
   }
 
-  if(!Hx_FillGaps(r0, n) || !Hx_FillGaps(r1, n) || !Hx_FillGaps(r2, n) ||
-     !Hx_FillGaps(tau1, n) || !Hx_FillGaps(tau2, n))
+  if(!HppcX_FillGaps(r0, n) || !HppcX_FillGaps(r1, n) || !HppcX_FillGaps(r2, n) ||
+     !HppcX_FillGaps(tau1, n) || !HppcX_FillGaps(tau2, n))
   {
     return false;
   }
-  Hx_Smooth(r1, n);
-  Hx_Smooth(r2, n);
-  Hx_Smooth(tau1, n);
-  Hx_Smooth(tau2, n);
+  HppcX_Smooth(r1, n);
+  HppcX_Smooth(r2, n);
+  HppcX_Smooth(tau1, n);
+  HppcX_Smooth(tau2, n);
 
   // Resample on the SOC grid of the fuel gauge
-  FuelGauge_GetSocGrid(grid);
+  const float *grid = FuelGauge_GetSocGrid();
 
   float v_prev = -INFINITY;
   for(uint8_t g = 0; g < HX_GRID_POINTS; g++)
   {
-    float zg = Hx_Clamp(grid[g] / 100.0f, 0.0f, 1.0f);
+    float zg = HppcX_Clamp(grid[g] / 100.0f, 0.0f, 1.0f);
     float v;
 
     if(zg < za)
@@ -883,7 +890,7 @@ static bool Hx_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float 
     }
     else
     {
-      v = Hx_PchipEval(z, ocv, dz, np, zg);
+      v = HppcX_PchipEval(z, ocv, dz, np, zg);
     }
     if(v < v_prev)
     {
@@ -892,11 +899,11 @@ static bool Hx_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float 
     v_prev = v;
 
     tab->ocv[g]  = v;
-    tab->r0[g]   = Hx_Interp(grid[g], soc, r0, n);
-    tab->r1[g]   = Hx_Interp(grid[g], soc, r1, n);
-    tab->r2[g]   = Hx_Interp(grid[g], soc, r2, n);
-    tab->tau1[g] = Hx_Interp(grid[g], soc, tau1, n);
-    tab->tau2[g] = Hx_Interp(grid[g], soc, tau2, n);
+    tab->r0[g]   = HppcX_Interp(grid[g], soc, r0, n);
+    tab->r1[g]   = HppcX_Interp(grid[g], soc, r1, n);
+    tab->r2[g]   = HppcX_Interp(grid[g], soc, r2, n);
+    tab->tau1[g] = HppcX_Interp(grid[g], soc, tau1, n);
+    tab->tau2[g] = HppcX_Interp(grid[g], soc, tau2, n);
   }
 
   *q_tot_out = q_tot;
@@ -904,7 +911,7 @@ static bool Hx_BuildCell(uint8_t cell, uint8_t n, FuelGauge_Table_t *tab, float 
 }
 
 // One cell per call. When all cells are done the status tells the result.
-static void Hx_FinalRun(void)
+static void HppcX_FinalRun(void)
 {
   static FuelGauge_Table_t tab;
   float                    q_tot = 0.0f;
@@ -916,14 +923,18 @@ static void Hx_FinalRun(void)
 
   if(hx_final_cell < hx_cells)
   {
-    if(Hx_BuildCell(hx_final_cell, hx_final_cycles, &tab, &q_tot))
+    // A table the fuel gauge refuses (NaN or inf) counts as a cell without tables
+    if(HppcX_BuildCell(hx_final_cell, hx_final_cycles, &tab, &q_tot) &&
+       FuelGauge_SetCellTable(hx_final_cell, hx_direction == HPPC_DIR_CHARGE, &tab))
     {
-      FuelGauge_SetCellTable(hx_final_cell, hx_direction == BD_HPPC_DIR_CHARGE, &tab);
-
       // One capacity is enough, it comes from the discharge test
-      if(hx_direction == BD_HPPC_DIR_DISCHARGE)
+      if(hx_direction == HPPC_DIR_DISCHARGE)
       {
         FuelGauge_SetCellCapacity(hx_final_cell, q_tot);
+        if(!hx_final_written || q_tot < hx_final_q_min)
+        {
+          hx_final_q_min = q_tot;
+        }
       }
       hx_final_written = true;
     }
@@ -939,7 +950,18 @@ static void Hx_FinalRun(void)
     hx_final_pending = false;
     if(hx_final_written)
     {
-      hx_status |= BD_HPPC_X_DONE;
+      hx_status |= HX_STATUS_DONE;
+      FuelGauge_SetLearned(hx_direction == HPPC_DIR_CHARGE);
+      if(hx_temp_ms > 0)
+      {
+        FuelGauge_SetModelTemperature(hx_direction == HPPC_DIR_CHARGE, (float)(hx_temp_sum / (double)hx_temp_ms));
+      }
+
+      // The pack capacity is the smallest cell: the weakest cell ends the discharge
+      if(hx_direction == HPPC_DIR_DISCHARGE)
+      {
+        FuelGauge_SetNominalCapacity(hx_final_q_min);
+      }
     }
   }
 }
@@ -951,7 +973,7 @@ void HppcX_Begin(uint8_t direction, uint8_t cell_count, uint32_t capacity_mah, u
 {
   HppcX_Reset();
 
-  if(cell_count == 0 || cell_count > BD_CELL_COUNT_MAX || v_hi_mv <= v_lo_mv ||
+  if(cell_count == 0 || cell_count > SYS_CELL_COUNT_MAX || v_hi_mv <= v_lo_mv ||
      (rest_ms / 1000UL) < 2UL || (rest_ms / 1000UL) > HX_REST_SAMPLES_MAX)
   {
     return;
@@ -962,15 +984,20 @@ void HppcX_Begin(uint8_t direction, uint8_t cell_count, uint32_t capacity_mah, u
   hx_v_lo         = (float)v_lo_mv / 1000.0f;
   hx_v_hi         = (float)v_hi_mv / 1000.0f;
   hx_q_max_ah     = (float)capacity_mah / 1000.0f * HX_Q_MAX_FACTOR;
-  hx_rest_samples = (uint16_t)(rest_ms / 1000UL);
+  hx_r0_min_di_ma = (float)capacity_mah * HX_R0_MIN_DI_C;
+  hx_rest_samples = (uint16_t)(rest_ms / HX_SAMPLE_MS);
 
   hx_cycle      = 0;
   hx_mode       = HX_MODE_NONE;
   hx_ring_pos   = 0;
   hx_ring_fill  = 0;
+  hx_pre_i_pos  = 0;
+  hx_pre_i_fill = 0;
   hx_rest_store = false;
   hx_rest_skip  = false;
   hx_final_written = false;
+  hx_temp_sum      = 0.0;
+  hx_temp_ms       = 0;
 
   hx_active = true;
 }
@@ -986,7 +1013,7 @@ void HppcX_Abort(void)
   hx_fit_busy      = false;
   hx_fit_started   = false;
   hx_final_pending = false;
-  hx_status       &= (uint16_t)~BD_HPPC_X_BUSY;
+  hx_status       &= (uint16_t)~HX_STATUS_BUSY;
 }
 void HppcX_RestStarted(void)
 {
@@ -1011,15 +1038,22 @@ void HppcX_RestStarted(void)
 
     for(uint8_t c = 0; c < hx_cells; c++)
     {
-      float di = hx_r0_i - hx_pre_i;
-
-      if(hx_r0_taken && di != 0.0f)
+      if(hx_r0_cnt > 0)
       {
-        hx_r0[c][k] = fabsf((hx_r0_v[c] - hx_pre_v[c]) / di);        // mV / mA = Ω
+        float di = hx_r0_i / (float)hx_r0_cnt - hx_pre_i;
+
+        if(fabsf(di) >= hx_r0_min_di_ma)
+        {
+          hx_r0[c][k] = fabsf((hx_r0_v[c] / (float)hx_r0_cnt - hx_pre_v[c]) / di);        // mV / mA = Ω
+        }
+        else
+        {
+          hx_r0[c][k] = HppcX_Nan();
+        }
       }
       else
       {
-        hx_r0[c][k] = Hx_Nan();
+        hx_r0[c][k] = HppcX_Nan();
       }
     }
 
@@ -1027,7 +1061,7 @@ void HppcX_RestStarted(void)
     hx_rest_skip = hx_fit_busy;
     if(hx_rest_skip)
     {
-      hx_status |= BD_HPPC_X_OVERRUN;
+      hx_status |= HX_STATUS_OVERRUN;
     }
     hx_rest_store = true;
   }
@@ -1038,6 +1072,7 @@ void HppcX_RestStarted(void)
 
   hx_mode      = HX_MODE_REST;
   hx_n         = 0;
+  hx_rest_next = 0;
   hx_have_prev = false;
 }
 void HppcX_RampStarted(void)
@@ -1056,7 +1091,7 @@ void HppcX_RampStarted(void)
 
     for(uint8_t c = 0; c < hx_cells; c++)
     {
-      hx_ocv_stop[c][k]  = Hx_RingAverage(c, (uint8_t)HX_STOP_AVG_TICKS) / 1000.0f;
+      hx_ocv_stop[c][k]  = HppcX_RingAverage(c, (uint8_t)HX_STOP_AVG_TICKS) / 1000.0f;
     }
 
     // A skipped rest has no samples, and the fit of the previous rest may still read
@@ -1065,15 +1100,15 @@ void HppcX_RampStarted(void)
     {
       for(uint8_t c = 0; c < hx_cells; c++)
       {
-        hx_r1[c][k]   = Hx_Nan();
-        hx_r2[c][k]   = Hx_Nan();
-        hx_tau1[c][k] = Hx_Nan();
-        hx_tau2[c][k] = Hx_Nan();
+        hx_r1[c][k]   = HppcX_Nan();
+        hx_r2[c][k]   = HppcX_Nan();
+        hx_tau1[c][k] = HppcX_Nan();
+        hx_tau2[c][k] = HppcX_Nan();
       }
     }
     else
     {
-      hx_rest_len = (uint16_t)((hx_n + HX_SAMPLE_TICKS - 1UL) / HX_SAMPLE_TICKS);
+      hx_rest_len = hx_rest_next;
       if(hx_rest_len > hx_rest_samples)
       {
         hx_rest_len = hx_rest_samples;
@@ -1099,10 +1134,21 @@ void HppcX_RampStarted(void)
     return;
   }
 
-  // OCV before the coming pulse
+  // OCV before the coming pulse, and the rest side of its R0 step
   for(uint8_t c = 0; c < hx_cells; c++)
   {
-    hx_ocv_start[c][hx_cycle] = Hx_RingAverage(c, (uint8_t)HX_START_AVG_TICKS) / 1000.0f;
+    hx_ocv_start[c][hx_cycle] = HppcX_RingAverage(c, (uint8_t)HX_START_AVG_TICKS) / 1000.0f;
+    hx_pre_v[c]               = HppcX_RingAverage(c, (uint8_t)HX_R0_AVG_TICKS);
+  }
+
+  hx_pre_i = 0.0f;
+  for(uint8_t k = 0; k < hx_pre_i_fill; k++)
+  {
+    hx_pre_i += hx_pre_i_ring[k];
+  }
+  if(hx_pre_i_fill > 0)
+  {
+    hx_pre_i /= (float)hx_pre_i_fill;
   }
 
   hx_mode      = HX_MODE_RAMP;
@@ -1111,13 +1157,25 @@ void HppcX_RampStarted(void)
   hx_cc_ah     = 0.0f;
   hx_i_sum     = 0.0f;
   hx_i_cnt     = 0;
-  hx_r0_taken  = false;
+  hx_r0_cnt    = 0;
+  hx_r0_i      = 0.0f;
+  for(uint8_t c = 0; c < hx_cells; c++)
+  {
+    hx_r0_v[c] = 0.0f;
+  }
 }
-void HppcX_Tick(const float *cell_mv, float current_ma, uint32_t dt_ms)
+void HppcX_Tick(const float *cell_mv, float current_ma, float temperature_c, uint32_t dt_ms)
 {
   if(!hx_active || hx_mode == HX_MODE_NONE)
   {
     return;
+  }
+
+  // The tables hold the cell at the test temperature: its average becomes the model temperature
+  if(isfinite(temperature_c))
+  {
+    hx_temp_sum += (double)temperature_c * (double)dt_ms;
+    hx_temp_ms  += dt_ms;
   }
 
   const float dt_s = (float)dt_ms / 1000.0f;      // real time since the last tick, for the charge
@@ -1133,33 +1191,35 @@ void HppcX_Tick(const float *cell_mv, float current_ma, uint32_t dt_ms)
   }
 
   // Charge moved, trapezoid inside a phase as np.trapz over the rows of a segment
+  // Phase time counts from the first tick of the phase
   if(hx_have_prev)
   {
     hx_cc_ah += 0.5f * (hx_prev_i + current_ma) * dt_s / 3600000.0f;      // mA * s -> Ah
+    hx_n     += dt_ms;
   }
   hx_prev_i    = current_ma;
   hx_have_prev = true;
 
   if(hx_mode == HX_MODE_REST)
   {
-    // Last tick of the rest is the baseline of the R0 step of the next pulse
-    for(uint8_t c = 0; c < hx_cells; c++)
+    // The last rest ticks are the baseline of the R0 step of the next pulse (voltages are in hx_ring)
+    hx_pre_i_ring[hx_pre_i_pos] = current_ma;
+    hx_pre_i_pos = (uint8_t)((hx_pre_i_pos + 1U) % HX_R0_AVG_TICKS);
+    if(hx_pre_i_fill < HX_R0_AVG_TICKS)
     {
-      hx_pre_v[c] = cell_mv[c];
+      hx_pre_i_fill++;
     }
-    hx_pre_i = current_ma;
 
-    if(hx_rest_store && !hx_rest_skip && (hx_n % HX_SAMPLE_TICKS) == 0)
+    // One sample per HX_SAMPLE_MS: the first tick at or after each full period
+    uint32_t j = hx_n / HX_SAMPLE_MS;
+
+    if(hx_rest_store && !hx_rest_skip && j >= hx_rest_next && j < hx_rest_samples)
     {
-      uint32_t j = hx_n / HX_SAMPLE_TICKS;
-
-      if(j < hx_rest_samples)
+      for(uint8_t c = 0; c < hx_cells; c++)
       {
-        for(uint8_t c = 0; c < hx_cells; c++)
-        {
-          hx_rest[c][j] = (uint16_t)(Hx_Clamp(cell_mv[c], 0.0f, 6553.0f) * 10.0f + 0.5f);
-        }
+        hx_rest[c][j] = (uint16_t)(HppcX_Clamp(cell_mv[c], 0.0f, 6553.0f) * 10.0f + 0.5f);
       }
+      hx_rest_next = (uint16_t)(j + 1UL);
     }
   }
   else
@@ -1167,18 +1227,17 @@ void HppcX_Tick(const float *cell_mv, float current_ma, uint32_t dt_ms)
     hx_i_sum += current_ma;
     hx_i_cnt++;
 
-    if(hx_n == HX_R0_TICKS)
+    if(hx_r0_cnt < HX_R0_AVG_TICKS && hx_n >= HX_R0_MS)
     {
       for(uint8_t c = 0; c < hx_cells; c++)
       {
-        hx_r0_v[c] = cell_mv[c];
+        hx_r0_v[c] += cell_mv[c];
       }
-      hx_r0_i     = current_ma;
-      hx_r0_taken = true;
+      hx_r0_i += current_ma;
+      hx_r0_cnt++;
     }
   }
 
-  hx_n++;
 }
 void HppcX_Done(void)
 {
@@ -1192,7 +1251,7 @@ void HppcX_Done(void)
 
   if(hx_cycle < HX_MIN_CYCLES)
   {
-    hx_status |= BD_HPPC_X_FEW_CYCLES;
+    hx_status |= HX_STATUS_FEW_CYCLES;
     return;
   }
 
@@ -1202,16 +1261,16 @@ void HppcX_Done(void)
 }
 void HppcX_Run(void)
 {
-  Hx_FitRun();
-  Hx_FinalRun();
+  HppcX_FitRun();
+  HppcX_FinalRun();
 
   if(hx_active || hx_fit_busy || hx_final_pending)
   {
-    hx_status |= BD_HPPC_X_BUSY;
+    hx_status |= HX_STATUS_BUSY;
   }
   else
   {
-    hx_status &= (uint16_t)~BD_HPPC_X_BUSY;
+    hx_status &= (uint16_t)~HX_STATUS_BUSY;
   }
 }
 uint16_t HppcX_GetStatus(void)

@@ -4,11 +4,11 @@ config_tool.py -- read or write the OpenBMS config over UART.
 
 Usage:
     python config_tool.py r [COM_PORT]
-    python config_tool.py w [COM_PORT] [config.json]
+    python config_tool.py w <test_folder> [COM_PORT]
     python config_tool.py p [COM_PORT]
 
     r   Reads the whole config out of the board and prints it.
-    w   Writes every value from config.json (the settings and the device info
+    w   Writes every value from <test_folder>/config.json (the settings and the device info
         strings) to the board, saves the config to the board's EEPROM, reboots
         the board, then reads everything back and checks it against the file.
 
@@ -18,8 +18,8 @@ Usage:
 
 Without COM_PORT the tool pings every serial port on the computer and uses the
 one where an OpenBMS answers. With COM_PORT it uses exactly that port.
-An argument ending in .json is the config file; config.json next to this
-script is used when none is given. Keys are the field names of Config_Data_t
+<test_folder> is a path, or just the name of a folder next to this script, for
+example 7_cell_2000mAh. Keys in config.json are the field names of Config_Data_t
 in openbms_data.h.
 
 Needs pyserial (pip install pyserial).
@@ -30,6 +30,16 @@ import os
 import struct
 import sys
 import time
+
+import importlib.util
+import subprocess
+
+# Third-party modules this script needs (import name: pip package). Missing ones are installed on the first run.
+REQUIRED_MODULES = {"serial": "pyserial"}
+for _module, _package in REQUIRED_MODULES.items():
+    if importlib.util.find_spec(_module) is None:
+        print(f"Installing {_package} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _package])
 
 import serial
 from serial.tools import list_ports
@@ -77,8 +87,8 @@ CTRL_STATES = {
 # ---------------------------------------------------------------
 # Config registers (Config_Data_t)
 # ---------------------------------------------------------------
-CELL_COUNT_MIN = 2     # BD_CELL_COUNT_MIN in openbms_data.h
-CELL_COUNT_MAX = 7     # BD_CELL_COUNT_MAX in openbms_data.h
+CELL_COUNT_MIN = 2     # SYS_CELL_COUNT_MIN in openbms_data.h
+CELL_COUNT_MAX = 7     # SYS_CELL_COUNT_MAX in openbms_data.h
 
 # (name, address, struct format, unit) -- in register order
 FIELDS = [
@@ -109,11 +119,11 @@ FIELDS = [
     ("ocp_discharge_fast_time_ms",      0x48, "H", "ms"),
     ("otp_threshold_c",                 0x49, "H", "C"),
     ("otp_time_ms",                     0x4A, "H", "ms"),
-    ("charge_stop_cell_mv",             0x4B, "H", "mV"),
     ("charge_monitor_cell_mv",          0x4C, "H", "mV"),
     ("utp_threshold_c",                 0x4D, "h", "C"),
     ("utp_time_ms",                     0x4E, "H", "ms"),
     ("otp_charge_threshold_c",          0x4F, "h", "C"),
+    ("utp_charge_threshold_c",          0x5C, "h", "C"),
     ("ocv_v_lo_mv",                     0x50, "H", "mV"),
     ("ocv_v_hi_mv",                     0x51, "H", "mV"),
     ("current_sensor_gain",             0x52, "f", ""),
@@ -124,7 +134,13 @@ FIELDS = [
     ("ntc_t_nominal",                   0x57, "f", "K"),
     ("temperature_offset",              0x58, "f", "C"),
     ("shunt_resistance_mohm",           0x59, "f", "mohm"),
-    ("current_bias_ma",                 0x5A, "f", "mA"),
+    ("current_offset_ma",               0x5A, "f", "mA"),
+    ("voltage_offset_mv",               0x5B, "7f", "mV"),   # one per cell, always 7 values
+    ("balance_enable",                  0x66, "?", ""),
+    ("balance_start_mv",                0x67, "H", "mV"),
+    ("balance_delta_mv",                0x68, "H", "mV"),
+    ("balance_max_temp_c",              0x69, "h", "C"),
+    ("balance_resistance_ohm",          0x6A, "f", "ohm"),
 ]
 
 # Device info strings -- written from the file like the settings, saved with the config.
@@ -554,17 +570,30 @@ def main(argv):
         return 2
 
     mode = argv[1].lower()[0]
-    port = None
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    args = argv[2:]
+    path = None
 
-    for arg in argv[2:]:
-        if arg.lower().endswith(".json"):
-            path = arg
-        elif port is None:
-            port = arg
-        else:
+    # Write: the first argument is the test folder, its config.json is written
+    if mode == "w":
+        if not args:
             print(__doc__)
             return 2
+        here = os.path.dirname(os.path.abspath(__file__))
+        folder = args[0]
+        if not os.path.isdir(folder) and os.path.isdir(os.path.join(here, folder)):
+            folder = os.path.join(here, folder)
+        if not os.path.isdir(folder):
+            print(f"ERROR: no test folder called {args[0]}")
+            return 1
+        path = os.path.join(folder, "config.json")
+        args = args[1:]
+
+    if len(args) > 1:
+        print(__doc__)
+        return 2
+    port = None
+    if args:
+        port = args[0]
 
     try:
         if mode == "p":
