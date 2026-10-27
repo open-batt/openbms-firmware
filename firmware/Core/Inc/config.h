@@ -14,7 +14,7 @@
 // and time step with CC_SIM_SAMPLE. Each sample runs Ctrl_Run once on the simulated time, so the
 // HPPC test, the parameter extraction, the fuel gauge and the protections all run on the host's data.
 // The FET pins always stay off, fet_status still shows what the firmware asked for.
- #define OPENBMS_SIMULATION
+// #define OPENBMS_SIMULATION
 
 // -----------------------------------------------------------------------------
 // System
