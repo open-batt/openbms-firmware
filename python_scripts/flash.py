@@ -5,7 +5,7 @@ flash.py -- program the OpenBMS firmware over UART through the bootloader.
 Usage:
     python flash.py [COM_PORT] [HEX_FILE]
 
-Without HEX_FILE the tool uses the .hex file in firmware/build/Debug (the newest one
+Without HEX_FILE the tool uses the .hex file in firmware/build/Release (the newest one
 if there are several). With HEX_FILE it uses exactly that file.
 
 Without COM_PORT the tool pings every serial port on the computer and uses the
@@ -47,7 +47,7 @@ TIMEOUT_PROGRAM     = 2.0    # seconds — per line
 TIMEOUT_CRC         = 5.0    # seconds
 TIMEOUT_FLAG        = 2.0    # seconds
 TIMEOUT_BOOT_WAIT   = 10.0   # seconds — max wait for bootloader after firmware resets
-BUILD_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "firmware", "build", "Debug")
+BUILD_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "firmware", "build", "Release")
 MAX_RETRIES         = 2
 PING_RETRIES        = 3
 BOOT_RETRY_DELAY    = 0.2    # seconds — wait between pings after firmware reset

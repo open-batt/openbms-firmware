@@ -18,8 +18,8 @@ Usage:
 
 Without COM_PORT the tool pings every serial port on the computer and uses the
 one where an OpenBMS answers. With COM_PORT it uses exactly that port.
-<test_folder> is a path, or just the name of a folder next to this script, for
-example 7_cell_2000mAh. Keys in config.json are the field names of Config_Data_t
+<test_folder> is a path, or just the name of a folder next to this script or in
+simulation/, for example 7_cell_2000mAh. Keys in config.json are the field names of Config_Data_t
 in openbms_data.h.
 
 Needs pyserial (pip install pyserial).
@@ -166,6 +166,10 @@ FORMAT_RANGES = {
 
 class ToolError(Exception):
     pass
+
+
+# Folder (next to this script) that holds the test folders
+SIMULATION_DIR = "simulation"
 
 
 def count_of(fmt):
@@ -582,6 +586,8 @@ def main(argv):
         folder = args[0]
         if not os.path.isdir(folder) and os.path.isdir(os.path.join(here, folder)):
             folder = os.path.join(here, folder)
+        if not os.path.isdir(folder) and os.path.isdir(os.path.join(here, SIMULATION_DIR, folder)):
+            folder = os.path.join(here, SIMULATION_DIR, folder)
         if not os.path.isdir(folder):
             print(f"ERROR: no test folder called {args[0]}")
             return 1

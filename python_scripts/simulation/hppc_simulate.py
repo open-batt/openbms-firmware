@@ -158,6 +158,8 @@ HPPC_STOPS = {
 }
 HPPC_X_BITS = {8: "BUSY", 9: "DONE", 10: "OVERRUN", 11: "FIT_WARN", 12: "GAP_LO", 13: "GAP_HI", 14: "FEW_CYCLES"}
 HPPC_X_BUSY = 1 << 8
+HPPC_STATE_DONE    = 4
+HPPC_STATE_ABORTED = 5
 # error_flags bits: OpenBMS_Error_t in openbms_error.h, in order
 ERROR_NAMES = [
     "EEPROM_READ_FAIL", "EEPROM_WRITE_FAIL", "EEPROM_CRC_FAIL",
@@ -184,8 +186,8 @@ TABLE_SCALE = [1.0, 1000.0, 1000.0, 1.0, 1000.0, 1.0]    # board unit -> printed
 SOC_GRID_POINTS = 20
 
 READ_EVERY_S  = 1.0     # real (wall clock) seconds between register read-backs, shown in the live line
-QUIT_KEY      = "q"     # pressing it stops the run: the HPPC test is stopped and the board goes back to normal run
-STOP_SAMPLES  = 100     # most samples sent after the stop command while the board leaves HPPC run
+QUIT_KEY      = "q"     # pressing it stops the run: the HPPC test is stopped (the board stays in HPPC run until the next reboot)
+STOP_SAMPLES  = 100     # most samples sent after the stop command until the test shows it ended
 
 # Registers read back once per READ_EVERY_S: (address, name, struct format, count)
 MONITOR_REGS = [
@@ -709,14 +711,25 @@ def quit_pressed():
     return False
 
 
+def test_ended(r):
+    """The board stays in HPPC_RUN after a test (only a reboot goes back to normal run), so the
+    end is the HPPC state: ABORTED, or DONE once the extraction is no longer busy with the tables."""
+    state = r["hppc_status"] & 0xFF
+    if state == HPPC_STATE_ABORTED:
+        return True
+    if state == HPPC_STATE_DONE and not (r["extract"] & HPPC_X_BUSY):
+        return True
+    return False
+
+
 def stop_test(ser, cell_mv, temperature_c, dt_ms):
     """Stops the HPPC test and keeps the board's loop running (last voltages, zero current)
-    until it is back in normal run. Ctrl_Run only runs on a sample in the simulation build."""
+    until the test shows it ended. Ctrl_Run only runs on a sample in the simulation build."""
     send_command(ser, CC_NORMAL_RUN, "HPPC stop")
     r = None
     for _ in range(STOP_SAMPLES):
         r = send_sample(ser, cell_mv, 0.0, temperature_c, dt_ms)
-        if r["ctrl_state"] == CTRL_STATE_NORMAL_RUN:
+        if test_ended(r):
             break
     return r
 
@@ -796,8 +809,8 @@ def run(ser, cfg, mode, fault, log):
             r = reply
             if r["ctrl_state"] == CTRL_STATE_HPPC_RUN:
                 started = True
-            elif started:
-                # Back in normal run: the test ended by itself and its tables are finished
+            if started and test_ended(r):
+                # The test ended by itself (DONE or ABORTED) and its tables are finished
                 event(f"{t:9.1f} s  test finished: {describe(r)}")
                 return r["hppc_status"] >> 8, r["extract"], cells
         fet_on = bool(r["fet"] & FET_MAIN)

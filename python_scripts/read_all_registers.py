@@ -174,6 +174,11 @@ CONFIG_REGISTERS = [
     Reg(0x59, "ShuntResistance",                       "mOhm",      'f', 1  ),
     Reg(0x5A, "CurrentOffsetUser",                     "mA",        'f', 1  ),
     Reg(0x5B, "VoltageOffsetUser",                     "mV",        'f', 7  ),
+    Reg(0x66, "BalanceEnable",                         "0/1",       'B', 1  ),
+    Reg(0x67, "BalanceStartVoltage",                   "mV",        'H', 1  ),
+    Reg(0x68, "BalanceDeltaVoltage",                   "mV",        'H', 1  ),
+    Reg(0x69, "BalanceMaxTemperature",                 "C",         'h', 1  ),
+    Reg(0x6A, "BalanceResistance",                     "Ohm",       'f', 1  ),
 ]
 
 # ---------------------------------------------------------------
@@ -209,6 +214,7 @@ FUEL_OUT_REGISTERS = [
     Reg(0x93, "CellSoH",                               "%",         'B', 7  ),
     Reg(0x94, "CellRemainingCapacity",                 "mAh",       'H', 7  ),
     Reg(0x96, "LearningStatus",                        "flags",     'H', 1  ),
+    Reg(0x97, "CapacityUpdateCount",                   "",          'H', 1  ),
 ]
 
 # ---------------------------------------------------------------

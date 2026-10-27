@@ -1,22 +1,22 @@
 # 📡 Communication Protocol
 
-OpenBMS firmware implements the following communication protocols:
+OpenBMS firmware talks to a host over three ports:
 
-- **OpenBMS binary protocol over UART** — 230400 baud, 8N1, register-based read/write with an 8-bit additive checksum. This is the only protocol currently implemented and is used for host communication, configuration, calibration, data logging and bootloader entry.
-- **I²C** — *planned.* The I2C2 peripheral is initialized in SMBus slave mode (slave address `0x0B`, PEC enabled) but no protocol handler exists yet.
-- **CAN 2.0** — *planned.* The bxCAN peripheral is initialized (1 Mbit/s, 11-bit identifier) but no protocol handler exists yet.
+- **UART** — 230400 baud, 8N1. The OpenBMS binary protocol: register read/write and commands, with an 8-bit additive checksum. Also used for bootloader entry and, in the simulation build, for `CC_SIM_SAMPLE`.
+- **I²C** — I2C2 slave at address `0x0B`. Carries exactly the same frames as the UART.
+- **CAN 2.0** — 1 Mbit/s, 11-bit IDs. A periodic status broadcast plus a small set of short commands. Register read/write is not available on CAN.
 
-A reference host implementation of the UART protocol lives in [`python_scripts/read_all_registers.py`](python_scripts/read_all_registers.py) (full register dump) and [`python_scripts/battery_cycler.py`](python_scripts/battery_cycler.py) (live logging).
+All three ports are served by `openbms_comm.c`. Host tools: [`python_scripts/bms_cmd.py`](python_scripts/bms_cmd.py) (typed commands), [`python_scripts/read_all_registers.py`](python_scripts/read_all_registers.py) (register dump) and [`python_scripts/simulation/config_tool.py`](python_scripts/simulation/config_tool.py) (write and save the config from `config.json`).
 
 ## OpenBMS Binary Protocol
 
-The protocol is a simple request/response scheme on a point-to-point UART link. There is no device address — one host talks to one OpenBMS board. Every transaction is initiated by the host; the device never speaks unsolicited.
+The protocol is a simple request/response scheme. There is no device address in the frame — one host talks to one OpenBMS board. Every transaction is started by the host; on UART and I²C the device never speaks unsolicited.
 
 | Layer | Name | Responsibility |
 |-------|------|----------------|
-| Application | OpenBMS register map | Register addresses, data types, access rights, control commands |
-| Transport | OpenBMS frame | Command byte, length byte, additive checksum |
-| Physical | UART | TX/RX lines, 230400 baud 8N1, idle-line frame delimiting |
+| Application | OpenBMS register map | Register addresses, data types, access rights, commands |
+| Transport | OpenBMS frame | Command byte, address, length byte, additive checksum |
+| Physical | UART or I²C | UART 230400 baud 8N1, or I²C slave `0x0B` |
 
 ### Frame structure
 
@@ -26,44 +26,61 @@ All frames — in both directions — share the same layout and are at least 4 b
 |---------|---------|--------|------|----------|
 | 1 byte | 1 byte | 1 byte | N bytes | 1 byte |
 
-- **Command** — frame type, see the table below.
-- **Address** — register address, `0x00`–`0xFF`. `0x00` in ACK and error frames.
-- **Length** — payload size in **bytes** (not elements, not 16-bit words). `0x00` for read requests, ACK frames and command frames with no payload.
-- **Data** — `Length` bytes of payload, **little-endian**, laid out exactly as the corresponding C struct field.
+- **Command** — frame type or command, see the table below.
+- **Address** — register address `0x00`–`0xFF` for read and write. `0x00` for commands, ACK and error frames.
+- **Length** — payload size in **bytes**. `0x00` for read requests, ACK frames and commands with no argument.
+- **Data** — `Length` bytes of payload, **little-endian**, laid out exactly as the C struct field.
 - **Checksum** — sum of all preceding bytes of the frame, modulo 256.
 
-Total frame size is always `Length + 4` bytes.
+Total frame size is always `Length + 4` bytes, at most 259 bytes (255 bytes of payload).
 
 Register data is a raw memory image of the firmware's struct field. The host must know each register's type and element count in advance — the protocol carries no type information. See the register map below.
 
 ### Command codes
 
-| Code | Name | Direction | Description |
-|------|------|-----------|-------------|
-| 0x01 | `CC_WRITE` | host → device | Write a register. Device answers with ACK or error. |
-| 0x02 | `CC_READ` | both | Host request (`Length` = 0) and device response (`Length` = register size). |
-| 0x03 | `CC_ACK` | device → host | Write or control command accepted. `Address` and `Length` are both `0x00`. |
-| 0x04 | `CC_ERROR` | device → host | Request rejected. Payload is a single error code byte. |
-| 0x05 | `CC_CMD` | host → device | Execute a control action rather than write a register. See [Control commands](#control-commands). |
-| 0x42 | `CC_BOOTLOADER` | host → device | Erase the application flag and reboot into the bootloader. `0x42` is ASCII `B`. |
+| Code | Name | Argument | Allowed in | Ports | Description |
+|------|------|----------|------------|-------|-------------|
+| 0x01 | `CC_WRITE` | register value | any state | UART, I²C | Write a register |
+| 0x02 | `CC_READ` | — | any state | UART, I²C | Read a register |
+| 0x03 | `CC_ACK` | — | — | reply | Positive reply |
+| 0x04 | `CC_ERROR` | 1 byte error code | — | reply | Negative reply |
+| 0x05 | `CC_EEPROM_CONFIG` | — | any state | UART, I²C | Save the config bank (`0x30`–`0x6A`) to EEPROM. `CE_EEPROM` if the write fails |
+| 0x06 | `CC_HPPC_START` | — | NORMAL_RUN | UART, I²C | Start the HPPC test |
+| 0x07 | `CC_NORMAL_RUN` | — | HPPC_RUN | UART, I²C, CAN | Stop the HPPC test (stop reason HOST). The device stays in HPPC_RUN with the FET off until a reboot |
+| 0x08 | `CC_SET_FET` | 1 byte, `0` or `1` | NORMAL_RUN | UART, I²C, CAN | Main FET off / on |
+| 0x09 | `CC_REBOOT` | — | any state | UART, I²C, CAN | ACK, then reset after 100 ms |
+| 0x0A | `CC_PING` | — | any state | UART, I²C | Just ACK |
+| 0x0B | `CC_RESET_PROTECTION` | — | any state | UART, I²C, CAN | Clear `protection_trigger`. A fault that is still there trips again after its normal detection time |
+| 0x0C | `CC_CLEAR_ERRORS` | — | any state | UART, I²C, CAN | Clear `error_flags` |
+| 0x0D | `CC_SET_PRE_FET` | 1 byte, `0` or `1` | NORMAL_RUN | UART, I²C | Pre-charge FET off / on |
+| 0x0E | `CC_SIM_SAMPLE` | 1–6 samples | NORMAL_RUN, HPPC_RUN | UART, I²C | Simulation build only, see below |
+| 0x0F | `CC_CLEAR_LEARNING` | — | any state | UART, I²C | Clear `learning_status` (`0x96`) and `capacity_update_count` (`0x97`) |
+| 0x10 | `CC_CAN_BROADCAST` | 1 byte, `0` or `1` | any state | CAN | Status broadcast off / on (RAM only) |
+| 0x11 | `CC_CAN_SEND_ONCE` | — | any state | CAN | Send the status messages once |
+| 0x12 | `CC_CLEAR_FAULT` | — | any state | UART, I²C, CAN | Clear the fault snapshot (`0x70`–`0x75`) |
+| 0x42 | `CC_BOOTLOADER` | — | any state | UART | Reset into the bootloader, see below |
+
+A command with the wrong argument length or value returns `CE_WRONG_CMD`. A command sent in a state where it is not allowed returns `CE_STATE`. An unknown command returns `CE_WRONG_CMD`; this includes `CC_SIM_SAMPLE` in a normal (non-simulation) build.
 
 ### Error codes
 
-Errors are returned as `[0x04][0x00][0x01][error code][checksum]`.
+When a request fails, the device replies with an error frame `04 00 01 <code> <checksum>`.
 
 | Code | Name | Meaning |
 |------|------|---------|
-| 0x00 | `CE_OK` | No error — never transmitted, internal success value only |
-| 0x01 | `CE_WRONG_CMD` | Unknown command byte, or a `CC_CMD` frame with a payload length other than 1, or a control command value out of range |
+| 0x00 | `CE_OK` | No error (never sent) |
+| 0x01 | `CE_WRONG_CMD` | Unknown command, wrong length, or value out of range (NaN/inf float, bad bool, bad cell count, ...) |
 | 0x02 | `CE_BAD_CRC` | Checksum mismatch |
-| 0x03 | `CE_NO_REG` | Register address is not mapped |
-| 0x04 | `CE_RO` | Write attempted on a read-only register, or FET control requested outside learning mode |
+| 0x03 | `CE_NO_REG` | Address not in the register map |
+| 0x04 | `CE_RO` | Write to a read-only register |
+| 0x05 | `CE_EEPROM` | EEPROM write failed (`CC_EEPROM_CONFIG`) |
+| 0x06 | `CE_STATE` | Command not allowed in the current `ctrl_state` |
 
 ### Read transaction
 
-The host sends a read request with `Length` set to `0x00`. The device replies with the register's **full native size** — a requested length is ignored, and there is no partial or block-offset read.
+The host sends a read request with `Length` set to `0x00`. The device replies with the register's **full native size** — there is no partial or block-offset read.
 
-**Request — read `CellVoltage()` at `0x00`:**
+**Request — read `cell_voltage` at `0x00`:**
 ```
 02  00  00  02
 │   │   │   └───── checksum — (0x02 + 0x00 + 0x00) & 0xFF
@@ -81,45 +98,33 @@ The host sends a read request with `Length` set to `0x00`. The device replies wi
 └─ command echo — CC_READ
 ```
 
-**Request and response — `FETStatus()` at `0x09`:**
+**Request and response — `fet_status` at `0x06`:**
 ```
-02  09  00  0B                  ← request
-02  09  02  03 00  10           ← response: uint16 LE 0x0003 (main FETs on, pre-FET on)
-```
-
-**Response — `FirmwareVersion()` at `0x52`:**
-```
-02 52 20 31 2E 30 2E 30 00 00 ... 00 61
-│  │  │  └─ char[32] — "1.0.0", null-padded
-│  │  └─ length — 32 bytes
-│  └─ register address echo — 0x52
-└─ command echo — CC_READ
+02  06  00  08                  ← request
+02  06  02  03 00  0D           ← response: uint16 LE 0x0003 (main FET on, pre-FET on)
 ```
 
-While a read is being served, the ADS131M08 `DRDY` interrupt (`EXTI15_10`) and the STM32 internal ADC interrupt (`ADC1`) are masked so the measurement buffers cannot be updated mid-copy. They are re-enabled immediately after.
+**Request and response — `ctrl_state` at `0x13`:**
+```
+02  13  00  15                  ← request
+02  13  01  02  18              ← response: 2 = NORMAL_RUN
+```
 
 ### Write transaction
 
-The host sends the register's **full native size** as payload. The device answers with a bare ACK — it does not echo the written value.
+The host sends the register's **full native size** as payload; any other length returns `CE_WRONG_CMD`. The device answers with a bare ACK — it does not echo the written value.
 
-**Request — write `TemperatureOffset()` at `0x12` = 1.5 °C:**
+**Request — write `ovp_slow_threshold_mv` at `0x3F` = 4220 mV:**
 ```
-01  12  04  00 00 C0 3F  16
-│   │   │   └────────┘   └───── checksum
-│   │   │   └────────────────── data — float32 LE 1.5
-│   │   └────────────────────── length — 4 bytes
-│   └────────────────────────── register address — 0x12
-└────────────────────────────── command — CC_WRITE
-```
-
-**Request — write `OVP_SlowThreshold()` at `0x3A` = 4220 mV:**
-```
-01  3A  02  7C 10  C9
-            └───┘   └───── checksum
-            └───────────── data — uint16 LE 4220
+01  3F  02  7C 10  CE
+│   │   │   └───┘  └───── checksum
+│   │   │   └──────────── data — uint16 LE 4220
+│   │   └──────────────── length — 2 bytes
+│   └──────────────────── register address — 0x3F
+└──────────────────────── command — CC_WRITE
 ```
 
-**Response — ACK (identical for every successful write and control command):**
+**Response — ACK (the same for every successful write and command):**
 ```
 03  00  00  03
 │   │   │   └───── checksum
@@ -128,38 +133,65 @@ The host sends the register's **full native size** as payload. The device answer
 └───────────────── command — CC_ACK
 ```
 
-### Control commands
+Writes are checked before they are applied:
 
-`CC_CMD` frames trigger an action instead of writing a register. The payload length must be exactly **1 byte**; any other length returns `CE_WRONG_CMD`. Control command addresses are a separate address space from the register map.
+- `cell_count` (`0x30`) must be 2–7.
+- The on/off settings (`0x31`–`0x36`, `0x66`) must be `0` or `1`.
+- `model_cell` (`0x9F`) must be 0–6.
+- A NaN or inf float is refused, the old value stays.
+- The filter noise values `kf_q_soc`, `kf_q_rc1`, `kf_q_rc2`, `kf_r_v` (`0xBB`–`0xBE`) must be above 0.
 
-| Address | Command | Payload | Notes |
-|---------|---------|---------|-------|
-| 0x00 | SetMode | 1 byte — `0`, `1` or `2` | `0` = normal, `1` = config, `2` = learning. Values ≥ `0x03` return `CE_WRONG_CMD`. Writes the mode field of `MainControl()`. |
-| 0x01 | SetMainFET | 1 byte — `0` or `1` | `0` = FETs off, `1` = FETs on. Accepted **only in learning mode**; in normal or config mode the device returns `CE_RO`. Any value other than `0`/`1` returns `CE_WRONG_CMD`. |
+A refused write returns `CE_WRONG_CMD`.
 
-**Request — enter learning mode:**
+### Commands
+
+Commands use the command byte itself; the address is `0x00` and the length is the argument size.
+
+**Request — ping:**
 ```
-05  00  01  02  08
+0A  00  00  0A
+```
+
+**Request — save the config to EEPROM:**
+```
+05  00  00  05
+```
+
+**Request — start the HPPC test (NORMAL_RUN only):**
+```
+06  00  00  06
+```
+
+**Request — turn the main FET on (NORMAL_RUN only):**
+```
+08  00  01  01  0A
 │   │   │   │   └───── checksum
-│   │   │   └───────── payload — mode 2 (learning)
+│   │   │   └───────── argument — 1 = on
 │   │   └───────────── length — 1 byte
-│   └───────────────── control command address — 0x00 (SetMode)
-└───────────────────── command — CC_CMD
+│   └───────────────── address — always 0x00
+└───────────────────── command — CC_SET_FET
 ```
 
-**Request — turn main FETs on (learning mode only):**
+All are answered with the standard ACK frame, or with `CE_STATE` if the current state does not allow the command:
 ```
-05  01  01  01  08
+04  00  01  06  0B
 ```
 
-Both are answered with the standard ACK frame, or `CE_RO` if the mode gate rejects it:
-```
-04  00  01  04  09
-```
+### Device states
+
+`ctrl_state` (`0x13`) decides which commands are accepted:
+
+| Value | State | Meaning |
+|-------|-------|---------|
+| 1 | WAIT_CONFIG | No valid config in EEPROM. Write the config, save it with `CC_EEPROM_CONFIG` and reboot |
+| 2 | NORMAL_RUN | Config loaded at boot. Protections, fuel gauge and balancing run; the FET is controlled by the host |
+| 3 | HPPC_RUN | HPPC test running or finished. The FET is controlled by the test. Only a reboot goes back to NORMAL_RUN |
+
+Saving the config does not change the state; the saved config is loaded and applied only at the next reboot.
 
 ### Bootloader entry
 
-`CC_BOOTLOADER` (`0x42`, ASCII `B`) is handled **before** checksum validation, so a single unframed `0x42` byte is enough. The firmware erases the application flag page, replies with the ASCII string `"1\n"`, waits 100 ms and issues a system reset into the bootloader.
+`CC_BOOTLOADER` (`0x42`, ASCII `B`) is handled **before** checksum validation, so on the UART a single unframed `0x42` byte (or `B\n`) is enough. The firmware erases the application flag page, replies with the ASCII string `"1\n"`, waits 100 ms and resets into the bootloader.
 
 The bootloader itself speaks a separate line-based ASCII protocol on the same UART at the same baud rate. `python_scripts/flash.py` drives the full sequence:
 
@@ -184,209 +216,325 @@ The application starts at `0x0800A000`; `main()` sets `SCB->VTOR` accordingly.
 | Parity | None |
 | Stop bits | 1 |
 | Flow control | None |
-| Frame delimiting | Idle line — `HAL_UARTEx_ReceiveToIdle_DMA()`, one idle character time (~43 µs at 230400) |
-| RX / TX | DMA1 Channel 5 (RX) and Channel 4 (TX), 2048-byte buffers each |
-| Max payload | 168 bytes — the largest register is `Cell_Covariance()` at `0xA8` |
+| Frame delimiting | Idle line (`HAL_UARTEx_ReceiveToIdle_DMA()`) plus the length byte |
+| RX / TX buffers | 259 bytes each, max payload 255 bytes |
+| Frame timeout | 50 ms |
+| TX timeout | 50 ms |
 
-A frame must be transmitted as one continuous burst. Any idle gap inside a frame closes it early and the partial frame will be rejected on the checksum.
+A frame that arrives in pieces is joined until the length byte says it is complete. A partial frame that is not complete within 50 ms is dropped. A reply waits for the previous reply to finish sending; if that takes longer than 50 ms the send is aborted and `UART_TX_TIMEOUT` is set in `error_flags`. UART errors (overrun, framing, noise) are recovered and set `UART_ERROR`.
+
+### I²C settings
+
+| Parameter | Value |
+|-----------|-------|
+| Peripheral | I2C2, slave |
+| Address | `0x0B` (7-bit) |
+| Frames | The same as the UART |
+
+1. The host **writes** a whole request frame in one transfer (START, address + W, frame bytes, STOP). The frame is accepted only if the byte count equals `Length + 4` at STOP.
+2. The host then **reads** the reply (START, address + R, bytes, NACK, STOP). Every read starts at byte 0 of the reply.
+   - Bytes read as `0x00` mean the reply is not ready yet; read again.
+   - Bytes past the end of the reply read as `0xFF`.
+   - The host knows the reply size from its length byte (`Length + 4`). NACK is the normal end of a read.
+
+Bytes written while a frame is still being processed are dropped. A transfer with no STOP for 100 ms restarts the I²C and sets `I2C_ERROR`.
+
+## CAN
+
+CAN runs at 1 Mbit/s with 11-bit standard IDs. All values are little-endian. CAN is restarted at most every 1000 ms when it stops (bus-off, errors); this sets `CAN_ERROR`.
+
+### Status broadcast
+
+While the broadcast is on (default on after every boot), the device sends these messages every 100 ms. `CC_CAN_BROADCAST` turns it off or on until the next reboot; `CC_CAN_SEND_ONCE` sends them once.
+
+| ID | Bytes | Content |
+|----|-------|---------|
+| `0x6B0` | 8 | `uint32` pack voltage mV, `int32` pack current mA (+ = charge) |
+| `0x6B1` | 8 | `uint16` × 4 — cell 1–4 voltage mV |
+| `0x6B2` | 6 | `uint16` × 3 — cell 5–7 voltage mV |
+| `0x6B3` | 4 | `uint16` SOC in 0.1 % (lowest shown cell SOC), `int16` temperature in 0.1 °C |
+| `0x6B4` | 8 | `uint8` ctrl_state, `uint16` fet_status, `uint16` protection_trigger, `error_flags` low 24 bits (3 bytes) |
+
+Status messages still waiting in the transmit queue at the next broadcast are dropped, so the bus always carries fresh values.
+
+### Commands
+
+| ID | Direction | Content |
+|----|-----------|---------|
+| `0x6BF` | host → device | byte 0 = command code (`CC_*`), then its argument |
+| `0x6BE` | device → host | byte 0 = command code, byte 1 = result (`CE_*`, `0` = OK) |
+
+Allowed on CAN: `CC_CAN_BROADCAST`, `CC_CAN_SEND_ONCE`, `CC_REBOOT`, `CC_SET_FET`, `CC_RESET_PROTECTION`, `CC_CLEAR_ERRORS`, `CC_CLEAR_FAULT`, `CC_NORMAL_RUN`. Every other command returns `CE_WRONG_CMD`. Send one command and wait for its reply before the next.
+
+**Example — turn the main FET on:**
+```
+ID 0x6BF  data 08 01           ← CC_SET_FET, argument 1
+ID 0x6BE  data 08 00           ← reply: CC_SET_FET, CE_OK
+```
+
+## Simulation sample (`CC_SIM_SAMPLE`)
+
+Only in a build with `OPENBMS_SIMULATION` defined in `config.h`. The host sends the measurements and the time step instead of the ADC; each sample runs the control loop once on the simulated time. The real FET and pre-FET pins stay off, but `fet_status` shows what the firmware asked for.
+
+**Request:** `0E 00 <len> <samples> <checksum>`, with 1–6 samples of 38 bytes each (`len` = 38 × n):
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 0 | `float[7]` | cell voltage mV |
+| 28 | `float` | pack current mA (+ = charge) |
+| 32 | `float` | temperature °C |
+| 36 | `uint16` | time step ms |
+
+The board stops at the first sample that changes the reply state (FET, state, HPPC status, protection or errors); the host resends the rest.
+
+**Reply:** `0E 00 12 <18 bytes> <checksum>`:
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 0 | `uint16` | fet_status |
+| 2 | `uint8` | ctrl_state |
+| 3 | `uint16` | hppc_status |
+| 5 | `uint16` | hppc_extract_status |
+| 7 | `uint16` | protection_trigger |
+| 9 | `uint64` | error_flags |
+| 17 | `uint8` | samples run |
+
+Allowed in NORMAL_RUN and HPPC_RUN, otherwise `CE_STATE`. A NaN value returns `CE_WRONG_CMD`.
 
 ## Register map
 
-Registers are grouped into three banks, each backed by one firmware data structure. The banks are not contiguous — every address outside the ranges listed below returns `CE_NO_REG`.
+Every address not listed below returns `CE_NO_REG`. Access: **r** = read-only (a write returns `CE_RO`), **r/w** = read and write.
 
-| Bank | Range | Structure | Source module |
-|------|-------|-----------|---------------|
-| Peripheral data | `0x00` – `0x12` | `Peripheral_Data_t` | `openbms_periph.c` |
-| Config, system and stats data | `0x30` – `0x57` | `Config_Data_t`, `System_Data_t`, `Stats_Data_t` | `openbms_ctrl.c` |
-| Fuel gauge data | `0x80` – `0xAC` | `FuelGauge_Data_t` | fuel gauge (not yet wired in) |
-| — | `0x13` – `0x2F`, `0x58` – `0x7F`, `0xAD` – `0xFF` | unmapped | returns `CE_NO_REG` |
+| Bank | Range | Structure |
+|------|-------|-----------|
+| Peripheral data | `0x00` – `0x06` | `Peripheral_Data_t` |
+| System data | `0x10` – `0x1A` | `System_Data_t` |
+| Config | `0x30` – `0x6A` | `Config_Data_t` |
+| Fault snapshot | `0x70` – `0x75` | `Stats_Data_t` |
+| Fuel gauge | `0x90` – `0xD7` | `FuelGauge_Data_t` |
 
-`Type` is the C type of the underlying struct field; `Size` is the exact payload length in bytes for both reads and writes.
+### Peripheral data — `0x00` – `0x06`
 
-### Peripheral data — `0x00` – `0x12`
+| Addr | Name | Type | Access | Unit / notes |
+|------|------|------|--------|--------------|
+| 0x00 | `cell_voltage` | `float[7]` | r | mV, smoothed |
+| 0x01 | `pack_voltage` | `float` | r | mV, sum of `cell_count` cells |
+| 0x02 | `pack_current` | `float` | r | mA, + = charge |
+| 0x03 | `temperature_package` | `float` | r | °C, NTC |
+| 0x04 | `temperature_stm32` | `float` | r | °C |
+| 0x05 | `main_vdd_voltage_mv` | `float` | r | mV |
+| 0x06 | `fet_status` | `uint16` | r | bit 0 main FET, bit 1 pre-FET, bits 2–8 balancing cell 1–7 |
 
-Live measurements and sensor calibration, refreshed from the peripheral module on every access.
+### System data — `0x10` – `0x1A`
 
-| Address | Register | Access | Type | Size | Notes |
-|---------|----------|--------|------|------|-------|
-| 0x00 | CellVoltage() | r | float[7] | 28 | Per-cell voltage in mV, cell 1 first |
-| 0x01 | CellVoltageFiltered() | r | float[7] | 28 | Filtered per-cell voltage in mV — this is what the voltage protections evaluate |
-| 0x02 | PackVoltage() | r | float | 4 | Pack terminal voltage in mV |
-| 0x03 | PackVoltageFiltered() | r | float | 4 | Filtered pack voltage in mV |
-| 0x04 | PackCurrent() | r | float | 4 | Instantaneous current in mA; signed |
-| 0x05 | PackCurrentFiltered() | r | float | 4 | Filtered current in mA — this is what the current protections evaluate |
-| 0x06 | TemperaturePackage() | r | float | 4 | NTC pack temperature in °C — this is what the temperature protection evaluates |
-| 0x07 | TemperatureSTM32() | r | float | 4 | Internal MCU die temperature in °C |
-| 0x08 | MainVddVoltage() | r | float | 4 | System VDD in mV; nominally 3300 |
-| 0x09 | FETStatus() | r | uint16 | 2 | Bits 15-9: reserved<br/>Bits 8-2: balancer FETs — bit 2 = cell 1 … bit 8 = cell 7; 0=off, 1=on<br/>Bit 1: pre-FET state — 0=off, 1=on<br/>Bit 0: main FETs state — 0=off, 1=on |
-| 0x0A | CurrentSensorOffset() | r/w | float | 4 | Current sensor offset calibration |
-| 0x0B | CurrentSensorGain() | r/w | float | 4 | Current sensor gain calibration |
-| 0x0C | VoltageOffset() | r/w | float[7] | 28 | Per-cell ADC offset calibration |
-| 0x0D | VoltageGain() | r/w | float[7] | 28 | Per-cell ADC gain calibration |
-| 0x0E | NTC_Beta() | r/w | float | 4 | NTC beta value from datasheet, e.g. 3950.0 |
-| 0x0F | NTC_R_Nominal() | r/w | float | 4 | NTC nominal resistance at 25 °C in Ω |
-| 0x10 | NTC_R_Fixed() | r/w | float | 4 | Divider resistor in Ω, e.g. 10000.0 |
-| 0x11 | NTC_T_Nominal() | r/w | float | 4 | NTC nominal temperature in K, e.g. 298.15 |
-| 0x12 | TemperatureOffset() | r/w | float | 4 | Temperature sensor offset in °C |
+| Addr | Name | Type | Access | Unit / notes |
+|------|------|------|--------|--------------|
+| 0x10 | `main_control` | `uint16` | r | bit 0: 0 = normal, 1 = HPPC |
+| 0x11 | `last_communication_timestamp` | `uint32` | r | ms, time of the last good frame |
+| 0x12 | `protection_trigger` | `uint16` | r | protection bits, see below. `0` = none |
+| 0x13 | `ctrl_state` | `uint8` | r | 1 WAIT_CONFIG, 2 NORMAL_RUN, 3 HPPC_RUN |
+| 0x15 | `error_flags` | `uint64` | r | error bits, see below |
+| 0x17 | `session_uptime_ms` | `uint32` | r | ms since boot |
+| 0x18 | `hppc_direction` | `uint8` | r | 0 unknown, 1 charge, 2 discharge |
+| 0x19 | `hppc_status` | `uint16` | r | low byte state, high byte stop reason, see below |
+| 0x1A | `hppc_extract_status` | `uint16` | r | extraction bits, see below |
 
-### Control data — `0x30` – `0x57`
+### Config — `0x30` – `0x6A`
 
-Configuration, protection thresholds, fault records, lifetime counters and device identity.
+All config registers are r/w. A write changes the value in RAM; `CC_EEPROM_CONFIG` saves the whole bank to EEPROM (CRC-32 protected), and the saved config is loaded at the next reboot. There are no firmware defaults — the defaults live in `config.json`.
 
-| Address | Register | Access | Type | Size | Notes |
-|---------|----------|--------|------|------|-------|
-| 0x30 | Configuration() | r/w | uint16 | 2 | Bits 15-10: reserved<br/>Bit 9: temperature protection — 0=disable, 1=enable<br/>Bit 8: current protection — 0=disable, 1=enable<br/>Bit 7: voltage protection — 0=disable, 1=enable<br/>Bit 6: UART state — 0=disable, 1=enable<br/>Bit 5: CAN 2.0 state — 0=disable, 1=enable<br/>Bit 4: I²C state — 0=disable, 1=enable<br/>Bits 3-0: cell count — valid range 2-7<br/>Default: `0x0387` (7 cells, all three protections enabled) |
-| 0x31 | MainControl() | r/w | uint16 | 2 | Bits 15-2: reserved<br/>Bits 1-0: operating mode — `0`=normal, `1`=config, `2`=learning, `3`=reserved<br/>Default: `0x0000` (normal). Prefer the `CC_CMD` SetMode command over writing this register directly. |
-| 0x32 | CellCapacity() | r/w | uint32 | 4 | Factory cell capacity in mAh; default 2000 |
-| 0x33 | MaxCellVoltage() | r/w | uint16 | 2 | Max designed cell voltage in mV; default 4200 |
-| 0x34 | MinCellVoltage() | r/w | uint16 | 2 | Min designed cell voltage in mV; default 2500 |
-| 0x35 | ChargingTerminationCurrent() | r/w | uint16 | 2 | Termination current in mA; default 100 |
-| 0x36 | UVP_SlowThreshold() | r/w | uint16 | 2 | Slow undervoltage threshold in mV; default 2700 |
-| 0x37 | UVP_SlowTime() | r/w | uint16 | 2 | Slow UVP detection time in ms; default 20000; `0` disables this protection |
-| 0x38 | UVP_FastThreshold() | r/w | uint16 | 2 | Fast undervoltage threshold in mV; default 2500 |
-| 0x39 | UVP_FastTime() | r/w | uint16 | 2 | Fast UVP detection time in ms; default 500; `0` disables |
-| 0x3A | OVP_SlowThreshold() | r/w | uint16 | 2 | Slow overvoltage threshold in mV; default 4220 |
-| 0x3B | OVP_SlowTime() | r/w | uint16 | 2 | Slow OVP detection time in ms; default 20000; `0` disables |
-| 0x3C | OVP_FastThreshold() | r/w | uint16 | 2 | Fast overvoltage threshold in mV; default 4300 |
-| 0x3D | OVP_FastTime() | r/w | uint16 | 2 | Fast OVP detection time in ms; default 500; `0` disables |
-| 0x3E | OCP_ChargeThreshold() | r/w | uint16 | 2 | Charge overcurrent threshold in mA; default 4000 |
-| 0x3F | OCP_ChargeTime() | r/w | uint16 | 2 | Charge OCP detection time in ms; default 10000; `0` disables |
-| 0x40 | OCP_DischargeSlowThreshold() | r/w | uint16 | 2 | Slow discharge overcurrent threshold in mA; default 15000 |
-| 0x41 | OCP_DischargeSlowTime() | r/w | uint16 | 2 | Slow discharge OCP detection time in ms; default 10000; `0` disables |
-| 0x42 | OCP_DischargeFastThreshold() | r/w | uint16 | 2 | Fast discharge overcurrent threshold in mA; default 18000 |
-| 0x43 | OCP_DischargeFastTime() | r/w | uint16 | 2 | Fast discharge OCP detection time in ms; default 1000; `0` disables |
-| 0x44 | OTP_Threshold() | r/w | uint16 | 2 | Overtemperature threshold in °C; default 60 |
-| 0x45 | OTP_Time() | r/w | uint16 | 2 | OTP detection time in ms; default 60000; `0` disables |
-| 0x46 | FaultSnapshotVoltage() | r | uint16[7] | 14 | Per-cell voltage at last fault in mV |
-| 0x47 | FaultSnapshotCurrent() | r | int16 | 2 | Current at last fault in mA; signed |
-| 0x48 | FaultSnapshotTemperature() | r | uint8 | 1 | Temperature at last fault in °C |
-| 0x49 | FaultSnapshotSoC() | r | uint8 | 1 | SoC at last fault in % |
-| 0x4A | FaultCode() | r | uint8[8] | 8 | Last 8 fault codes; entry 0 = oldest, entry 7 = latest |
-| 0x4B | FaultTimestamp() | r | uint32[8] | 32 | Unix timestamps matching `FaultCode()`, same ordering |
-| 0x4C | CellBalancingEnergy() | r | uint16[7] | 14 | Per-cell accumulated balancing energy in mWh |
-| 0x4D | CellBalancingTime() | r | uint16[7] | 14 | Per-cell accumulated balancing time in minutes |
-| 0x4E | CellDeepestDischarge() | r | uint8[7] | 7 | Per-cell lowest SoC ever recorded in % |
-| 0x4F | CellMaxTemperature() | r | uint8[7] | 7 | Per-cell highest temperature ever recorded in °C |
-| 0x50 | LastCommunicationTimestamp() | r | uint32 | 4 | Time of last host communication in ms since boot; not yet updated by the firmware |
-| 0x51 | UptimeCounter() | r | uint64 | 8 | Total uptime in ms; rollover-safe accumulation of the HAL tick |
-| 0x52 | FirmwareVersion() | r | char[32] | 32 | ASCII, null-padded — "1.0.0" |
-| 0x53 | HardwareVersion() | r | char[32] | 32 | ASCII, null-padded — "RevA" |
-| 0x54 | ManufacturerName() | r | char[32] | 32 | ASCII, null-padded — "OpenBatt Team" |
-| 0x55 | DeviceName() | r | char[32] | 32 | ASCII, null-padded — "OpenBMS" |
-| 0x56 | DeviceChemistry() | r | char[32] | 32 | ASCII, null-padded — "Li-Ion" |
-| 0x57 | ManufacturerData() | r | char[32] | 32 | ASCII, null-padded — "Year 2026" |
+| Addr | Name | Type | Unit / notes |
+|------|------|------|--------------|
+| 0x30 | `cell_count` | `uint8` | 2–7 |
+| 0x31 | `use_i2c` | `bool` | |
+| 0x32 | `use_can` | `bool` | |
+| 0x33 | `use_uart` | `bool` | |
+| 0x34 | `volt_protection` | `bool` | OVP / UVP on |
+| 0x35 | `current_protection` | `bool` | OCP on |
+| 0x36 | `temp_protection` | `bool` | OTP / UTP on |
+| 0x37 | `cell_capacity` | `uint32` | mAh |
+| 0x38 | `voltage_cell_max` | `uint16` | mV, HPPC charge stops here |
+| 0x39 | `voltage_cell_min` | `uint16` | mV, HPPC discharge stops here |
+| 0x3A | `charging_term_current` | `uint16` | mA |
+| 0x3B | `uvp_slow_threshold_mv` | `uint16` | mV |
+| 0x3C | `uvp_slow_time_ms` | `uint16` | ms |
+| 0x3D | `uvp_fast_threshold_mv` | `uint16` | mV |
+| 0x3E | `uvp_fast_time_ms` | `uint16` | ms |
+| 0x3F | `ovp_slow_threshold_mv` | `uint16` | mV |
+| 0x40 | `ovp_slow_time_ms` | `uint16` | ms |
+| 0x41 | `ovp_fast_threshold_mv` | `uint16` | mV |
+| 0x42 | `ovp_fast_time_ms` | `uint16` | ms |
+| 0x43 | `ocp_charge_threshold_ma` | `uint16` | mA |
+| 0x44 | `ocp_charge_time_ms` | `uint16` | ms |
+| 0x45 | `ocp_discharge_slow_threshold_ma` | `uint16` | mA |
+| 0x46 | `ocp_discharge_slow_time_ms` | `uint16` | ms |
+| 0x47 | `ocp_discharge_fast_threshold_ma` | `uint16` | mA |
+| 0x48 | `ocp_discharge_fast_time_ms` | `uint16` | ms |
+| 0x49 | `otp_threshold_c` | `uint16` | °C |
+| 0x4A | `otp_time_ms` | `uint16` | ms, also used by OTP_CHARGE |
+| 0x4C | `charge_monitor_cell_mv` | `uint16` | mV, full-charge detection |
+| 0x4D | `utp_threshold_c` | `int16` | °C |
+| 0x4E | `utp_time_ms` | `uint16` | ms, also used by UTP_CHARGE |
+| 0x4F | `otp_charge_threshold_c` | `int16` | °C |
+| 0x50 | `ocv_v_lo_mv` | `uint16` | mV, HPPC OCV range |
+| 0x51 | `ocv_v_hi_mv` | `uint16` | mV |
+| 0x52 | `current_sensor_gain` | `float` | |
+| 0x53 | `voltage_gain` | `float[7]` | |
+| 0x54 | `ntc_beta` | `float` | |
+| 0x55 | `ntc_r_nominal` | `float` | Ω |
+| 0x56 | `ntc_r_fixed` | `float` | Ω |
+| 0x57 | `ntc_t_nominal` | `float` | °C |
+| 0x58 | `temperature_offset` | `float` | °C |
+| 0x59 | `shunt_resistance_mohm` | `float` | mΩ |
+| 0x5A | `current_offset_ma` | `float` | mA |
+| 0x5B | `voltage_offset_mv` | `float[7]` | mV |
+| 0x5C | `utp_charge_threshold_c` | `int16` | °C |
+| 0x60 | `firmware_version` | `char[32]` | null-padded |
+| 0x61 | `hardware_version` | `char[32]` | |
+| 0x62 | `manufacturer_name` | `char[32]` | |
+| 0x63 | `device_name` | `char[32]` | |
+| 0x64 | `device_chemistry` | `char[32]` | |
+| 0x65 | `manufacturer_data` | `char[32]` | |
+| 0x66 | `balance_enable` | `bool` | |
+| 0x67 | `balance_start_mv` | `uint16` | mV, highest cell must be at least this |
+| 0x68 | `balance_delta_mv` | `uint16` | mV, cell above the lowest by more than this bleeds |
+| 0x69 | `balance_max_temp_c` | `int16` | °C, no balancing above this |
+| 0x6A | `balance_resistance_ohm` | `float` | Ω, bleed resistor (fuel gauge subtracts the bleed current) |
 
-Protection thresholds are evaluated every 50 ms against the *filtered* measurements. A protection fires only after its condition has held continuously for the configured detection time; a detection time of `0` disables that individual protection regardless of the `Configuration()` enable bit.
+`0x4B` and `0x5D`–`0x5F` are unused.
 
-> **Note:** `0x32`–`0x34` are per-cell quantities in the firmware (`cell_capacity`, `voltage_cell_max`, `voltage_cell_min`), matching `CellCapacity()` / `MaxCellVoltage()` / `MinCellVoltage()` above. `python_scripts/read_all_registers.py` uses these same names.
+### Fault snapshot — `0x70` – `0x75`
 
-### Fuel gauge data — `0x80` – `0xAC`
+Taken once at the first protection trip and kept until `CC_CLEAR_FAULT`. RAM only, lost at reboot.
 
-Gauge outputs, the OCV/ECM cell model, temperature-dependent capacity, Kalman filter tuning and per-cell filter and aging state.
+| Addr | Name | Type | Access | Unit / notes |
+|------|------|------|--------|--------------|
+| 0x70 | `voltage` | `uint16[7]` | r | mV per cell |
+| 0x71 | `current` | `int16` | r | mA |
+| 0x72 | `temperature` | `int8` | r | °C |
+| 0x73 | `soc` | `uint8` | r | % |
+| 0x74 | `fault_code` | `uint16` | r | `protection_trigger` at the trip |
+| 0x75 | `fault_timestamp` | `uint32` | r | `session_uptime_ms` at the trip |
 
-All 20-element tables share the SOC breakpoints defined by `SOC_Grid()` at `0x86` — 0 % to 95 % in 5 % steps by default. All 5-element tables share the temperature breakpoints defined by `Q_Nom_TempSetpoints()` at `0x93`. See [battery-model.md](battery-model.md) for the model these parameters feed.
+### Fuel gauge — `0x90` – `0xD7`
 
-| Address | Register | Access | Type | Size | Notes |
-|---------|----------|--------|------|------|-------|
-| 0x80 | RelativeSoC() | r | uint8 | 1 | Pack SoC as % of full charge capacity; 0-100 |
-| 0x81 | CellSoC() | r | uint8[7] | 7 | Per-cell SoC in %; 0-100 |
-| 0x82 | CellSoH() | r | uint8[7] | 7 | Per-cell SoH in %; 0-100 |
-| 0x83 | CellRemainingCapacity() | r | uint16[7] | 14 | Per-cell remaining capacity in mAh |
-| 0x84 | CellSelfDischarge() | r | uint16[7] | 14 | Per-cell self-discharge rate in mAh/month |
-| 0x85 | CellQmax() | r | uint16[7] | 14 | Per-cell learned maximum capacity in mAh |
-| 0x86 | SOC_Grid() | r/w | float[20] | 80 | SOC breakpoints in %; default 0 to 95 in 5 % steps |
-| 0x87 | OCV_Discharge() | r/w | float[20] | 80 | Open-circuit voltage discharge curve in V per cell |
-| 0x88 | OCV_Charge() | r/w | float[20] | 80 | Open-circuit voltage charge curve in V per cell |
-| 0x89 | R0_Discharge() | r/w | float[20] | 80 | Series resistance, discharge, in Ω |
-| 0x8A | R1_Discharge() | r/w | float[20] | 80 | First RC resistance, discharge, in Ω |
-| 0x8B | Tau1_Discharge() | r/w | float[20] | 80 | First RC time constant, discharge, in s |
-| 0x8C | R2_Discharge() | r/w | float[20] | 80 | Second RC resistance, discharge, in Ω |
-| 0x8D | Tau2_Discharge() | r/w | float[20] | 80 | Second RC time constant, discharge, in s |
-| 0x8E | R0_Charge() | r/w | float[20] | 80 | Series resistance, charge, in Ω |
-| 0x8F | R1_Charge() | r/w | float[20] | 80 | First RC resistance, charge, in Ω |
-| 0x90 | Tau1_Charge() | r/w | float[20] | 80 | First RC time constant, charge, in s |
-| 0x91 | R2_Charge() | r/w | float[20] | 80 | Second RC resistance, charge, in Ω |
-| 0x92 | Tau2_Charge() | r/w | float[20] | 80 | Second RC time constant, charge, in s |
-| 0x93 | Q_Nom_TempSetpoints() | r/w | float[5] | 20 | Temperature breakpoints in °C; default −20, −10, 0, 25, 45 |
-| 0x94 | Q_Nom_TempCapacity() | r/w | float[5] | 20 | Capacity in Ah at each temperature breakpoint |
-| 0x95 | Q_Nom() | r/w | float | 4 | Nominal capacity at 25 °C in Ah |
-| 0x96 | CoulombicEfficiency() | r/w | float | 4 | Typically 0.995 to 0.999 |
-| 0x97 | R0_Ref() | r/w | float | 4 | R0 reference at 25 °C in Ω |
-| 0x98 | R1_Ref() | r/w | float | 4 | R1 reference at 25 °C in Ω |
-| 0x99 | Tau1_Ref() | r/w | float | 4 | tau1 reference at 25 °C in s |
-| 0x9A | R2_Ref() | r/w | float | 4 | R2 reference at 25 °C in Ω |
-| 0x9B | Tau2_Ref() | r/w | float | 4 | tau2 reference at 25 °C in s |
-| 0x9C | Ea_R0() | r/w | float | 4 | Arrhenius activation energy for R0 in J/mol |
-| 0x9D | Ea_R1() | r/w | float | 4 | Arrhenius activation energy for R1 in J/mol |
-| 0x9E | Ea_Tau1() | r/w | float | 4 | Arrhenius activation energy for tau1 in J/mol |
-| 0x9F | Ea_R2() | r/w | float | 4 | Arrhenius activation energy for R2 in J/mol |
-| 0xA0 | Ea_Tau2() | r/w | float | 4 | Arrhenius activation energy for tau2 in J/mol |
-| 0xA1 | KF_Q_SOC() | r/w | float | 4 | Kalman process noise — SOC state |
-| 0xA2 | KF_Q_RC1() | r/w | float | 4 | Kalman process noise — V_RC1 state |
-| 0xA3 | KF_Q_RC2() | r/w | float | 4 | Kalman process noise — V_RC2 state |
-| 0xA4 | KF_R_V() | r/w | float | 4 | Kalman measurement noise — voltage sensor, V² |
-| 0xA5 | Cell_SOC_f() | r | float[7] | 28 | Last estimated SOC per cell, 0.0 to 1.0 |
-| 0xA6 | Cell_VRC1() | r | float[7] | 28 | Last estimated V_RC1 per cell in V |
-| 0xA7 | Cell_VRC2() | r | float[7] | 28 | Last estimated V_RC2 per cell in V |
-| 0xA8 | Cell_Covariance() | r/w | float[7][6] | 168 | Covariance upper triangle per cell, row-major by cell<br/>Per-cell order: `P00, P01, P02, P11, P12, P22`<br/>Cell 1: bytes 0-23 · Cell 2: bytes 24-47 · … · Cell 7: bytes 144-167 |
-| 0xA9 | Cell_Q_Nom() | r | float[7] | 28 | Per-cell capacity after aging in Ah |
-| 0xAA | Cell_R0_Scale() | r | float[7] | 28 | Per-cell R0 growth factor; 1.0 = nominal |
-| 0xAB | CycleCount() | r | uint16 | 2 | Charge/discharge cycle counter |
-| 0xAC | LearningStatus() | r | uint16 | 2 | Kalman filter convergence and learning state flags |
+The per-cell model registers (`0xA1`–`0xAC` and `0xD4`) act on the cell picked with `model_cell` (`0x9F`). To read or write the tables of cell 3, write `0x9F` = 2 first.
 
-## Planned interfaces
+**Outputs:**
 
-Both peripherals below are initialized by `main.c` but have no protocol handler in `openbms_comm.c` yet — **nothing in this section is implemented**. The intent is for both to expose the same register map and the same command and error codes as the UART protocol (`CC_READ`, `CC_WRITE`, `CC_ACK`, `CC_ERROR`, `CC_CMD` and the `CE_*` error codes, unchanged), so that any register reachable over UART is reachable over I²C and CAN with identical addressing. The framing below is a draft of what each handler is expected to implement, written down now so host-side tooling can be designed in parallel — it is not a commitment, and specifics may well change once a handler actually exists and gets tested against real hardware.
+| Addr | Name | Type | Access | Unit / notes |
+|------|------|------|--------|--------------|
+| 0x90 | `relative_soc` | `uint8` | r | % |
+| 0x92 | `cell_soc` | `uint8[7]` | r | %, shown SOC per cell |
+| 0x93 | `cell_soh` | `uint8[7]` | r | %, set by capacity learning |
+| 0x94 | `cell_remaining_capacity` | `uint16[7]` | r | mAh |
+| 0x96 | `learning_status` | `uint16` | r/w | bit 0 CHARGE, bit 1 DISCHARGE, bit 2 COMPLETE (HPPC tables written) |
+| 0x97 | `capacity_update_count` | `uint16` | r | capacity learning updates |
+| 0x9F | `model_cell` | `uint8` | r/w | 0–6, cell for `0xA1`–`0xAC` and `0xD4` |
 
-### I²C — planned
+**Model (written by the HPPC extraction, or by the host):**
 
-| Parameter | Value |
-|-----------|-------|
-| Peripheral | I2C2 in SMBus slave mode |
-| Slave address | `0x0B` (7-bit) |
-| PEC | Enabled |
-| Timeouts | `TIDLE` and `TEXTEN` enabled |
-| Bus speed | ~100 kHz |
-| Status | Hardware initialized, no protocol handler |
+| Addr | Name | Type | Access | Unit / notes |
+|------|------|------|--------|--------------|
+| 0xA0 | `soc_grid` | `float[20]` | r/w | %, shared by all tables |
+| 0xA1 | `ocv_dis` | `float[20]` | r/w | V, selected cell |
+| 0xA2 | `ocv_chg` | `float[20]` | r/w | V, selected cell |
+| 0xA3 | `r0_dis` | `float[20]` | r/w | Ω, selected cell |
+| 0xA4 | `r1_dis` | `float[20]` | r/w | Ω, selected cell |
+| 0xA5 | `tau1_dis` | `float[20]` | r/w | s, selected cell |
+| 0xA6 | `r2_dis` | `float[20]` | r/w | Ω, selected cell |
+| 0xA7 | `tau2_dis` | `float[20]` | r/w | s, selected cell |
+| 0xA8 | `r0_chg` | `float[20]` | r/w | Ω, selected cell |
+| 0xA9 | `r1_chg` | `float[20]` | r/w | Ω, selected cell |
+| 0xAA | `tau1_chg` | `float[20]` | r/w | s, selected cell |
+| 0xAB | `r2_chg` | `float[20]` | r/w | Ω, selected cell |
+| 0xAC | `tau2_chg` | `float[20]` | r/w | s, selected cell |
+| 0xAD | `q_temp_c` | `float[5]` | r/w | °C, capacity vs temperature points |
+| 0xAE | `q_temp_factor` | `float[5]` | r/w | capacity factor at those points |
+| 0xAF | `q_nom_ah` | `float` | r/w | Ah |
+| 0xB0 | `coulombic_efficiency` | `float` | r/w | |
+| 0xB1 | `model_temp_dis_c` | `float` | r/w | °C, temperature of the discharge test |
+| 0xB2 | `model_temp_chg_c` | `float` | r/w | °C, temperature of the charge test |
+| 0xB6 | `ea_r0` | `float` | r/w | J/mol, Arrhenius activation energy |
+| 0xB7 | `ea_r1` | `float` | r/w | J/mol |
+| 0xB8 | `ea_tau1` | `float` | r/w | J/mol |
+| 0xB9 | `ea_r2` | `float` | r/w | J/mol |
+| 0xBA | `ea_tau2` | `float` | r/w | J/mol |
+| 0xBB | `kf_q_soc` | `float` | r/w | Kalman process noise, > 0 |
+| 0xBC | `kf_q_rc1` | `float` | r/w | > 0 |
+| 0xBD | `kf_q_rc2` | `float` | r/w | > 0 |
+| 0xBE | `kf_r_v` | `float` | r/w | Kalman measurement noise, > 0 |
 
-**Planned frame format (draft):** the same `[Command][Address][Length][Data][Checksum]` frame used on UART, carried as the data of a single SMBus block-write (host → device request) or block-read (device → host response). Standard SMBus block transfers cap at 32 data bytes, which covers every register except the handful of large fuel-gauge tables (`Cell_Covariance()` at 168 bytes is the largest) — those will need more than one block transaction, most likely paged with an offset appended after the register address. The exact paging scheme isn't fixed yet; PEC (already enabled on the peripheral) would sit alongside or replace the additive checksum, whichever turns out simpler once a handler is written.
+**Filter state:**
 
-> **Note:** `I2C1` is a separate master-mode bus used internally for the on-board 4 kB EEPROM at address `0xA0`. It is not a host interface.
+| Addr | Name | Type | Access | Unit / notes |
+|------|------|------|--------|--------------|
+| 0xD0 | `cell_soc_f` | `float[7]` | r | 0–1, filter SOC |
+| 0xD1 | `cell_vrc1` | `float[7]` | r | V, RC1 voltage |
+| 0xD2 | `cell_vrc2` | `float[7]` | r | V, RC2 voltage |
+| 0xD3 | `cell_p` | `float[7][6]` | r | covariance, 168 bytes |
+| 0xD4 | `capacity_ah` | `float` | r/w | Ah, selected cell, learned over time |
+| 0xD7 | `cycle_count` | `uint16` | r | |
 
-### CAN 2.0 — planned
+### Protection bits — `protection_trigger` (`0x12`)
 
-| Parameter | Value |
-|-----------|-------|
-| Peripheral | CAN1 (bxCAN) on PA11 / PA12 |
-| Bit rate | 1 Mbit/s — prescaler 8, BS1 7 TQ, BS2 2 TQ, SJW 1 TQ at 80 MHz PCLK1 |
-| Frame format | CAN 2.0A — 11-bit identifier |
-| Max payload | 8 bytes per frame |
-| Auto bus-off recovery | Enabled |
-| Auto retransmission | Enabled |
-| Interrupts | `CAN1_RX0`, `CAN1_TX`, `CAN1_SCE` enabled |
-| Termination | 120 Ω at each end of the bus |
-| Status | Hardware initialized, no protocol handler |
+| Bit | Name | Bit | Name |
+|-----|------|-----|------|
+| 0 | OVP_SLOW | 6 | OCP_DISCHARGE_FAST |
+| 1 | OVP_FAST | 7 | OTP |
+| 2 | UVP_SLOW | 8 | UTP |
+| 3 | UVP_FAST | 9 | OTP_CHARGE (only while charging) |
+| 4 | OCP_CHARGE | 10 | UTP_CHARGE (only while charging) |
+| 5 | OCP_DISCHARGE_SLOW | | |
 
-**Planned frame format (draft):** two fixed 11-bit identifiers — `0x100` for host → device requests and `0x101` for device → host responses — since this stays a point-to-point link with no multi-device addressing to design in yet.
+Any trip turns the FET off and stops a running HPPC test. `CC_RESET_PROTECTION` clears the bits.
 
-Because bxCAN carries at most 8 bytes per frame while several registers are far larger (`Cell_Covariance()` alone is 168 bytes), the plan is to reuse the ISO 15765-2 ("ISO-TP") single/first/consecutive-frame pattern rather than invent a new one, carrying the same `[Command][Address][Length][Data][Checksum]` frame as the payload:
+### Error bits — `error_flags` (`0x15`)
 
-| First byte(s) | Frame type | Carries |
-|----------------|------------|---------|
-| `0x0N` | Single frame | The whole OpenBMS frame in the remaining 7 bytes, when `N` (its length) is ≤ 7 — most requests, ACKs and small registers |
-| `0x1L` `LL` | First frame | 12-bit total length split across the low nibble of byte 0 and all of byte 1, then the first 6 bytes of the OpenBMS frame |
-| `0x2N` | Consecutive frame | The next 7 bytes, `N` a wrapping 0–15 sequence number |
+| Bit | Name | Bit | Name |
+|-----|------|-----|------|
+| 0 | EEPROM_READ_FAIL | 9 | HW_DRV_FAULT |
+| 1 | EEPROM_WRITE_FAIL | 10 | HW_DRV_GATE_FAULT |
+| 2 | EEPROM_CRC_FAIL | 11 | HW_PWR_FAIL |
+| 3 | ADS_READ_FAIL | 12 | UART_ERROR |
+| 4 | ADS_INIT_FAIL | 13 | UART_TX_TIMEOUT |
+| 5 | ADS_ID_FAIL | 14 | NTC_FAULT |
+| 6 | ADS_CRC_FAIL | 15 | I2C_ERROR |
+| 7 | ADS_RESET | 16 | CAN_ERROR |
+| 8 | ADS_DATA_LOST | 17 | WATCHDOG_RESET |
 
-A read of `CellVoltage()` (`0x00`) returns a 32-byte OpenBMS frame (command + address + length + 28 bytes of data + checksum) — too big for one CAN frame. It would arrive as one first frame (6 bytes) plus four consecutive frames (7+7+7+5 bytes) carrying the remaining 26. The CAN IDs and this framing are a starting point for the handler, not a fixed spec — they will be finalized once one is actually implemented and run against the bus.
+`CC_CLEAR_ERRORS` clears all bits.
+
+### HPPC status — `hppc_status` (`0x19`) and `hppc_extract_status` (`0x1A`)
+
+| State (low byte) | | Stop reason (high byte) | |
+|-------|------|------|------|
+| 0 | IDLE | 0 | NONE |
+| 1 | DETECT | 1 | CELL_MAX |
+| 2 | REST | 2 | CELL_MIN |
+| 3 | RAMP | 3 | TERM_CURRENT |
+| 4 | DONE | 4 | NO_CURRENT |
+| 5 | ABORTED | 5 | NO_CONFIG |
+| | | 6 | HOST |
+| | | 7 | PROTECTION |
+| | | 8 | CURRENT_RANGE |
+| | | 9 | TEMPERATURE |
+
+| Bit | `hppc_extract_status` |
+|-----|------|
+| 8 | BUSY — test running or fits still being worked on |
+| 9 | DONE — tables written |
+| 10 | OVERRUN |
+| 11 | FIT_WARN |
+| 12 | GAP_LO — OCV range not reached at the low end |
+| 13 | GAP_HI — OCV range not reached at the high end |
+| 14 | FEW_CYCLES |
 
 ## Notes for implementers
 
-Behaviour worth knowing when writing a host tool against the current firmware:
-
-- **Reads return the whole register.** The length byte in a read request is ignored; the device always sends the register's full native size. There is no partial read and no block offset.
-- **Writes must carry the whole register.** The firmware copies the register's native size out of the receive buffer regardless of the length the host declared. A short write will pull in whatever follows in the buffer, so always send exactly `Size` bytes.
-- **The device never initiates traffic.** There are no alarm broadcasts, no unsolicited status frames and no charger negotiation. A host that needs alarm awareness must poll `FETStatus()`, the fault registers and the measurement registers.
-- **One transaction at a time.** There is no sequence or transaction ID, so the host must wait for a response before issuing the next request. The reference scripts flush the input buffer before each request.
-- **Register writes are not yet persisted or propagated.** Writable registers in the peripheral and control banks are copied into a module-local snapshot inside `openbms_comm.c`; there is no setter path back into `openbms_periph.c` or `openbms_ctrl.c`, and nothing is written to EEPROM. Writes therefore do not currently take effect and do not survive a reset.
-- **The fuel gauge bank is not yet wired up.** `0x80`–`0xAC` are served from a zero-initialized static structure — the fuel gauge module does not populate it yet, so these registers read as zeros.
-- **`0xAD`–`0xD9` decode into the fuel gauge bank but map to nothing.** They return `CE_NO_REG` like any other unmapped address.
+- **Reads return the whole register.** There is no partial read and no block offset.
+- **Writes must carry the whole register.** Any other length returns `CE_WRONG_CMD`.
+- **Config writes are applied at reboot.** Write the registers, send `CC_EEPROM_CONFIG`, then `CC_REBOOT`. `python_scripts/simulation/config_tool.py w` does this from `config.json`.
+- **The fuel gauge model is per cell.** Select the cell with `0x9F` before reading or writing `0xA1`–`0xAC` or `0xD4`.
+- **One transaction at a time.** There is no sequence or transaction ID, so the host must wait for a reply before sending the next request.
+- **UART and I²C never send unsolicited data.** Only the CAN status broadcast is sent without a request. A host on UART or I²C polls `protection_trigger`, `error_flags` and the measurement registers.

@@ -5,7 +5,7 @@
             "label": "Clean Rebuild",
             "type": "cmake",
             "command": "cleanRebuild",
-            "preset": "Debug",
+            "preset": "Release",
             "group": "build",
             "problemMatcher": ["$gcc"]
         },
@@ -13,7 +13,7 @@
             "label": "Clean",
             "type": "cmake",
             "command": "clean",
-            "preset": "Debug",
+            "preset": "Release",
             "problemMatcher": []
         }
     ]

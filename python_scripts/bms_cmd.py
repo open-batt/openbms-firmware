@@ -15,7 +15,7 @@ Commands:
     fet on | fet off       main FET (normal run only)
     prefet on | prefet off pre-FET (normal run only)
     hppc start             start an HPPC test (normal run only)
-    hppc stop              back to normal run (stops a running HPPC test)
+    hppc stop              stop a running HPPC test (FET off, normal run again only after reset)
     save                   save the config to the EEPROM
     reset protection       clear a protection trip
     clear errors           clear the latched error flags
@@ -80,6 +80,14 @@ PROTECTION_NAMES = [
     "OCP_CHARGE", "OCP_DISCHARGE_SLOW", "OCP_DISCHARGE_FAST", "OTP",
     "UTP", "OTP_CHARGE", "UTP_CHARGE",
 ]
+# error_flags bits (0x15): OpenBMS_Error_t in openbms_error.h, bit 0 first
+ERROR_NAMES = [
+    "EEPROM_READ_FAIL", "EEPROM_WRITE_FAIL", "EEPROM_CRC_FAIL",
+    "ADS_READ_FAIL", "ADS_INIT_FAIL", "ADS_ID_FAIL", "ADS_CRC_FAIL", "ADS_RESET", "ADS_DATA_LOST",
+    "HW_DRV_FAULT", "HW_DRV_GATE_FAULT", "HW_PWR_FAIL",
+    "UART_ERROR", "UART_TX_TIMEOUT", "NTC_FAULT", "I2C_ERROR", "CAN_ERROR", "WATCHDOG_RESET",
+]
+FET_BALANCE_SHIFT = 2   # fet_status bits 2..8: balancing cell 1..7
 HPPC_STATES = {0: "IDLE", 1: "DETECT", 2: "REST", 3: "RAMP", 4: "DONE", 5: "ABORTED"}
 HPPC_STOPS = {
     0: "none", 1: "cell max", 2: "cell min", 3: "term current", 4: "no current",
@@ -96,7 +104,7 @@ SIMPLE_COMMANDS = {
     "ping":             (CC_PING,             TIMEOUT_REPLY, "board answered"),
     "reset":            (CC_REBOOT,           TIMEOUT_REPLY, "STM32 is rebooting"),
     "hppc start":       (CC_HPPC_START,       TIMEOUT_REPLY, "HPPC test started"),
-    "hppc stop":        (CC_NORMAL_RUN,       TIMEOUT_REPLY, "back to normal run"),
+    "hppc stop":        (CC_NORMAL_RUN,       TIMEOUT_REPLY, "HPPC test stopped, FET off. Type reset to go back to normal run"),
     "save":             (CC_EEPROM_CONFIG,    TIMEOUT_SAVE,  "config saved to the EEPROM"),
     "reset protection": (CC_RESET_PROTECTION, TIMEOUT_REPLY, "protection trip cleared"),
     "clear errors":     (CC_CLEAR_ERRORS,     TIMEOUT_REPLY, "error flags cleared"),
@@ -192,6 +200,29 @@ def protection_text(value):
     return ",".join(names)
 
 
+def error_text(value):
+    if not value:
+        return "none"
+    names = []
+    for bit in range(64):
+        if value & (1 << bit):
+            if bit < len(ERROR_NAMES):
+                names.append(ERROR_NAMES[bit])
+            else:
+                names.append(f"bit{bit}")
+    return ",".join(names)
+
+
+def balance_text(fet, cell_count):
+    cells = []
+    for i in range(cell_count):
+        if fet & (1 << (FET_BALANCE_SHIFT + i)):
+            cells.append(str(i + 1))
+    if not cells:
+        return "none"
+    return "cells " + " ".join(cells)
+
+
 def print_status(ser):
     cell_count = read_value(ser, 0x30, "B")
     cells = read_value(ser, 0x00, "f", 7)[:cell_count]
@@ -223,11 +254,12 @@ def print_status(ser):
     print(f"  current      {current:.1f} mA")
     print(f"  temperature  pack {temp_pack:.1f} C, STM32 {temp_stm32:.1f} C")
     print(f"  FET          main {main_fet}, pre {pre_fet}")
+    print(f"  balancing    {balance_text(fet, cell_count)}")
     print(f"  state        {CTRL_STATES.get(state, state)}, uptime {uptime / 1000.0:.1f} s")
     print(f"  HPPC         {HPPC_STATES.get(hppc & 0xFF, '?')} (stop: {HPPC_STOPS.get(hppc >> 8, '?')}), "
           f"extract 0x{extract:04X}")
     print(f"  protection   trip 0x{trip:04X} {protection_text(trip)}")
-    print(f"  errors       0x{errors:X}")
+    print(f"  errors       0x{errors:X} {error_text(errors)}")
     print(f"  SOC          {soc} %")
     print(f"  learning     {learning_text(learning)}")
 
