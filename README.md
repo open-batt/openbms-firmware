@@ -4,8 +4,8 @@
 ![License](https://img.shields.io/badge/license-MIT-7c5cbf)
 
 [OpenBMS](https://github.com/open-batt/openbms-hardware) firmware runs on STM32L4 microcontroller and is written in bare C. It consists of two layers:
-- Peripheral control and communication protocol handler - initializes and runs all peripherals on STM32L4, reads ADC, controls GPIO, and implements the host communication protocol over UART (I2C and CAN peripherals are initialized but not yet handled — see [communication-protocol.md](communication-protocol.md)).
-- Algorithms - battery fuel gauge algorithm, charge, discharge and cell balancing control, protections.
+- Peripheral control and communication protocol handler - initializes and runs all peripherals on STM32L4, reads ADC, controls GPIO, and implements the host communication protocol over UART and I2C (slave `0x0B`, same frames as UART), plus a CAN status broadcast and short CAN commands — see [communication-protocol.md](communication-protocol.md).
+- Algorithms - on-board HPPC test with battery model parameter extraction, battery fuel gauge (SOC, capacity learning, SOH, temperature compensation), cell balancing control, protections.
 
 ## ❤️ Funding
 
@@ -23,19 +23,20 @@ Learn more at the [NLnet project page](https://nlnet.nl/project/OpenBMS).
 |--------|--------|
 | Communication Protocol Define | ✅ Done |
 | Fuel Gauge Algorithms | ✅ Done |
-| Implementation on STM32 | 🚧 In progress |
+| Implementation on STM32 | ✅ Done |
 | Test & Bug Fix | 🚧 In progress |
 
 ## Prerequisites
 - Install STM32CubeIDE for VS Code extension
 - Check that bundle version numbers in `firmware/.vscode/settings.json` and `firmware/.vscode/launch.json` match your locally installed versions under `%LOCALAPPDATA%\stm32cube\bundles\`
+- Build with the **Release** preset (the only one, `-Os`); the output is in `firmware/build/Release`
 
 ## 📚 Documentation
 
-- **[how-to-use.md](how-to-use.md)** — end-to-end walkthrough: first-time setup, flashing, running HPPC tests, and turning the data into a working SOC estimate.
-- **[battery-model.md](battery-model.md)** — 2-RC equivalent circuit battery model, HPPC parameter extraction, and SOC estimation via an Extended Kalman Filter, with a worked 7-cell hardware example.
-- **[communication-protocol.md](communication-protocol.md)** — full wire protocol. The OpenBMS binary protocol over UART is implemented; I²C and CAN 2.0 are planned (draft frame formats included).
-- **[python-script.md](python-script.md)** — reference for the host-side scripts in `python_scripts/` (flashing firmware, running hardware tests, analyzing logs).
+- **[how-to-use.md](how-to-use.md)** — end-to-end walkthrough: first-time setup, flashing, writing the config, running the on-board HPPC test, using the BMS, and testing against a simulated battery.
+- **[battery-model.md](battery-model.md)** — 2-RC equivalent circuit battery model, on-board HPPC parameter extraction, SOC estimation via an Extended Kalman Filter with its corrections, capacity learning and temperature compensation, with a worked 7-cell hardware example.
+- **[communication-protocol.md](communication-protocol.md)** — full wire protocol: the OpenBMS binary protocol over UART and I²C, the CAN status broadcast and commands, and the complete register map.
+- **[python-script.md](python-script.md)** — reference for the host-side scripts in `python_scripts/` (flashing firmware, sending commands, writing the config, running the HPPC test, simulation tests).
 
 ## 🔗 Connected Projects
 
