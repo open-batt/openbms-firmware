@@ -31,7 +31,13 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "openbms_data.h"
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -48,11 +54,13 @@ extern CAN_HandleTypeDef hcan1;
 extern CRC_HandleTypeDef hcrc;
 
 extern I2C_HandleTypeDef hi2c1;
-extern SMBUS_HandleTypeDef hsmbus2;
+extern I2C_HandleTypeDef hi2c2;
 
 extern SPI_HandleTypeDef hspi1;
 
 extern UART_HandleTypeDef huart1;
+
+extern TIM_HandleTypeDef htim7;
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/
@@ -81,16 +89,16 @@ void Error_Handler(void);
 #define DRV_FLT_GPIO_Port GPIOA
 #define DRV_FET_EN_Pin GPIO_PIN_2
 #define DRV_FET_EN_GPIO_Port GPIOA
-#define DRV_FLT_GD_Pin GPIO_PIN_3
-#define DRV_FLT_GD_GPIO_Port GPIOA
+#define CHG_PRES_Pin GPIO_PIN_3
+#define CHG_PRES_GPIO_Port GPIOA
 #define MEAS_CELL_Pin GPIO_PIN_4
 #define MEAS_CELL_GPIO_Port GPIOA
 #define CELL_1_BAL_Pin GPIO_PIN_0
 #define CELL_1_BAL_GPIO_Port GPIOB
 #define NTC_Pin GPIO_PIN_1
 #define NTC_GPIO_Port GPIOB
-#define PWR_PG_Pin GPIO_PIN_2
-#define PWR_PG_GPIO_Port GPIOB
+#define CURR_CAL_Pin GPIO_PIN_2
+#define CURR_CAL_GPIO_Port GPIOB
 #define DRV_MAIN_EN_Pin GPIO_PIN_12
 #define DRV_MAIN_EN_GPIO_Port GPIOB
 #define WAKE_UP_Pin GPIO_PIN_13

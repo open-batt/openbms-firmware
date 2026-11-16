@@ -15,7 +15,7 @@ set(CMAKE_C_EXTENSIONS ON)
 
 # Define the build type
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Debug")
+    set(CMAKE_BUILD_TYPE "Release")
 endif()
 
 # Set the project name
@@ -50,6 +50,13 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/openbms_ctrl.c
     Core/Src/openbms_comm.c
+    Core/Src/openbms_periph.c
+    Core/Src/openbms_error.c
+    Core/Src/openbms_fuelgauge.c
+    Core/Src/openbms_hppc.c
+    Core/Src/openbms_hppc_extract.c
+    Core/Src/openbms_balance.c
+    Core/Src/openbms_eeprom.c
 )   
 
 # Add include paths
@@ -76,3 +83,6 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
         $<TARGET_FILE:${CMAKE_PROJECT_NAME}>
         ${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.hex
 )
+
+# Use float numbers for printf/scanf
+target_link_options(${PROJECT_NAME} PRIVATE -u _printf_float)

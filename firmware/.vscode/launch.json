@@ -7,7 +7,7 @@
             "request": "launch",
             "servertype": "stlink",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/Debug/openbms-firmware.elf",
+            "executable": "${workspaceFolder}/build/Release/openbms-firmware.elf",
             "interface": "swd",
             "device": "STM32L431CCUx",
             "runToEntryPoint": "main",

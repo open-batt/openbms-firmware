@@ -16,478 +16,898 @@
   */
 
 #include "openbms_ctrl.h"
-#include "openbms_comm.h"
-#include "stm32l4xx_hal_gpio.h"
+#include "openbms_periph.h"
+#include "openbms_error.h"
+#include "openbms_fuelgauge.h"
+#include "openbms_hppc.h"
+#include "openbms_hppc_extract.h"
+#include "openbms_balance.h"
+#include "openbms_eeprom.h"
+#include <stddef.h>
+#include <string.h>
+#include <math.h>
 
-ADC_HandleTypeDef   *internal_adc    = &hadc1;
-CAN_HandleTypeDef   *host_can        = &hcan1;
-CRC_HandleTypeDef   *hw_crc          = &hcrc;
-I2C_HandleTypeDef   *eeprom_i2c      = &hi2c1;
-SMBUS_HandleTypeDef *host_smbus      = &hsmbus2;
-SPI_HandleTypeDef   *adc_spi         = &hspi1;
+#ifdef OPENBMS_TEST
+static uint32_t ctrl_test_loop_time_us[2] = {0, 0};   // [0] last pass, [1] longest pass since boot
+#endif
 
-uint64_t                OpenBMS_status   = 0;
-OpenBMS_Data_t          OpenBMS_data     = {0};
-OpenBMS_Config_t        OpenBMS_config   = {0};
-OpenBMS_Ctrl_t          OpenBMS_ctrl     = {0};
+#define CTRL_PROT_CHARGE_MIN_MA          (50.0f)
 
-static void HandleError(OpenBMS_Status_t error)
+#define CTRL_BATT_CURRENT_MA             (50.0f)         // charge / discharge current above this counts as charging / discharging
+#define CTRL_BATT_FULL_MS                (10000UL)       // full condition held this long sets FULL
+#define CTRL_BATT_EMPTY_MS               (2000UL)        // a cell at or below voltage_cell_min this long sets EMPTY (load peaks stay shorter)
+#define CTRL_BATT_CLEAR_MS               (2000UL)        // current in the other direction this long clears the flag
+
+#define CTRL_UVP_SHUTDOWN_MS             (300000UL)
+
+static Config_Data_t    config_data             = {0};
+static System_Data_t    system_data             = {0};
+static Stats_Data_t     stats_data              = {0};
+static FuelGauge_Data_t fuelgauge_data          = {0};
+static bool             protection_reset        = false;
+static bool             shutdown_request        = false;  // CC_SHUTDOWN, Ctrl_Run enters SHUTDOWN
+static bool             reset_request           = false;  // CC_REBOOT / CC_BOOTLOADER, Ctrl_Run enters RESET
+static bool             errors_cleared          = false;  // CC_CLEAR_ERRORS, Ctrl_Run leaves FAULT for STARTUP
+static bool             hppc_model_saved        = false;  // the model of this HPPC test has been handed to the EEPROM
+static bool             reset_bootloader        = false;
+static uint32_t         reset_tick              = 0;    // HAL_GetTick when RESET was entered
+static uint32_t         startup_tick            = 0;    // HAL_GetTick when the cell measuring went on at boot
+
+static void Ctrl_FaultSnapshot(void);
+static void Ctrl_BatteryStatus(void);
+static void Ctrl_ChargerStatus(void);
+static void Ctrl_UvpShutdown(void);
+static bool Ctrl_CellsPresent(void);
+
+#define CTRL_RESET_DELAY_MS     (100U)
+
+#define CTRL_CELL_PRESENT_MV    (1000.0f)
+#define CTRL_STARTUP_TIMEOUT_MS (1000U)
+
+// True once any of the values has been past the threshold for longer than timeout_ms.
+// over = true: past means above the threshold, over = false: below it. A timeout of 0 disables the check.
+static bool Ctrl_ProtectionTriggered(const float *value, uint8_t value_count, float threshold, bool over,
+                                 uint32_t timeout_ms, uint32_t *timer, bool *triggered)
 {
-  OpenBMS_status |= (1ULL << error);
-}
-static void EEPROM_Init(void)
-{
-  uint8_t data[2];
+  bool threshold_exceeded = false;
 
-  // Read first 2 bytes of EEPROM identification page to verify communication
-  if(HAL_I2C_Master_Receive(eeprom_i2c, EEPROM_I2C_ADDRESS | 0x01, data, 2, EEPROM_I2C_ID_TIMEOUT) != HAL_OK)
+  if(timeout_ms > 0)
   {
-    HandleError(OPENBMS_EEPROM_ID_READ_FAIL);
-    return;
-  }
-
-  // Check if the EEPROM returns the expected identification bytes
-  if(data[0] != 0x20 || data[1] != 0xE0)
-  {
-    HandleError(OPENBMS_EEPROM_ID_VAL_FAIL);
-    return;
-  }
-}
-static void EEPROM_Read(void)
-{
-  uint32_t crc_stored   = 0;
-  uint32_t crc_calc     = 0;
-  uint8_t  data[32];
-  uint16_t total_bytes  = sizeof(OpenBMS_Config_t);
-  uint16_t bytes_read   = 0;
-  uint8_t  *dest        = (uint8_t *)&OpenBMS_config;
-  uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);  // Last 4 bytes of EEPROM
-
-  // Read struct starting at address 0x0000
-  while(bytes_read < total_bytes)
-  {
-    uint16_t chunk_size = total_bytes - bytes_read;
-    if(chunk_size > 32)
+    for(uint8_t i = 0; i < value_count; i++)
     {
-      chunk_size = 32;
-    }
-
-    if(HAL_I2C_Mem_Read(eeprom_i2c,
-                        EEPROM_I2C_ADDRESS,
-                        bytes_read,
-                        I2C_MEMADD_SIZE_16BIT,
-                        data,
-                        chunk_size,
-                        EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
-    {
-      HandleError(OPENBMS_EEPROM_READ_FAIL);
-      return;
-    }
-
-    memcpy(dest + bytes_read, data, chunk_size);
-    bytes_read += chunk_size;
-  }
-
-  // Read CRC from last 4 bytes of EEPROM
-  if(HAL_I2C_Mem_Read(eeprom_i2c,
-                      EEPROM_I2C_ADDRESS,
-                      crc_address,
-                      I2C_MEMADD_SIZE_16BIT,
-                      (uint8_t *)&crc_stored,
-                      sizeof(uint32_t),
-                      EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
-  {
-    HandleError(OPENBMS_EEPROM_READ_FAIL);
-    return;
-  }
-
-  // Calculate CRC32 over read struct and compare with stored CRC
-  crc_calc = HAL_CRC_Calculate(hw_crc, (uint32_t *)&OpenBMS_config, total_bytes / sizeof(uint32_t));
-
-  if(crc_calc != crc_stored)
-  {
-    HandleError(OPENBMS_EEPROM_CRC_FAIL);
-    return;
-  }
-}
-static void EEPROM_Update(void)
-{
-  uint8_t  eeprom_buf[32];
-  uint8_t  struct_buf[32];
-  uint16_t total_bytes  = sizeof(OpenBMS_Config_t);
-  uint16_t bytes_done   = 0;
-  uint8_t  *src         = (uint8_t *)&OpenBMS_config;
-  uint32_t crc_calc     = 0;
-  uint16_t crc_address  = EEPROM_SIZE - sizeof(uint32_t);
-
-  while(bytes_done < total_bytes)
-  {
-    uint16_t chunk_size = total_bytes - bytes_done;
-    if(chunk_size > 32)
-    {
-      chunk_size = 32;
-    }
-
-    // Read 32 bytes from EEPROM
-    if(HAL_I2C_Mem_Read(eeprom_i2c,
-                        EEPROM_I2C_ADDRESS,
-                        bytes_done,
-                        I2C_MEMADD_SIZE_16BIT,
-                        eeprom_buf,
-                        chunk_size,
-                        EEPROM_I2C_READ_TIMEOUT) != HAL_OK)
-    {
-      HandleError(OPENBMS_EEPROM_READ_FAIL);
-      return;
-   }
-
-    // Copy corresponding chunk from struct
-    memcpy(struct_buf, src + bytes_done, chunk_size);
-
-    // Compare EEPROM chunk with struct chunk
-    if(memcmp(eeprom_buf, struct_buf, chunk_size) != 0)
-    {
-      // Data differs — write struct chunk to EEPROM
-      if(HAL_I2C_Mem_Write(eeprom_i2c,
-                            EEPROM_I2C_ADDRESS,
-                            bytes_done,
-                            I2C_MEMADD_SIZE_16BIT,
-                            struct_buf,
-                            chunk_size,
-                            EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
+      if(over)
       {
-        HandleError(OPENBMS_EEPROM_WRITE_FAIL);
-        return;
+        if(value[i] > threshold) threshold_exceeded = true;
+      }
+      else
+      {
+        if(value[i] < threshold) threshold_exceeded = true;
       }
 
-      // M24C32 requires up to 5ms write cycle time — wait before next operation
-      HAL_Delay(5);
-    }
-
-    bytes_done += chunk_size;
-  }
-
-  // Calculate new CRC32 over entire struct
-  crc_calc = HAL_CRC_Calculate(&hcrc, (uint32_t *)&OpenBMS_config, sizeof(OpenBMS_Config_t));
-
-  // Write CRC to last 4 bytes of EEPROM
-  if(HAL_I2C_Mem_Write(eeprom_i2c,
-                        EEPROM_I2C_ADDRESS,
-                        crc_address,
-                        I2C_MEMADD_SIZE_16BIT,
-                        (uint8_t *)&crc_calc,
-                        sizeof(uint32_t),
-                        EEPROM_I2C_WRITE_TIMEOUT) != HAL_OK)
-  {
-    HandleError(OPENBMS_EEPROM_WRITE_FAIL);
-    return;
-  }
-
-  // Wait for final CRC write cycle to complete
-  HAL_Delay(5);
-}
-static bool ADS131M08_ReadReg(uint8_t reg, uint16_t *status, uint8_t* value)
-{
-  // According to datasheet, if word is set to 24 bits, then total SPI transacation has 30 bytes
-  // First 3 bytes are command, followed by 24 bytes of response, followed by 3 bytes of CRC
-  uint8_t tx_buff[30] = {0};
-  uint8_t rx_buff[30] = {0};
-  uint16_t cmd;
-  bool res = true;
-
-  cmd = 0xA000 | ((uint16_t)reg << 7);
-  tx_buff[0] = (cmd >> 8) & 0xFF;
-  tx_buff[1] =  cmd       & 0xFF;
-
-  // CS low
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
-
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 30, ADS131M0_SPI_TIMEOUT) != HAL_OK)
-  {
-    res = false;
-  }
-
-  // CS high
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
-
-  // Assign status word and value from response
-  *status = (rx_buff[0] << 8) | rx_buff[1];
-  memcpy(value, &rx_buff[2], 24);
-
-  return res;
-}
-static bool ADS131M08_WriteReg(uint8_t reg, uint16_t value)
-{
-  uint8_t tx_buff[6] = {0};
-  uint8_t rx_buff[6] = {0};
-  uint16_t cmd;
-  bool res = true;
-
-  cmd = 0x6000 | ((uint16_t)reg << 7);
-  tx_buff[0] = (cmd >> 8) & 0xFF;
-  tx_buff[1] =  cmd       & 0xFF;
-  tx_buff[2] = 0x00;
-
-  tx_buff[3] = 0x00;
-  tx_buff[4] = (value >> 8) & 0xFF;
-  tx_buff[5] =  value       & 0xFF;
-
-    // CS low
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
-
-  if(HAL_SPI_TransmitReceive(adc_spi, tx_buff, rx_buff, 6, ADS131M0_SPI_TIMEOUT) != HAL_OK)
-  {
-    res = false;
-  }
-
-  // CS high
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
-  return res;
-}
-static void ADS131M08_Init(void)
-{
-  uint8_t rx_data[30] = {0};
-  uint16_t status;
-
-  // Read ADC ID register (0x00) to verify communication
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // To read out register, actually one more transaction is needed after writing the command, 
-  // so read ID register again to get the value
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // Check if ID is good
-  if(rx_data[0] != 0x28)
-  {
-    HandleError(OPENBMS_ADS131M08_ID_FAIL);
-    return;
-  }
-
-  // Initilize CLOCK register, all channels enabled, SPS set to 125
-  if(!ADS131M08_WriteReg(0x03, 0xFF13))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // Initilize GAIN1 register, PGA3 = PGA2 = PGA1 = 4, PGA0 = 16
-  if(!ADS131M08_WriteReg(0x04, 0x2224))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-
-  // Initilize GAIN2 register, PGA7 = PGA6 = PGA5 = PGA4 = 4
-  if(!ADS131M08_WriteReg(0x05, 0x2222))
-  {
-    HandleError(OPENBMS_ADS131M08_INIT_FAIL);
-    return;
-  }
-}
-static void ADS131M08_Read(void)
-{
-  uint8_t rx_data[30] = {0};
-  uint16_t status;
-  int32_t raw_value;
-  float voltage_mv;
-
-  if(!ADS131M08_ReadReg(0x00, &status, rx_data))
-  {
-    HandleError(OPENBMS_ADS131M08_READ_FAIL);
-  }
-
-  // Extract CH0 value, get battery current by dividing voltage by shunt resistance
-  raw_value = ((int32_t)rx_data[0] << 24) | (rx_data[1] << 16) | (rx_data[2] << 8);
-  raw_value >>= 8;
-  voltage_mv = (float)raw_value * (150.0f / 16777216.0f);
-  voltage_mv /= OpenBMS_config.shunt_resistance_mohms;
-  OpenBMS_data.pack_current = voltage_mv;
-
-  // Set update flags
-  OpenBMS_data.pack_current_updated   = true;
-
-  // Extract CH1 - CH7 values and get cell voltages
-  if(OpenBMS_ctrl.meas_pack_voltage_enable & OpenBMS_ctrl.meas_cell_voltage_enable)
-  {
-    // Only measure pack voltage from channel 7
-    raw_value = ((int32_t)rx_data[7*3+0] << 24) | (rx_data[7*3+1] << 16) | (rx_data[7*3+2] << 8);
-    raw_value >>= 8;
-    voltage_mv = (float)raw_value * (600.0f / 16777216.0f);
-    OpenBMS_data.pack_voltage = voltage_mv / OpenBMS_config.batt_voltage_resistance_factor;
-
-    // Set update flags
-    OpenBMS_data.pack_voltage_updated = true;
-  }
-  else if(OpenBMS_ctrl.meas_cell_voltage_enable)
-  {
-    // Measure all cell voltages
-    for(uint8_t i = 1; i <= 7; i++)
-    {
-      raw_value = ((int32_t)rx_data[i*3+0] << 24) | (rx_data[i*3+1] << 16) | (rx_data[i*3+2] << 8);
-      raw_value >>= 8;
-      voltage_mv = (float)raw_value * (600.0f / 16777216.0f);
-      voltage_mv /= OpenBMS_config.cell_voltage_resistance_factor;
-      OpenBMS_data.cell_voltage[i-1] = voltage_mv;
-    }
-
-    // Set update flags
-    OpenBMS_data.cell_voltage_updated = true;
-  }
-}
-static float NTC_GetTemperature(float ntc_mv, float vdd_mv)
-{
-    if(ntc_mv >= vdd_mv || ntc_mv <= 0.0f)
-    {
-        return -273.15f;
-    }
-
-    float r_ntc = OpenBMS_config.ntc_r_fixed * (ntc_mv / (vdd_mv - ntc_mv));
-
-    if(r_ntc <= 0.0f)
-    {
-        return -273.15f;
-    }
-
-    float temp_k = 1.0f / ((1.0f / OpenBMS_config.ntc_t_nominal) + (1.0f / OpenBMS_config.ntc_beta) * logf(r_ntc / OpenBMS_config.ntc_r_nominal)
-    );
-
-    return temp_k - 273.15f;
-}
-static void STM32_ADC_Init(void)
-{
-  HAL_ADCEx_Calibration_Start(internal_adc, ADC_SINGLE_ENDED);
-  HAL_ADC_Start_IT(internal_adc);
-}
-static void STM32_ADC_Read(void)
-{
-  switch(ADC_CHANNEL_ID_MASK & internal_adc->Instance->SQR1)
-  {
-    case ADC_CHANNEL_16:         
-    {
-      uint32_t adc_ntc_raw     = HAL_ADC_GetValue(internal_adc); 
-
-      if(OpenBMS_data.vdd_mv_updated)
+      if(threshold_exceeded)
       {
-        // Calculate NTC voltage using actual VDD
-        float ntc_mv = ((float)adc_ntc_raw / 4095.0f) * OpenBMS_data.vdd_mv;
+        break;
+      }
+    }
 
-        // Get temperature now
-        OpenBMS_data.temperature_ntc = NTC_GetTemperature(ntc_mv, OpenBMS_data.vdd_mv);
+    if(threshold_exceeded)
+    {
+      if(!(*triggered))
+      {
+        *timer = HAL_GetTick();
+        *triggered = true;
+      }
+      else 
+      {
+        if((HAL_GetTick() - *timer) > timeout_ms)
+        {
+          return true;
+        }
+      }
+    }
+    else 
+    {
+      *triggered = false;
+    }
+  }
 
-        // Set flag
-        OpenBMS_data.temperature_ntc_updated = true;
+  return false;
+}
+static void Ctrl_ProtectionCheck(void)
+{
+  static uint32_t ovp_slow_timer        = 0;
+  static uint32_t ovp_fast_timer        = 0;
+  static uint32_t uvp_slow_timer        = 0;
+  static uint32_t uvp_fast_timer        = 0;
+  static uint32_t ocp_chg_timer         = 0;
+  static uint32_t ocp_dchg_slow_timer   = 0;
+  static uint32_t ocp_dchg_fast_timer   = 0;
+  static uint32_t otp_timer             = 0;
+  static uint32_t utp_timer             = 0;
+  static uint32_t otp_chg_timer         = 0;
+  static uint32_t utp_chg_timer         = 0;
+
+  static bool ovp_slow_triggered        = false;
+  static bool ovp_fast_triggered        = false;
+  static bool uvp_slow_triggered        = false;
+  static bool uvp_fast_triggered        = false;
+  static bool ocp_chg_triggered         = false;
+  static bool ocp_dchg_slow_triggered   = false;
+  static bool ocp_dchg_fast_triggered   = false;
+  static bool otp_triggered             = false;
+  static bool utp_triggered             = false;
+  static bool otp_chg_triggered         = false;
+  static bool utp_chg_triggered         = false;
+
+  Peripheral_Data_t pd;
+  Periph_GetData(&pd);
+
+  if(protection_reset)
+  {
+    ovp_slow_triggered        = false;
+    ovp_fast_triggered        = false;
+    uvp_slow_triggered        = false;
+    uvp_fast_triggered        = false;
+    ocp_chg_triggered         = false;
+    ocp_dchg_slow_triggered   = false;
+    ocp_dchg_fast_triggered   = false;
+    otp_triggered             = false;
+    utp_triggered             = false;
+    otp_chg_triggered         = false;
+    utp_chg_triggered         = false;
+    protection_reset          = false;
+  }
+
+  uint8_t cell_count = config_data.cell_count;
+  if(cell_count > SYS_CELL_COUNT_MAX)
+  {
+    cell_count = SYS_CELL_COUNT_MAX;
+  }
+
+  if(config_data.volt_protection)
+  {
+    if(Ctrl_ProtectionTriggered(pd.cell_voltage_live, cell_count, config_data.ovp_slow_threshold_mv, true,
+                                config_data.ovp_slow_time_ms, &ovp_slow_timer,
+                                &ovp_slow_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_OVP_SLOW;
+    }
+
+    if(Ctrl_ProtectionTriggered(pd.cell_voltage_live, cell_count, config_data.ovp_fast_threshold_mv, true,
+                                config_data.ovp_fast_time_ms, &ovp_fast_timer,
+                                &ovp_fast_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_OVP_FAST;
+    }
+
+    if(Ctrl_ProtectionTriggered(pd.cell_voltage_live, cell_count, config_data.uvp_slow_threshold_mv, false,
+                                config_data.uvp_slow_time_ms, &uvp_slow_timer,
+                                &uvp_slow_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_UVP_SLOW;
+    }
+
+    if(Ctrl_ProtectionTriggered(pd.cell_voltage_live, cell_count, config_data.uvp_fast_threshold_mv, false,
+                                config_data.uvp_fast_time_ms, &uvp_fast_timer,
+                                &uvp_fast_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_UVP_FAST;
+    }
+                              
+  }
+  else
+  {
+    ovp_slow_triggered        = false;
+    ovp_fast_triggered        = false;
+    uvp_slow_triggered        = false;
+    uvp_fast_triggered        = false;
+  }
+
+  if(config_data.current_protection)
+  {
+    float c = pd.pack_current;
+    float d = -pd.pack_current;
+
+    if(Ctrl_ProtectionTriggered(&c, 1, config_data.ocp_charge_threshold_ma, true,
+                                config_data.ocp_charge_time_ms, &ocp_chg_timer,
+                                &ocp_chg_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_OCP_CHARGE;
+    }
+
+    if(Ctrl_ProtectionTriggered(&d, 1, config_data.ocp_discharge_slow_threshold_ma, true,
+                                config_data.ocp_discharge_slow_time_ms, &ocp_dchg_slow_timer,
+                                &ocp_dchg_slow_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_OCP_DISCHARGE_SLOW;
+    }
+
+    if(Ctrl_ProtectionTriggered(&d, 1, config_data.ocp_discharge_fast_threshold_ma, true,
+                                config_data.ocp_discharge_fast_time_ms, &ocp_dchg_fast_timer,
+                                &ocp_dchg_fast_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_OCP_DISCHARGE_FAST;
+    }
+  }
+  else
+  {
+    ocp_chg_triggered         = false;
+    ocp_dchg_slow_triggered   = false;
+    ocp_dchg_fast_triggered   = false;
+  }
+
+  if(config_data.temp_protection && !Error_IsSet(OPENBMS_NTC_FAULT))
+  {
+    float t = pd.temperature_package;
+
+    if(Ctrl_ProtectionTriggered(&t, 1, config_data.otp_threshold_c, true,
+                                config_data.otp_time_ms, &otp_timer,
+                                &otp_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_OTP;
+    }
+
+    if(Ctrl_ProtectionTriggered(&t, 1, config_data.utp_threshold_c, false,
+                                config_data.utp_time_ms, &utp_timer,
+                                &utp_triggered))
+    {
+      system_data.protection_trigger |= CTRL_PROT_UTP;
+    }
+
+    if(pd.pack_current > CTRL_PROT_CHARGE_MIN_MA)
+    {
+      if(Ctrl_ProtectionTriggered(&t, 1, config_data.otp_charge_threshold_c, true,
+                                  config_data.otp_time_ms, &otp_chg_timer,
+                                  &otp_chg_triggered))
+      {
+        system_data.protection_trigger |= CTRL_PROT_OTP_CHARGE;
       }
 
+      if(Ctrl_ProtectionTriggered(&t, 1, config_data.utp_charge_threshold_c, false,
+                                  config_data.utp_time_ms, &utp_chg_timer,
+                                  &utp_chg_triggered))
+      {
+        system_data.protection_trigger |= CTRL_PROT_UTP_CHARGE;
+      }
     }
-    break;
-
-    case ADC_CHANNEL_VREFINT:    
+    else
     {
-      uint32_t adc_vrefint_raw = HAL_ADC_GetValue(internal_adc);
-
-      // ST factory calibrated VREFINT value measured at 3.0V, 30°C
-      // Stored in flash at fixed address
-      uint16_t vrefint_cal = *((uint16_t*)0x1FFF75AA);
-
-      // Calculate actual VDD
-      // vrefint_cal was measured at 3.0V so multiply by 3.0
-      OpenBMS_data.vdd_mv = (3000.0f * (float)vrefint_cal) / (float)adc_vrefint_raw;
-
-      // Set flag true
-      OpenBMS_data.vdd_mv_updated = true;
+      otp_chg_triggered       = false;
+      utp_chg_triggered       = false;
     }
-    break;
+  }
+  else
+  {
+    otp_triggered             = false;
+    utp_triggered             = false;
+    otp_chg_triggered         = false;
+    utp_chg_triggered         = false;
+  }
+}
+static bool Ctrl_CellsPresent(void)
+{
+  Peripheral_Data_t pd;
+  uint8_t           cell_count = config_data.cell_count;
 
-    case ADC_CHANNEL_TEMPSENSOR: 
+  if(!EEPROM_ConfigLoaded())
+  {
+    return true;
+  }
+  if(cell_count > SYS_CELL_COUNT_MAX)
+  {
+    cell_count = SYS_CELL_COUNT_MAX;
+  }
+
+  Periph_GetData(&pd);
+  for(uint8_t i = 0; i < cell_count; i++)
+  {
+    if(pd.cell_voltage_live[i] < CTRL_CELL_PRESENT_MV)
     {
-      uint32_t adc_temp_raw = HAL_ADC_GetValue(internal_adc); 
+      return false;
+    }
+  }
+  return true;
+}
+void Ctrl_Init(void)
+{
+  Periph_Init();
+  FuelGauge_Init(&fuelgauge_data, &config_data);
+  Balance_Init(&config_data);
 
-      // Calculate STM32 die temperature using actual VDD
-      // ST factory cal values
-      uint16_t ts_cal1 = *((uint16_t*)0x1FFF75A8);  // TS_CAL1 at 30°C, 3.0V
-      uint16_t ts_cal2 = *((uint16_t*)0x1FFF75CA);  // TS_CAL2 at 130°C, 3.0V
-      OpenBMS_data.temperature_stm32 = (130.0f - 30.0f) / ((float)ts_cal2 - (float)ts_cal1) * ((float)adc_temp_raw - (float)ts_cal1) + 30.0f;
+  EEPROM_Init(&config_data, &fuelgauge_data);
+  system_data.ctrl_state = CTRL_STATE_STARTUP;
+  if(EEPROM_ConfigLoaded())
+  {
+    Periph_SetCalibration(&config_data);
+  }
 
-      // Set flag true
-      OpenBMS_data.temperature_stm32_updated = true;
+  Periph_Wake();
+  startup_tick = HAL_GetTick();
+
+#ifdef OPENBMS_TEST
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT       = 0;
+  DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
+#endif
+}
+void Ctrl_Run(void)
+{
+  uint8_t         hppc_direction;
+  uint16_t        hppc_status;
+  uint16_t        hppc_extract_status;
+  bool            run_fet;
+  bool            run_pre_fet;
+  bool            run_balance;
+  bool            hppc_fet = false;
+#ifdef OPENBMS_TEST
+  uint32_t        loop_start_cycles = DWT->CYCCNT;
+#endif
+
+  system_data.error_flags = Error_GetFlags();
+
+  system_data.session_uptime_ms = HAL_GetTick();
+
+
+  switch(system_data.ctrl_state)
+  {
+    case CTRL_STATE_STARTUP:
+    {
+      if(reset_request)
+      {
+        reset_tick             = HAL_GetTick();
+        system_data.ctrl_state = CTRL_STATE_RESET;
+      }
+      else if((Error_GetFlags() & ERROR_FAULT_FLAGS) != 0U)
+      {
+        system_data.ctrl_state = CTRL_STATE_FAULT;
+      }
+      else if(Periph_CellMeasureReady())
+      {
+        if(Ctrl_CellsPresent())
+        {
+          system_data.ctrl_state = CTRL_STATE_NORMAL_RUN;
+        }
+        else
+        {
+          Error_Set(OPENBMS_CELL_MISSING);
+          system_data.ctrl_state = CTRL_STATE_FAULT;
+        }
+      }
+      else if((HAL_GetTick() - startup_tick) >= CTRL_STARTUP_TIMEOUT_MS)
+      {
+        Error_Set(OPENBMS_ADS131M08_DATA_LOST);
+        system_data.ctrl_state = CTRL_STATE_FAULT;
+      }
     }
     break;
+
+    case CTRL_STATE_FAULT:
+    {
+      system_data.fet_request     = false;
+      system_data.pre_fet_request = false;
+      if(reset_request)
+      {
+        reset_tick             = HAL_GetTick();
+        system_data.ctrl_state = CTRL_STATE_RESET;
+      }
+      else if(shutdown_request)
+      {
+        system_data.ctrl_state = CTRL_STATE_SHUTDOWN;
+      }
+      else if(errors_cleared)
+      {
+        system_data.main_control = CTRL_MODE_NORMAL;
+        startup_tick             = HAL_GetTick();
+        system_data.ctrl_state   = CTRL_STATE_STARTUP;
+      }
+      errors_cleared = false;
+    }
+    break;
+
+    case CTRL_STATE_NORMAL_RUN:
+    {
+      if(reset_request)
+      {
+        reset_tick             = HAL_GetTick();
+        system_data.ctrl_state = CTRL_STATE_RESET;
+      }
+      else if(shutdown_request)
+      {
+        system_data.ctrl_state = CTRL_STATE_SHUTDOWN;
+      }
+      else if((Error_GetFlags() & ERROR_FAULT_FLAGS) != 0U)
+      {
+        system_data.fet_request     = false;
+        system_data.pre_fet_request = false;
+        system_data.ctrl_state      = CTRL_STATE_FAULT;
+      }
+      else
+      {
+#ifdef OPENBMS_TEST
+        if(EEPROM_FuelGaugeLoaded() && !Periph_MeasTestOffOn())
+#else
+        if(EEPROM_FuelGaugeLoaded())
+#endif
+        {
+          FuelGauge_Run();
+        }
+
+        if(system_data.main_control == CTRL_MODE_HPPC)
+        {
+          system_data.fet_request     = false;
+          system_data.pre_fet_request = false;
+          EEPROM_StopFuelGauge();
+          system_data.ctrl_state      = CTRL_STATE_HPPC_RUN;
+        }
+      }
+    }
+    break;
+
+    case CTRL_STATE_HPPC_RUN:
+    {
+      if(reset_request)
+      {
+        reset_tick             = HAL_GetTick();
+        system_data.ctrl_state = CTRL_STATE_RESET;
+        break;
+      }
+      if(shutdown_request)
+      {
+        if(system_data.main_control == CTRL_MODE_HPPC)
+        {
+          Hppc_Abort(HPPC_STOP_SHUTDOWN, &hppc_fet);
+          hppc_fet = false;
+        }
+        Hppc_GetStatus(&hppc_direction, &hppc_status, &hppc_extract_status);
+        system_data.hppc_direction      = hppc_direction;
+        system_data.hppc_status         = hppc_status;
+        system_data.hppc_extract_status = hppc_extract_status;
+        system_data.ctrl_state          = CTRL_STATE_SHUTDOWN;
+        break;
+      }
+      if((Error_GetFlags() & ERROR_FAULT_FLAGS) != 0U)
+      {
+        if(system_data.main_control == CTRL_MODE_HPPC)
+        {
+          Hppc_Abort(HPPC_STOP_ERRORS, &hppc_fet);
+          hppc_fet = false;
+        }
+        Hppc_GetStatus(&hppc_direction, &hppc_status, &hppc_extract_status);
+        system_data.hppc_direction      = hppc_direction;
+        system_data.hppc_status         = hppc_status;
+        system_data.hppc_extract_status = hppc_extract_status;
+        system_data.ctrl_state          = CTRL_STATE_FAULT;
+        break;
+      }
+
+      if(system_data.main_control == CTRL_MODE_NORMAL)
+      {
+        Hppc_Stop(&hppc_fet);
+      }
+      else if(system_data.protection_trigger != 0)
+      {
+        Hppc_Abort(HPPC_STOP_PROTECTION, &hppc_fet);
+      }
+      else
+      {
+        Hppc_Run(&hppc_fet);
+      }
+
+      Hppc_GetStatus(&hppc_direction, &hppc_status, &hppc_extract_status);
+      system_data.hppc_direction      = hppc_direction;
+      system_data.hppc_status         = hppc_status;
+
+      if(!hppc_model_saved && (hppc_extract_status & HX_STATUS_DONE) != 0 && (hppc_extract_status & HX_STATUS_BUSY) == 0)
+      {
+        hppc_model_saved = EEPROM_SaveFuelGaugeModel();
+      }
+      if(hppc_model_saved)
+      {
+        if(EEPROM_SaveRunning())
+        {
+          hppc_extract_status |= HX_STATUS_BUSY;
+        }
+        else if(((EEPROM_GetStatus() & EEPROM_STATUS_SAVE_MASK) >> EEPROM_STATUS_SAVE_SHIFT) == EEPROM_SAVE_DONE)
+        {
+          hppc_extract_status |= HX_STATUS_SAVED;
+        }
+      }
+      system_data.hppc_extract_status = hppc_extract_status;
+    }
+    break;
+
+    case CTRL_STATE_SHUTDOWN:
+    {
+      system_data.fet_request     = false;
+      system_data.pre_fet_request = false;
+      Periph_Off();
+
+      if(EEPROM_FinalSave())
+      {
+        Periph_PowerOff();
+      }
+    }
+    break;
+
+    case CTRL_STATE_RESET:
+    {
+      system_data.fet_request     = false;
+      system_data.pre_fet_request = false;
+      Periph_Off();
+
+      if(EEPROM_FinalSave() && (HAL_GetTick() - reset_tick) >= CTRL_RESET_DELAY_MS)
+      {
+        if(reset_bootloader)
+        {
+          Periph_RemoveAppFlag();
+        }
+        NVIC_SystemReset();
+      }
+    }
+    break;
+
+    default: break;
   }
-}
-static void GPIO_Ctrl(void)
-{
-  // Set main FET state
-  HAL_GPIO_WritePin(DRV_MAIN_EN_GPIO_Port, DRV_MAIN_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.main_fet_enable);
 
-  // Set precharge/predischarge FET state
-  HAL_GPIO_WritePin(DRV_PRE_FET_EN_GPIO_Port, DRV_PRE_FET_EN_Pin, (GPIO_PinState) OpenBMS_ctrl.pre_fet_enable);
+  EEPROM_Run();
+  system_data.eeprom_status = EEPROM_GetStatus();
 
-  // Enable cell voltage measuring
-  HAL_GPIO_WritePin(MEAS_CELL_GPIO_Port, MEAS_CELL_Pin, (GPIO_PinState) OpenBMS_ctrl.meas_cell_voltage_enable);
-
-  // Enable pack voltage measuring
-  HAL_GPIO_WritePin(MEAS_BATT_GPIO_Port, MEAS_BATT_Pin, (GPIO_PinState) OpenBMS_ctrl.meas_pack_voltage_enable);
-
-  // Set balancer
-  HAL_GPIO_WritePin(CELL_1_BAL_GPIO_Port, CELL_1_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[0]);
-  HAL_GPIO_WritePin(CELL_2_BAL_GPIO_Port, CELL_2_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[1]);
-  HAL_GPIO_WritePin(CELL_3_BAL_GPIO_Port, CELL_3_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[2]);
-  HAL_GPIO_WritePin(CELL_4_BAL_GPIO_Port, CELL_4_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[3]);
-  HAL_GPIO_WritePin(CELL_5_BAL_GPIO_Port, CELL_5_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[4]);
-  HAL_GPIO_WritePin(CELL_6_BAL_GPIO_Port, CELL_6_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[5]);
-  HAL_GPIO_WritePin(CELL_7_BAL_GPIO_Port, CELL_7_BAL_Pin, (GPIO_PinState) OpenBMS_ctrl.cell_balancer_enable[6]);
-  
-  // Set main power signal on to keep OpenBMS on
-  HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, (GPIO_PinState) OpenBMS_ctrl.pwr_on);
-
-  // Read driver fault pin, inverse state
-  OpenBMS_ctrl.fet_driver_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GPIO_Port, DRV_FLT_Pin));
-
-  // Read driver gate fault pin, inverse state
-  OpenBMS_ctrl.fet_driver_gate_fault = (bool)(1 - (uint8_t)HAL_GPIO_ReadPin(DRV_FLT_GD_GPIO_Port, DRV_FLT_GD_Pin));
-
-  // Read wake up pin, active high
-  OpenBMS_ctrl.wake_up = (bool)HAL_GPIO_ReadPin(WAKE_UP_GPIO_Port, WAKE_UP_Pin);
-
-  // Read VCC power good pin
-  OpenBMS_ctrl.vcc_power_good = (bool)HAL_GPIO_ReadPin(PWR_PG_GPIO_Port, PWR_PG_Pin);
-
-}
-void OpenBMS_Ctrl_Init(void)
-{
-  OpenBMS_Comm_Init();
-  //EEPROM_Init();
-  //EEPROM_Read();
-
-  //ADS131M08_Init();
-
-  //STM32_ADC_Init();
-}
-void OpenBMS_Ctrl_Run(void)
-{
-  //GPIO_Ctrl();
-  OpenBMS_Comm_Run();
-}
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-  if (GPIO_Pin == ADC_DRDY_Pin)
+  if(EEPROM_ConfigLoaded() && Periph_CellMeasureReady())
   {
-    ADS131M08_Read();
+    Ctrl_ProtectionCheck();
+    Ctrl_FaultSnapshot();
+    Ctrl_BatteryStatus();
+    Ctrl_UvpShutdown();
+  }
+  Ctrl_ChargerStatus();
+
+  if(system_data.protection_trigger != 0)
+  {
+    system_data.fet_request     = false;
+    system_data.pre_fet_request = false;
+  }
+
+  run_fet = EEPROM_ConfigLoaded() && (system_data.protection_trigger == 0) && (hppc_fet | system_data.fet_request);
+
+  run_pre_fet = EEPROM_ConfigLoaded() && (system_data.protection_trigger == 0) && system_data.pre_fet_request;
+
+  Periph_SetFET(run_fet);
+  Periph_SetPreFET(run_pre_fet);
+
+  run_balance = EEPROM_ConfigLoaded() && (system_data.ctrl_state == CTRL_STATE_NORMAL_RUN) && (system_data.protection_trigger == 0);
+  if(EEPROM_FuelGaugeLoaded())
+  {
+    Periph_SetBalance(Balance_Run(run_balance, FuelGauge_GetBalanceTarget()));
+  }
+  else
+  {
+    Periph_SetBalance(Balance_Run(run_balance, 0));
+  }
+
+  Periph_Run();
+
+#ifdef OPENBMS_TEST
+  ctrl_test_loop_time_us[0] = (DWT->CYCCNT - loop_start_cycles) / (SystemCoreClock / 1000000U);
+  if(ctrl_test_loop_time_us[0] > ctrl_test_loop_time_us[1])
+  {
+    ctrl_test_loop_time_us[1] = ctrl_test_loop_time_us[0];
+  }
+#endif
+}
+#ifdef OPENBMS_TEST
+const uint32_t *Ctrl_TestLoopTime(void)
+{
+  return ctrl_test_loop_time_us;
+}
+#endif
+const Config_Data_t *Ctrl_GetConfig(void)
+{
+  return &config_data;
+}
+const System_Data_t *Ctrl_GetSystem(void)
+{
+  return &system_data;
+}
+const Stats_Data_t *Ctrl_GetStats(void)
+{
+  return &stats_data;
+}
+const FuelGauge_Data_t *Ctrl_GetFuelGauge(void)
+{
+  return &fuelgauge_data;
+}
+// Writes one field of a struct owned by this module, length is the size of that field.
+// Floats between block_start and block_end must be real numbers.
+static bool Ctrl_WriteField(void *base, uint32_t size, uint32_t block_start, uint32_t block_end,
+                            const void *field, const uint8_t *data, uint8_t length)
+{
+  uint32_t offset = (uint32_t)((const uint8_t *)field - (const uint8_t *)base);
+  float    value;
+
+  if(offset + length > size)
+  {
+    return false;
+  }
+
+  if(offset >= block_start && offset < block_end)
+  {
+    for(uint32_t i = 0; i + sizeof(float) <= length; i += sizeof(float))
+    {
+      memcpy(&value, data + i, sizeof(float));
+      if(!isfinite(value))
+      {
+        return false;
+      }
+    }
+  }
+
+  memcpy((uint8_t *)base + offset, data, length);
+  return true;
+}
+bool Ctrl_WriteConfig(const void *field, const uint8_t *data, uint8_t length)
+{
+  return Ctrl_WriteField(&config_data, sizeof(Config_Data_t),
+                         offsetof(Config_Data_t, current_sensor_gain), offsetof(Config_Data_t, device_chemistry),
+                         field, data, length);
+}
+bool Ctrl_WriteFuelGauge(const void *field, const uint8_t *data, uint8_t length)
+{
+  if(field == &fuelgauge_data.kf_r_v)
+  {
+    float value;
+
+    if(length != sizeof(float))
+    {
+      return false;
+    }
+    memcpy(&value, data, sizeof(float));
+    if(!(value > 0.0f))
+    {
+      return false;
+    }
+  }
+
+  return Ctrl_WriteField(&fuelgauge_data, sizeof(FuelGauge_Data_t),
+                         offsetof(FuelGauge_Data_t, soc_grid), offsetof(FuelGauge_Data_t, cycle_count),
+                         field, data, length);
+}
+void Ctrl_SetMode(uint16_t mode)
+{
+  system_data.main_control = mode;
+}
+bool Ctrl_StartHppc(uint8_t direction)
+{
+  if(system_data.ctrl_state == CTRL_STATE_HPPC_RUN)
+  {
+    if(system_data.main_control == CTRL_MODE_HPPC ||
+       (HppcX_GetStatus() & HX_STATUS_BUSY) != 0 ||
+       ((HppcX_GetStatus() & HX_STATUS_DONE) != 0 && !hppc_model_saved))
+    {
+      return false;
+    }
+    hppc_model_saved = false;
+  }
+
+  FuelGauge_SetDefaultsIfEmpty();
+
+  Hppc_SetDirection(direction);
+  system_data.main_control = CTRL_MODE_HPPC;
+  return true;
+}
+// True once cond has been true for hold_ms without a break; *start is the tick it became true
+static bool Ctrl_HeldFor(bool cond, uint32_t hold_ms, uint32_t *start, bool *active)
+{
+  if(!cond)
+  {
+    *active = false;
+    return false;
+  }
+  if(!(*active))
+  {
+    *start  = HAL_GetTick();
+    *active = true;
+  }
+  if((HAL_GetTick() - *start) >= hold_ms)
+  {
+    return true;
+  }
+  return false;
+}
+static void Ctrl_BatteryStatus(void)
+{
+  static uint32_t full_start         = 0;
+  static uint32_t empty_start        = 0;
+  static uint32_t full_clear_start   = 0;
+  static uint32_t empty_clear_start  = 0;
+  static bool     full_active        = false;
+  static bool     empty_active       = false;
+  static bool     full_clear_active  = false;
+  static bool     empty_clear_active = false;
+  Peripheral_Data_t pd;
+  float           top_mv;
+  float           bottom_mv;
+  bool            full;
+  uint8_t         cell_count = config_data.cell_count;
+
+  if(system_data.ctrl_state != CTRL_STATE_NORMAL_RUN && system_data.ctrl_state != CTRL_STATE_HPPC_RUN)
+  {
+    return;
+  }
+  if(cell_count > SYS_CELL_COUNT_MAX)
+  {
+    cell_count = SYS_CELL_COUNT_MAX;
+  }
+  if(cell_count == 0)
+  {
+    return;
+  }
+
+  Periph_GetData(&pd);
+  top_mv    = pd.cell_voltage[0];
+  bottom_mv = pd.cell_voltage[0];
+  for(uint8_t i = 1; i < cell_count; i++)
+  {
+    if(pd.cell_voltage[i] > top_mv)
+    {
+      top_mv = pd.cell_voltage[i];
+    }
+    if(pd.cell_voltage[i] < bottom_mv)
+    {
+      bottom_mv = pd.cell_voltage[i];
+    }
+  }
+
+  full = (pd.pack_current > CTRL_BATT_CURRENT_MA) &&
+         (top_mv >= (float)config_data.charge_monitor_cell_mv) &&
+         (pd.pack_current <= (float)config_data.charging_term_current);
+  if(Ctrl_HeldFor(full, CTRL_BATT_FULL_MS, &full_start, &full_active))
+  {
+    system_data.battery_status |= CTRL_BATT_FULL;
+  }
+  if(Ctrl_HeldFor(pd.pack_current < -CTRL_BATT_CURRENT_MA, CTRL_BATT_CLEAR_MS, &full_clear_start, &full_clear_active))
+  {
+    system_data.battery_status &= (uint8_t)~CTRL_BATT_FULL;
+  }
+
+  if(Ctrl_HeldFor(bottom_mv <= (float)config_data.voltage_cell_min, CTRL_BATT_EMPTY_MS, &empty_start, &empty_active))
+  {
+    system_data.battery_status |= CTRL_BATT_EMPTY;
+  }
+  if(Ctrl_HeldFor(pd.pack_current > CTRL_BATT_CURRENT_MA, CTRL_BATT_CLEAR_MS, &empty_clear_start, &empty_clear_active))
+  {
+    system_data.battery_status &= (uint8_t)~CTRL_BATT_EMPTY;
   }
 }
-// This callback fires automatically when conversion completes
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+static void Ctrl_ChargerStatus(void)
 {
-  if(hadc->Instance == ADC1)
+  Peripheral_Data_t pd;
+
+  Periph_GetData(&pd);
+  if(pd.sys_vcc_mv > CTRL_CHARGER_PRESENT_MV)
   {
-    STM32_ADC_Read();
+    system_data.charger_present = 1U;
   }
+  else
+  {
+    system_data.charger_present = 0U;
+  }
+}
+static void Ctrl_UvpShutdown(void)
+{
+  static uint32_t   low_start  = 0;
+  static bool       low_active = false;
+  Peripheral_Data_t pd;
+  float             bottom_mv;
+  bool              empty;
+  uint8_t           cell_count = config_data.cell_count;
+
+  if(cell_count > SYS_CELL_COUNT_MAX)
+  {
+    cell_count = SYS_CELL_COUNT_MAX;
+  }
+  if(cell_count == 0)
+  {
+    return;
+  }
+
+  Periph_GetData(&pd);
+  bottom_mv = pd.cell_voltage[0];
+  for(uint8_t i = 1; i < cell_count; i++)
+  {
+    if(pd.cell_voltage[i] < bottom_mv)
+    {
+      bottom_mv = pd.cell_voltage[i];
+    }
+  }
+
+  empty = ((system_data.protection_trigger & (CTRL_PROT_UVP_SLOW | CTRL_PROT_UVP_FAST)) != 0U) &&
+          (system_data.charger_present == 0U) &&
+          (bottom_mv <= (float)config_data.voltage_cell_min);
+  if(Ctrl_HeldFor(empty, CTRL_UVP_SHUTDOWN_MS, &low_start, &low_active))
+  {
+    shutdown_request = true;
+  }
+}
+static void Ctrl_FaultSnapshot(void)
+{
+  if(system_data.protection_trigger == 0 || stats_data.fault_code != 0)
+  {
+    return;
+  }
+
+  Peripheral_Data_t pd;
+  Periph_GetData(&pd);
+
+  for(uint8_t i = 0; i < SYS_CELL_COUNT_MAX; i++)
+  {
+    float mv = pd.cell_voltage[i] + 0.5f;
+
+    if(mv < 0.0f)               mv = 0.0f;
+    if(mv > (float)UINT16_MAX)  mv = (float)UINT16_MAX;
+    stats_data.fault_snapshot_voltage[i] = (uint16_t)mv;
+  }
+
+  float ma = roundf(pd.pack_current);
+  if(ma < (float)INT16_MIN) ma = (float)INT16_MIN;
+  if(ma > (float)INT16_MAX) ma = (float)INT16_MAX;
+  stats_data.fault_snapshot_current = (int16_t)ma;
+
+  float t = roundf(pd.temperature_package);
+  if(t < (float)INT8_MIN) t = (float)INT8_MIN;
+  if(t > (float)INT8_MAX) t = (float)INT8_MAX;
+  stats_data.fault_snapshot_temperature = (int8_t)t;
+
+  stats_data.fault_snapshot_soc = fuelgauge_data.relative_soc;
+  stats_data.fault_code         = system_data.protection_trigger;
+  stats_data.fault_timestamp    = system_data.session_uptime_ms;
+}
+void Ctrl_ClearFault(void)
+{
+  memset(stats_data.fault_snapshot_voltage, 0, sizeof(stats_data.fault_snapshot_voltage));
+  stats_data.fault_snapshot_current     = 0;
+  stats_data.fault_snapshot_temperature = 0;
+  stats_data.fault_snapshot_soc         = 0;
+  stats_data.fault_code                 = 0;
+  stats_data.fault_timestamp            = 0;
+}
+void Ctrl_ClearErrors(void)
+{
+  if(Error_IsSet(OPENBMS_HW_DRV_FAULT))
+  {
+    Periph_DriverReset();
+  }
+  Error_ClearAll();
+  if(system_data.ctrl_state == CTRL_STATE_FAULT)
+  {
+    errors_cleared = true;
+  }
+}
+void Ctrl_Shutdown(void)
+{
+  shutdown_request = true;
+}
+void Ctrl_RequestReset(bool bootloader)
+{
+  reset_request = true;
+  if(bootloader)
+  {
+    reset_bootloader = true;
+  }
+}
+void Ctrl_ResetProtection(void)
+{
+  system_data.protection_trigger = 0;
+  protection_reset               = true;
+}
+void Ctrl_SetFetRequest(bool state)
+{
+  system_data.fet_request = state;
+}
+void Ctrl_SetPreFetRequest(bool state)
+{
+  system_data.pre_fet_request = state;
+}
+void Ctrl_SetLastCommunication(void)
+{
+  system_data.last_communication_timestamp = HAL_GetTick();
 }

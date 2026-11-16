@@ -1,8 +1,8 @@
 CompileFlags:
   Add:
-    - '-ferror-limit=0'
-    - '-Wno-implicit-int'
-  CompilationDatabase: build/Debug
+    - -ferror-limit=0
+    - -Wno-implicit-int
+  CompilationDatabase: build/Release
 Diagnostics:
   Suppress:
     - unused-includes
