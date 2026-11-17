@@ -1,0 +1,495 @@
+# 🔋 Battery Model & SOC Estimation
+
+## What is a Battery Model
+
+A battery model is a set of mathematical equations that describes how a battery 
+behaves electrically, how its voltage responds to current, how it stores and 
+releases charge, and how its internal resistance affects performance. It takes 
+measurable inputs (voltage, current, temperature) and produces predictions of internal 
+states such as state of charge (SOC) and state of health (SOH) that cannot be measured directly.
+
+## Why a Battery Model is Necessary
+
+A battery does not have a direct way to measure its state. You cannot attach a 
+sensor to read SOC or SOH the way you would read temperature or voltage. The only 
+quantities measurable in real time are **terminal voltage**, **current**, and 
+**temperature**. Everything else must be estimated.
+
+This is where the battery model becomes essential. The model acts as a mathematical 
+representation of the battery's internal behaviour, allowing the firmware to infer 
+hidden states from the measurable signals. Without a model, the firmware has no way 
+to interpret what the voltage and current measurements actually mean in terms of 
+remaining charge, health, or available power.
+
+In the **OpenBMS firmware** the battery model serves as the core engine for 
+estimating:
+
+- **SOC (State of Charge)** — how much charge remains, expressed as a percentage
+  of full capacity. Critical for fuel gauge accuracy and preventing over-discharge.
+
+- **SOH (State of Health)** — how much the cell has degraded relative to its 
+  original capacity and resistance. Used to predict end-of-life and adjust SOC 
+  calculations as the cell ages.
+
+- **SOP (State of Power)** — the maximum current the cell can deliver or accept
+  at the current moment without violating voltage limits. The model holds what is
+  needed for it, but the firmware does not compute SOP yet.
+
+- **Terminal voltage prediction** — the model predicts what voltage the cell should 
+  show under a given load. The difference between predicted and measured voltage is 
+  the correction signal that drives the Kalman filter.
+
+
+## Battery Modelling Overview
+
+Rechargeable batteries can be modelled at different levels of complexity depending 
+on the application. The main approaches are:
+
+- **Electrochemical models** — describe the internal physics and chemistry in detail
+  (e.g. Doyle-Fuller-Newman model). Very accurate but computationally expensive.
+  Used mainly in research and cell design.
+
+- **Mathematical/empirical models** — use fitted equations to describe capacity fade
+  and voltage behaviour. Simple but limited in dynamic accuracy.
+
+- **Equivalent Circuit Models (ECM)** — represent the battery using standard
+  electrical components (resistors, capacitors, voltage sources). Good balance
+  between accuracy and computational cost. Widely used in BMS applications.
+
+This project uses the **2RC Thevenin Equivalent Circuit Model** — the industry 
+standard for battery management systems. It captures the two dominant dynamic 
+processes inside the cell (fast charge-transfer kinetics and slow solid-state 
+diffusion) with enough accuracy for real-time SOC estimation on embedded hardware.
+
+<br/>
+<img src="images/thevenin-battery-model-with-2-RC-branches.png" alt="2RC Thevenin ECM" width="50%"/>
+
+### Model Parameters
+
+The model requires the following parameters:
+
+| Parameter | Description | Unit |
+|---|---|---|
+| **V_OCV** | Open Circuit Voltage — equilibrium voltage with no current flowing | V |
+| **R0** | Ohmic resistance — instantaneous voltage drop, includes contact and SEI resistance | Ω |
+| **R1** | Polarization resistance of first RC pair — models fast charge-transfer kinetics | Ω |
+| **τ1** | Time constant of first RC pair (τ1 = R1·C1) — typically 5 to 100 seconds | s |
+| **R2** | Polarization resistance of second RC pair — models slow solid-state diffusion | Ω |
+| **τ2** | Time constant of second RC pair (τ2 = R2·C2) — typically 100 to 1000 seconds | s |
+| **Q** | Cell capacity — total charge the cell can deliver, one value per cell (`capacity_ah`) | Ah |
+
+Note that C1 and C2 are not stored directly — they are always derived from
+τ and R as C = τ / R.
+
+V_OCV, R0, R1, τ1, R2 and τ2 are stored per cell as 20-point tables on a shared
+SOC grid (`soc_grid`, `0xA0`), one set for charge and one for discharge:
+
+| Table | Discharge | Charge |
+|---|---|---|
+| V_OCV | `ocv_dis` `0xA1` | `ocv_chg` `0xA2` |
+| R0 | `r0_dis` `0xA3` | `r0_chg` `0xA8` |
+| R1 | `r1_dis` `0xA4` | `r1_chg` `0xA9` |
+| τ1 | `tau1_dis` `0xA5` | `tau1_chg` `0xAA` |
+| R2 | `r2_dis` `0xA6` | `r2_chg` `0xAB` |
+| τ2 | `tau2_dis` `0xA7` | `tau2_chg` `0xAC` |
+
+The per-cell tables and `capacity_ah` (`0xD4`) act on the cell selected with
+`model_cell` (`0x9F`). See [communication-protocol.md](communication-protocol.md)
+for the full register map.
+
+### Parameter Extraction
+
+There are several methods to extract battery model parameters, each with different
+trade-offs between accuracy, equipment requirements, and complexity. OpenBMS
+extracts them **on the board** with a **Hybrid Pulse Power Characterization (HPPC) test**,
+so no lab equipment or PC-side processing is needed. The test only has to be run
+once per pack, once for charge and once for discharge.
+
+**HPPC test** — started with `CC_HPPC_START` (`0x06`), which names the direction (1 charge, 2 discharge). The BMS first waits with the FET off until the cells have relaxed from whatever was done before (every cell moving less than 4 µV/s between two 1-minute averages, at least 2 min, at most 30 min, `HPPC_SETTLE_*` in `config.h`). Then it switches the FET on
+for a current pulse, then rests for 450 s, at 20 SOC checkpoints
+(100, 98, 95, 90, 85, 80, 70 ... 10, 8, 6, 4, 2 %). A charger or a load provides
+the current; the board measures the direction and stops the test when it is not the one asked for. The test only starts on a full pack for discharge (every cell ≥ `HPPC_DIS_START_MIN_MV`, 4100 mV) or an empty pack for charge (every cell ≤ `HPPC_CHG_START_MAX_MV`, 3450 mV), because the checkpoints and the measured capacity count from that end, and only with no error flags set. For every pulse and every cell:
+
+- **OCV** is the average voltage at the end of the rest.
+- **R0** is the voltage step right after the pulse starts, divided by the current step.
+- **R1, τ1, R2, τ2** come from a 2-RC least-squares fit of the rest relaxation
+  (a grid search over τ1/τ2 refined by a compass search, the amplitudes solved linearly).
+- The charge moved during each pulse gives the capacity axis.
+
+The fits run in small slices of the 10 ms main loop, so the BMS keeps protecting
+the pack during the test. When the test ends at `voltage_cell_max` (charge) or
+`voltage_cell_min` (discharge), the cycles are smoothed and resampled onto the
+20-point SOC grid and written into the tables of the tested direction. A discharge
+test also writes each cell's capacity. The test is stopped without writing anything
+if a protection trips, the current leaves 0.5–2 C, or the pack temperature leaves
+15–35 °C. Progress is shown in `hppc_status` (`0x19`) and `hppc_extract_status` (`0x1A`).
+
+At runtime the firmware interpolates between table entries to get the parameter
+values at the current SOC and current direction.
+
+#### HPPC battery charging test:
+<img src="images/hppc_charging.png" width="80%"/>
+
+#### HPPC battery discharging test:
+<img src="images/hppc_discharging.png" width="80%"/>
+
+### Additional Battery Parameters
+
+Beyond the core ECM parameters, the following additional characteristics are 
+required for a complete and accurate battery model:
+
+| Parameter | Description | Register |
+|---|---|---|
+| **η (Coulombic efficiency)** | Ratio of discharge to charge capacity — typically 0.995 to 0.999 for healthy Li-ion. Applied to the charge current | `coulombic_efficiency` `0xB0` |
+| **OCV hysteresis** | Difference between charge and discharge OCV curves at the same SOC — 5 to 30 mV depending on chemistry. Covered by the separate charge and discharge OCV tables | `0xA1` / `0xA2` |
+| **Q(T)** | Capacity derating with temperature — usable capacity drops significantly below 10°C. A factor table over 5 temperatures, used for the remaining capacity | `q_temp_c` `0xAD`, `q_temp_factor` `0xAE` |
+| **Activation energies** | How R0, R1, τ1, R2 and τ2 change with temperature (Arrhenius). `0` turns the scaling off | `ea_r0` … `ea_tau2` `0xB6`–`0xBA` |
+| **Model temperature** | Average pack temperature during the charge / discharge HPPC test — the temperature the tables belong to | `model_temp_chg_c` `0xB2`, `model_temp_dis_c` `0xB1` |
+
+Self-discharge is not modelled; a rest correction (below) removes the SOC error it causes.
+
+### Temperature Compensation
+
+The tables are measured at one temperature, the average pack temperature during
+the HPPC test. At any other temperature the firmware scales every resistance and
+time constant with the Arrhenius law:
+
+`X(T) = X_table · exp(Ea / R_gas · (1/T − 1/T_model))`
+
+with T in kelvin, R_gas = 8.314 J/(mol·K), and the scale limited to 0.1–20 so a
+wrong temperature cannot blow the model up. The HPPC test does not measure the
+activation energies; when the model is empty the firmware fills in defaults fitted
+to public Li-ion test data (CALCE, 0/25/45 °C): 12500 (R0), 15500 (R1), 7000 (τ1),
+17000 (R2) and 1000 (τ2) J/mol. The OCV curve is not scaled.
+The capacity factor table (`q_temp_factor`) reduces the reported remaining capacity
+in the cold, without changing the SOC itself.
+
+### Example of battery extracted parameters
+
+The HPPC test is run separately in the charge and discharge directions because 
+the extracted parameters are not the same — R0, R1, τ1, R2, and τ2 differ between 
+charging and discharging at the same SOC due to the asymmetric electrochemical 
+kinetics of the cell. For this reason the firmware stores and interpolates 
+separate lookup tables for each direction rather than a single shared table.
+
+#### Cell 1 extracted parameters - charging:
+<img src="images/cell1_param_charge.png" width="80%"/>
+
+#### Cell 1 extracted parameters - discharging:
+<img src="images/cell1_param_discharge.png" width="80%"/>
+
+## SOC Estimation with an Extended Kalman Filter
+
+The ECM and the parameter tables above describe how the battery behaves. They 
+do not, by themselves, tell you the SOC — for that, the model has to be run 
+forward against live current and voltage measurements. This section covers 
+how that runs in practice.
+
+### Why Not Just Integrate Current
+
+The simplest possible SOC estimate is coulomb counting: start from a known 
+SOC and integrate current over time, `SOC(t) = SOC(0) + ∫I·dt / Q_nom`. This 
+works, but it has no way to correct itself. Current sensor offset, ADC 
+quantization, and any error in `Q_nom` all integrate too, so the estimate 
+drifts further from the truth the longer the pack runs with no way back. A 
+pack that starts a long trip 2% off will still be 2% off — or worse — 
+whenever it lands, unless something periodically checks the estimate against 
+an independent signal.
+
+The independent signal available here is voltage. The ECM predicts what 
+voltage the cell should show for a given SOC and current; comparing that 
+prediction against the cell's actual measured voltage gives a correction 
+signal that coulomb counting alone can never produce. Combining the two — a 
+model-based prediction and a real measurement — is exactly what a Kalman 
+filter does.
+
+### The Extended Kalman Filter
+
+The filter's state is `[SOC, V_RC1, V_RC2]` — the charge level plus the 
+voltage sitting across each RC branch from the model above. Every step runs 
+in two halves:
+
+- **Predict** — SOC advances by coulomb counting (current × Δt / `Q_nom`), 
+  and V_RC1/V_RC2 decay or charge toward their steady-state values at the 
+  rates set by `τ1`/`τ2` and `R1`/`R2` at the current SOC. This half needs 
+  no measurement at all — it is the same open-loop prediction the ECM makes 
+  on its own.
+
+- **Correct** — the predicted state gives a predicted terminal voltage, 
+  `V_OCV(SOC) + I·R0 + V_RC1 + V_RC2`. The gap between that prediction and 
+  the cell's actual measured voltage is fed back through the OCV curve's 
+  local slope (`dV_OCV/dSOC`) to nudge SOC, V_RC1 and V_RC2 toward whatever 
+  values would have made the prediction match reality — weighted by how much 
+  the filter trusts the model versus the measurement at that moment.
+
+That weighting is what makes it a *Kalman* filter rather than a fixed 
+correction rule: it tracks its own uncertainty about the state and about the 
+measurement, and blends the two accordingly.
+
+### Filter Tuning
+
+The filter does not use hand-tuned process noise. Following Rzepka et al. (KIT, 2021),
+it works out the noise of every step from what is known about the sensors and the model:
+
+- **SOC process noise** comes from the current sensor accuracy:
+  `Q_SOC = ((σ_I + g·|I|) · Δt / (3600 · Q))²`, with σ_I = 20 mA offset error and
+  g = 1 % gain error.
+- **RC process noise** comes from the same current error passed through each RC branch,
+  plus a 20 % error on the R and τ tables. It is zero at rest with relaxed branches,
+  and grows with the current.
+- **Measurement noise** is `kf_r_v` (`0xBE`, default 2.5·10⁻⁵ V², 5 mV) plus the
+  same 20 % model error on the R0 drop, `(I·R0·0.2)²`, and the current error through
+  R0. So the filter leans on the voltage at rest and on coulomb counting under a
+  heavy load, where the model is least sure.
+- **Resistance scale** — the resistance tables are never exact (temperature, ageing,
+  pack wiring). The filter carries a shared resistance scale as a *consider*
+  parameter (Schmidt-Kalman): it is not estimated, but its uncertainty
+  (variance 0.1 of ln k, about ×0.73–×1.37) is included in the gain, so a resistance
+  error does not get read as an SOC error.
+- **P0** — right after the seed the state uncertainty is 0.05² for SOC and 0.02² V²
+  for V_RC.
+
+`kf_r_v` is the only tuning register and must be above 0. The other values are
+constants in `openbms_fuelgauge.c` (`FG_KF_*`). The filter runs every 10 ms.
+
+### Guarding Against Bad Corrections
+
+The correction step assumes any gap between predicted and measured voltage 
+means the state estimate is wrong. That assumption breaks in two situations 
+worth designing around explicitly. Right at a fast current step, a cell's 
+voltage sensor can momentarily disagree with what its `R0` predicts by more 
+than noise alone would explain — trusting that one sample fully can yank SOC 
+by a physically implausible amount in a single step. And with no current 
+flowing at all, coulomb counting says SOC cannot be changing, so any residual 
+during rest can only be an imperfect `R1`/`R2`/`τ1`/`τ2` relaxation fit — 
+never real charge — yet the correction step has no built-in way to know that 
+unless it's told.
+
+The estimator therefore checks each correction before applying it: whether 
+the residual is statistically plausible given the filter's own uncertainty, 
+whether it implies a rate of SOC change coulomb counting could never produce, 
+and whether any current is actually flowing at all. A correction that fails 
+these checks is scaled back or, at rest, blocked from touching SOC
+entirely — V_RC1 and V_RC2 are still free to absorb it, since a relaxation
+mismatch is exactly what they're there to represent.
+
+In the firmware these guards are:
+
+- A residual larger than **4 σ** of the filter's own uncertainty is treated as a glitch.
+- One correction may move SOC by at most **1 % per second**.
+- Below **50 mA** the pack counts as at rest and the SOC row of the Kalman gain is blocked.
+- A time step longer than **0.5 s** (after an HPPC test, a stall or at boot) is skipped
+  instead of integrating the current over the whole gap.
+- At boot, SOC comes from the **saved fuel gauge state** if it belongs to the stored
+  model. Otherwise it is **seeded from the OCV tables** 500 ms after start, when the
+  voltage filters have settled. While the last current direction is not known, the
+  seed uses the mean of the charge and discharge OCV tables, so the error is at most
+  half the hysteresis either way.
+
+## Corrections Beyond the Kalman Filter
+
+The Kalman filter keeps SOC close while current flows. Three slower mechanisms keep
+it right over days and months:
+
+- **Full charge** — while charging, when the highest cell reaches
+  `charge_monitor_cell_mv` and the current has dropped to `charging_term_current`
+  for 10 s, every cell within 20 mV of the highest one is set to 100 %. Set
+  `charging_term_current` above the charger's own cut-off current, otherwise the
+  charger stops before this is seen.
+- **Rest correction** — after a rest (no current) of 30 min, or 5 min once the
+  voltage has settled (dV/dt below 4 µV/s), SOC is pulled toward the OCV reading.
+  The weight depends on how steep the OCV curve is there: up to 80 % on a steep part,
+  nothing where the curve is flat (below 1 mV per % SOC).
+- **Shown SOC** — a correction never makes the reported SOC jump. The reported
+  value (`cell_soc` `0x92`, `relative_soc` `0x90`, the CAN status) holds still at
+  rest, and the gap is spread over the next charge or discharge so that the reported
+  and the internal SOC reach 0 % or 100 % together. `cell_soc_f` (`0xD0`) shows the
+  internal SOC. `relative_soc` is the lowest cell, since that cell reaches its
+  cut-off first. The whole-percent registers only move with the current: they never
+  go up while discharging, never down while charging, and hold still at rest, so the
+  display does not flicker between two values.
+
+### Capacity Learning and State of Health
+
+HPPC runs only once, but a cell's capacity fades as it ages. The firmware learns
+it from normal use: between two settled rests on a steep part of the OCV curve
+(at least 3 mV per % SOC), the charge counted per cell divided by the SOC change
+read from the OCV gives the capacity. A learning point is used only when:
+
+- the SOC changed by at least 40 %,
+- both rests are within 48 h,
+- the temperature stayed between 10 and 40 °C,
+- no measurement was lost.
+
+A result more than 10 % away from the current value is rejected; otherwise the
+capacity moves 20 % of the way toward it. The charge counter applies η to the charge
+current and subtracts each cell's balancing bleed current, so balancing does not
+bias the result.
+
+Each update sets the cell's `capacity_ah` (`0xD4`), the SOH (`cell_soh` `0x93`,
+learned capacity / `cell_capacity`) and counts `capacity_update_count` (`0x97`).
+`cycle_count` (`0xD7`) adds one for every `q_nom_ah` of discharged charge.
+
+### SOC Balancing
+
+Balancing by voltage only works at the top of charge, where the OCV curve is steep.
+The fuel gauge adds a balancing target per cell: after a relaxed rest of at least
+5 min, where every cell sits on a steep part of the OCV curve (at least 5 mV per %
+SOC), it reads each cell's SOC from the OCV and works out how much charge each cell
+has to bleed so that all cells reach full at the same time:
+
+`target(i) = max_j(room_j) − room_i`, with `room = (1 − SOC_OCV) · capacity_ah`
+
+Targets below 1.5 % of the cell capacity are dropped, larger ones are limited to 10 %.
+While any target is left, the balancer bleeds exactly those cells (SOC mode) and the
+fuel gauge counts the bled charge off; when all are done, it goes back to voltage
+balancing (`balance_start_mv`, `balance_delta_mv`, `balance_stop_mv`). The remaining
+targets are in `balance_target_mah` (`0x9A`) and are saved with the fuel gauge state,
+so a reboot does not lose them. Balancing pauses for 500 ms every 5 s to take fresh
+cell readings.
+
+### Balancing Bleed
+
+While a cell is balancing, part of the pack current flows through its bleed
+resistor instead of the cell. The fuel gauge subtracts V_cell /
+`balance_resistance_ohm` from that cell's current, so its SOC does not drift during
+balancing.
+
+### Divider Drain
+
+While cell measuring is on (always while the board runs), every cell tap has a
+voltage divider of 70 kΩ (68k + 2k, `PER_CELL_DIVIDER_OHM` in `config.h`) to battery
+minus. Its current returns to battery minus without passing the shunt, and a tap's
+current flows through every cell below it, so cell k loses
+I_div(k) = Σ (n = k..7) V_tap(n) / 70 kΩ, where V_tap(n) is the sum of cells 1..n and
+unused taps (jumpered to the top cell) sit at pack voltage. At 3.7 V per cell this is
+1.48 mA for cell 1 down to 0.37 mA for cell 7. The fuel gauge subtracts it from each
+cell's current like the balancing bleed, in the filter and in capacity learning.
+
+### Model Storage
+
+When an HPPC test writes its tables, the whole model is stored in the EEPROM
+(`hppc_extract_status` `0x1A` bit 15 SAVED) and loaded at the next boot. A model can
+also be written over the registers and stored with `CC_EEPROM_FUELGAUGE` (`0x15`).
+The fuel gauge runs only in NORMAL_RUN and only when the loaded model is complete
+(`learning_status` `0x96` COMPLETE: both charge and discharge tables written, a
+rising SOC grid, `kf_r_v` above 0, η and capacities); `eeprom_status` (`0x1D`) bit 1
+shows it. Without a stored model the fuel gauge stays off.
+
+The learned values (capacity per cell, SOC, shown SOC, SOH, cycle count, balancing
+targets, last current direction) are stored separately as the fuel gauge state.
+It is saved whenever the SOC moves by 1 % or a value is learned, and at shutdown and
+reboot, so the SOC survives a power cycle without a new seed. See
+[communication-protocol.md](communication-protocol.md#fuel-gauge-state--0x9b-and-0x9c).
+
+
+## Example: Estimating a 7-Cell Battery
+
+Here a 7-cell Li-Ion 2000 mAh battery pack is being estimated, with a 10k NTC 
+resistor built inside and an XT60 connector.
+
+<img src="images/battery.jpg" width="80%"/>
+
+### Setup
+
+<img src="images/setup.jpg" width="80%"/>
+
+Battery charging was ran with 2 A, and discharging was ran also with 2 A by
+enabling two of the test bench's 25 Ω resistors in parallel. This example was made
+before the extraction moved onto the board: the HPPC test was logged on a PC and
+the parameters were extracted offline by the original PC pipeline, once for the
+charge log and once for the discharge log. The on-board extraction is a port of
+that pipeline and gives the same OCV tables (within 0.1 mV) on the same logs; R0 is
+read earlier into the pulse on the board (20 ms instead of 250 ms), so it comes out
+slightly lower.
+
+### Estimated Battery Parameters (all cells)
+
+#### R0 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_R0_charge.png" width="80%"/>
+
+#### R0 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_R0_discharge.png" width="80%"/>
+
+#### R1 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_R1_charge.png" width="80%"/>
+
+#### R1 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_R1_discharge.png" width="80%"/>
+
+#### R2 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_R2_charge.png" width="80%"/>
+
+#### R2 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_R2_discharge.png" width="80%"/>
+
+#### τ1 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_tau1_charge.png" width="80%"/>
+
+#### τ1 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_tau1_discharge.png" width="80%"/>
+
+#### τ2 vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_tau2_charge.png" width="80%"/>
+
+#### τ2 vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_tau2_discharge.png" width="80%"/>
+
+#### OCV vs SOC - all cells, charging:
+<img src="images/battery_parameters/all_cells_OCV_charge.png" width="80%"/>
+
+#### OCV vs SOC - all cells, discharging:
+<img src="images/battery_parameters/all_cells_OCV_discharge.png" width="80%"/>
+
+### Estimated Capacity per Cell
+
+Capacity is taken over the 2.5 V-4.2 V OCV range, from the same offline run as the
+parameters above:
+
+| Cell | Charge Capacity 2.5V-4.2V [mAh] | Discharge Capacity 2.5V-4.2V [mAh] |
+|---|---|---|
+| 1 | 2113.1 | 1999.4 |
+| 2 | 2047.0 | 2003.8 |
+| 3 | 2033.4 | 1994.4 |
+| 4 | 2031.9 | 1995.9 |
+| 5 | 2033.3 | 1998.0 |
+| 6 | 2012.1 | 2000.9 |
+| 7 | 1973.3 | 2000.5 |
+
+### Example of SOC Estimation (Kalman filter)
+
+This was done offline with the original PC estimator, before the fuel gauge moved
+onto the board (it used fixed, hand-tuned filter noise, not the noise model above). Each run below replays a real log 
+through the model twice — open loop (pure prediction, no correction) and with 
+the Kalman filter — and plots both against the cell's actual measured voltage, 
+the two SOC traces, and the pack current that drove them. The Kalman trace 
+tracking the real voltage noticeably more closely than the open-loop trace is 
+the filter doing its job; persistent daylight between them across a whole run 
+is a sign the underlying parameter table, not the filter, needs a second look.
+
+#### SOC estimation - charging:
+<img src="images/soc_estimator_charge.png" width="80%"/>
+
+#### SOC estimation - discharging:
+<img src="images/soc_estimator_discharge.png" width="80%"/>
+
+### Conclusion
+
+The estimation looks correct overall. R0 and OCV both follow the shape expected from 
+a 2-RC Li-ion model, and all 7 cells track each other tightly on both, which shows 
+the pack is reasonably balanced. Discharge capacity also lands close to the rated 
+2000 mAh across all cells.
+
+Two smaller things stand out: Cell 6's discharge τ2 spikes above 95% SOC while every 
+other cell drops, which looks like a fitting artifact rather than real cell 
+behaviour. And Cell 1's charge OCV sits a bit below the other six, which pulls its 
+charge capacity estimate up to 2113 mAh. In general, charge capacities spread more 
+across cells (7%) than discharge capacities do (0.5%), so the discharge numbers are 
+the more reliable of the two for now.
+
+The Kalman-filtered SOC estimate also holds up well: in both the charge and 
+discharge runs above, the Kalman-corrected voltage tracks the real measured voltage 
+closely, while the open-loop estimate drifts away over time (on the charge run it 
+undershoots and only reaches ~97% SOC by the end, versus 100% for the real pack and 
+the Kalman estimate). That confirms the filter is correcting properly with these 
+parameter tables.
